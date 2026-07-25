@@ -384,11 +384,11 @@ impl Tool for VerifyFixAgentic {
 /// when fuzzing is enabled.
 fn build_method_section(config: &Config) -> String {
     match config.verify_harness {
-        VerifyHarness::Libloading => METHOD_LIBLOADING.to_owned(),
         VerifyHarness::Gtest => {
             let section = if config.fuzz { FUZZTEST_SECTION } else { "" };
             METHOD_GTEST.replace("{FUZZTEST_SECTION}", section)
-        }
+        },
+        VerifyHarness::Libloading => METHOD_LIBLOADING.to_owned()
     }
 }
 
@@ -607,12 +607,12 @@ fn render_configurations(cfg: &TestConfig) -> String {
 #[derive(Debug, Deserialize, Default, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyHarness {
-    /// dlopen the C `.so` from a Rust integration test (the original method).
-    #[default]
-    Libloading,
     /// C++ GoogleTest environment with the C reference linked in and the Rust
     /// translation loaded via `dlopen`.
+    #[default]
     Gtest,
+    /// dlopen the C `.so` from a Rust integration test (the original method).
+    Libloading,
 }
 
 /// Tool-specific configuration, read from `[tools.verify_fix_agentic]` in the HARVEST config.

@@ -18,12 +18,12 @@ pub enum TestHarness {
 /// Which comparison mechanism the in-loop verification agent is given.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VerifyHarness {
-    /// The agent dlopens the C `.so` from a Rust integration test (default).
-    #[default]
-    Libloading,
     /// The agent gets a C++ GoogleTest environment with the C reference linked
     /// in and the Rust translation loaded via dlopen.
+    #[default]
     Gtest,
+    /// The agent dlopens the C `.so` from a Rust integration test.
+    Libloading,
 }
 
 #[derive(Parser)]
@@ -146,7 +146,7 @@ pub struct Args {
     pub agent_tools: bool,
 
     /// Comparison mechanism the in-loop verification agent is given.
-    #[arg(long, value_enum, default_value_t = VerifyHarness::Libloading, requires = "agentic_verify")]
+    #[arg(long, value_enum, default_value_t = VerifyHarness::Gtest, requires = "agentic_verify")]
     pub verify_harness: VerifyHarness,
 
     /// With --verify-harness gtest, also describe FuzzTest
