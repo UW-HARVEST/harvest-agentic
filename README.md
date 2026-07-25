@@ -15,40 +15,63 @@ ACTOR. See
 
 ## Building the Rust code
 
-First, you will need to install libClang if you do not already have it. If you use ubuntu, this you can do this by runing:
-```
+Install `libclang` if it is not already installed.
+
+On Ubuntu, run:
+
+```sh
 apt-get install libclang-dev
 ```
 
+`libclang` is typically bundled with Xcode or Apple's Command Line Tools.
+Check for a `libclang` installation by running:
+
+```sh
+find /Library/Developer/CommandLineTools /Applications/Xcode.app -name "libclang.dylib" 2>/dev/null
+```
+
+Or install it by running either:
+
+```sh
+brew install llvm
+```
+
+via brew,
+    or by running:
+
+```sh
+xcode-select install
+```
+
 If you have [rustup](https://rustup.rs) installed, you can build the code by
-running:
+running the following command from the root of this repository:
 
 ```bash
 cargo build --release
 ```
 
-If you do not use rustup, you will need a sufficiently-new stable Rust compiler
-(see rust-toolchain.toml for a toolchain version that is known to work).
+If you do not use rustup, you will need a sufficiently-new stable Rust compiler.
+See [rust-toolchain.toml](./rust-toolchain.toml) for a version that is known to work.
 
 ## LLM server
 
-You will also need an LLM server. This can be local, or remote. A couple options
-are given below:
+You will need a local or remote LLM server.
+A couple options are given below:
 
 ### Local Ollama instance
 
 You can follow Ollama's [download instructions](https://ollama.com/download), or
 download its [Docker image](https://hub.docker.com/r/ollama/ollama).
 
-Once you have it installed, you need to download a model. By default,
-harvest_translate uses `codellama:7b`:
+Once you have it installed, you need to download a model.
+`harvest_translate` defaults to `codellama:7b`:
 
 ```bash
 ollama pull codellama:7b                       # If installed in your system
 docker container run ollama pull codellama:7b  # If using Docker
 ```
 
-You will need to have Ollama running to run harvest_translate.
+Ollama must be running to run `harvest_translate`.
 
 ### Remote OpenAI instance
 
@@ -63,11 +86,11 @@ api_key = "your_key_here" # Will be read from environment if empty
 address = ""  # Not needed for OpenAI
 max_tokens = 16384
 ```
-You should place this config at the OS-dependent harvest config location, which you can find by running:
-```bash
-cargo run -- --print-config-path
-``` 
+You should place this config at the OS-dependent Harvest config location, which you can find by running:
 
+```sh
+cargo run -- --print-config-path
+```
 
 ## Running
 
