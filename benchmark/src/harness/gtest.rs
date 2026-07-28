@@ -395,6 +395,9 @@ fn run_gtest_tests(
     Ok((test_results, error_messages))
 }
 
+/// Grace the harness waits beyond a test's budget before SIGKILLing it.
+const KILL_GRACE_SECS: u64 = 5;
+
 /// Runs a single test in its own process via `--gtest_filter`.
 fn run_single_gtest(
     gtest_bin: &Path,
@@ -405,20 +408,29 @@ fn run_single_gtest(
     let mut child = Command::new(gtest_bin)
         .arg(format!("--gtest_filter={}", test_name))
         .env(LD_LIBRARY_PATH_ENV, ld_library_path)
+        .env(
+            "HARVEST_TEST_SOFT_TIMEOUT_SECS",
+            timeout.as_secs().to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn gtest binary: {}", e))?;
 
-    match child.wait_timeout(timeout) {
+    match child.wait_timeout(timeout + Duration::from_secs(KILL_GRACE_SECS)) {
         Ok(Some(_)) => child
             .wait_with_output()
             .map_err(|e| format!("Failed to read gtest output: {}", e).into()),
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(format!("Test timed out after {} seconds", timeout.as_secs()).into())
+            Err(format!(
+                "Test exceeded its {}s budget (killed {}s later)",
+                timeout.as_secs(),
+                KILL_GRACE_SECS
+            )
+            .into())
         }
         Err(e) => {
             let _ = child.kill();
