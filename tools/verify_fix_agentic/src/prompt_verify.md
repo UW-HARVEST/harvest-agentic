@@ -144,7 +144,7 @@ Format per entry:
    only do a fix in-process when it is a one-line change you can apply
    from what you already see.
 
-{CLAUDE_ASYNC_SUBAGENT_WARNING}
+{AGENT_BUG_WORKAROUNDS}
 
    Things you keep:
    - HYPOTHESES.md ownership (sub-agents do NOT edit HYPOTHESES.md)

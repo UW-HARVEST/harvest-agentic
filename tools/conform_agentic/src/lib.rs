@@ -108,12 +108,6 @@ pub fn run(params: ConformParams) -> Result<(), Box<dyn std::error::Error>> {
     let rust_toolchain_context =
         agent_runner::detect_rust_toolchain_context(params.input_project_dir)?;
 
-    let claude_async_subagent_warning = if params.agent == AgentKind::Claude {
-        agent_runner::CLAUDE_ASYNC_SUBAGENT_WARNING
-    } else {
-        ""
-    };
-
     let model_limits = match (params.agent, params.model) {
         (AgentKind::OpenCode, Some(model)) => {
             let limits = agent_runner::load_opencode_model_limits(model)?;
@@ -124,8 +118,8 @@ pub fn run(params: ConformParams) -> Result<(), Box<dyn std::error::Error>> {
 
     let prompt = PROMPT_CONFORM
         .replace(
-            "{CLAUDE_ASYNC_SUBAGENT_WARNING}",
-            claude_async_subagent_warning,
+            "{AGENT_BUG_WORKAROUNDS}",
+            agent_runner::agent_bug_workarounds(params.agent),
         )
         .replace(
             "{CONFORM_TEST_INSTRUCTIONS}",

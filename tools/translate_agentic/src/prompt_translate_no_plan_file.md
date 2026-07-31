@@ -245,7 +245,7 @@ sub-agent so the C code and the new Rust code never have to live in YOUR
 context. Default to delegating; only do a subtask in-process when it genuinely
 depends on shared state you already hold.
 
-{CLAUDE_ASYNC_SUBAGENT_WARNING}
+{AGENT_BUG_WORKAROUNDS}
 
 Things you keep:
 - The plan and its progress tracking (sub-agents report back; you decide what

@@ -268,7 +268,7 @@ point that is not part of the original library, plan to translate it early.
    YOUR context. Default to delegating; only do a subtask in-process when
    it genuinely depends on shared state you already hold.
 
-{CLAUDE_ASYNC_SUBAGENT_WARNING}
+{AGENT_BUG_WORKAROUNDS}
 
    Things you keep:
    - PLAN.md ownership (sub-agents do NOT edit PLAN.md)

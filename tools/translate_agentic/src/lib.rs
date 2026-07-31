@@ -155,15 +155,10 @@ impl Tool for TranslateAgentic {
         } else {
             String::new()
         };
-        let claude_async_subagent_warning = if agent == AgentKind::Claude {
-            agent_runner::CLAUDE_ASYNC_SUBAGENT_WARNING
-        } else {
-            ""
-        };
         let translate_prompt = translate_prompt
             .replace(
-                "{CLAUDE_ASYNC_SUBAGENT_WARNING}",
-                claude_async_subagent_warning,
+                "{AGENT_BUG_WORKAROUNDS}",
+                agent_runner::agent_bug_workarounds(agent),
             )
             .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
             .replace("{AGENT_TOOLS_SECTION}", &agent_tools_section)

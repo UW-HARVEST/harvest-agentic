@@ -96,7 +96,7 @@ fix — should go to a sub-agent so neither the C nor the buggy Rust ever has to
 live in YOUR context. Default to delegating; only do a fix in-process when it
 is a one-line change you can apply from what you already see.
 
-{CLAUDE_ASYNC_SUBAGENT_WARNING}
+{AGENT_BUG_WORKAROUNDS}
 
 Things you keep:
 - Hypothesis tracking (sub-agents report findings back; you decide each

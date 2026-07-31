@@ -6,7 +6,7 @@ passes those internal tests, but may still fail an **external** test suite that
 was written independently. Your single objective: **make every external test
 pass**, by fixing the Rust — without weakening or gaming the tests.
 
-{CLAUDE_ASYNC_SUBAGENT_WARNING}
+{AGENT_BUG_WORKAROUNDS}
 
 {WORKDIR_BOUNDARY}
 

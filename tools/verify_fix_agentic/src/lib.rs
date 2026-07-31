@@ -178,15 +178,10 @@ impl Tool for VerifyFixAgentic {
         } else {
             String::new()
         };
-        let claude_async_subagent_warning = if agent == AgentKind::Claude {
-            agent_runner::CLAUDE_ASYNC_SUBAGENT_WARNING
-        } else {
-            ""
-        };
         let prompt = load_verify_prompt(&config, agent)?
             .replace(
-                "{CLAUDE_ASYNC_SUBAGENT_WARNING}",
-                claude_async_subagent_warning,
+                "{AGENT_BUG_WORKAROUNDS}",
+                agent_runner::agent_bug_workarounds(agent),
             )
             .replace("{CMAKE_BUILD_FLAGS}", &test_config.cmake_flags)
             .replace("{ALL_CONFIGURATIONS}", &render_configurations(&test_config))

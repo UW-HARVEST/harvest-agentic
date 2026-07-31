@@ -88,10 +88,8 @@ impl AgentInvocation<'_> {
 /// Temporary workaround for a Claude Code CLI bug: recent versions default to
 /// asynchronous sub-agents, and in headless (`claude -p`) mode the process
 /// exits as soon as the main agent ends its turn — killing any sub-agents
-/// still running in the background. Prompt-building tools substitute this text
-/// for `{CLAUDE_ASYNC_SUBAGENT_WARNING}` when the agent is Claude, and an
-/// empty string otherwise. Remove once the CLI is fixed.
-pub const CLAUDE_ASYNC_SUBAGENT_WARNING: &str = "\
+/// still running in the background. Remove once the CLI is fixed.
+const CLAUDE_ASYNC_SUBAGENT_WARNING: &str = "\
 **Claude Code async sub-agent bug** \
 Recent Claude Code versions launch sub-agents asynchronously by default. \
 In this headless (`claude -p`) session that is fatal: ending your turn \
@@ -101,6 +99,41 @@ Therefore, you MUST launch EVERY sub-agent with `run_in_background: false` \
 (synchronous). You are still encouraged to launch multiple sub-agents \
 in a single turn when parallel execution is beneficial, but make sure \
 all of them are synchronous.";
+
+/// Temporary workaround for an OpenCode bug (upstream issue #29363): each
+/// model response is capped at 32000 output tokens regardless of the model's
+/// `limit.output`, and thinking tokens count against the same cap. A turn
+/// that burns the full cap in thinking ends without a tool call, OpenCode
+/// treats it as complete, and a sub-agent that ends this way returns an
+/// empty result. `run_bash_agent` raises the cap through
+/// `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`, but a hard cap remains, so the
+/// prompt must also steer the model away from long thinking and monolithic
+/// writes. Remove once the upstream cap respects `limit.output`.
+const OPENCODE_OUTPUT_CAP_WARNING: &str = "\
+**OpenCode output-token cap bug** \
+OpenCode caps the output tokens of each model response (upstream issue #29363). \
+Thinking tokens count against the same cap. \
+If thinking uses the full cap before your first tool call, the turn ends as if it were complete. \
+The session then stops silently. \
+A sub-agent that stops this way returns an empty result and writes no files.
+Therefore: keep thinking short. Do not draft a whole file in thinking. \
+Write long files in parts: create the file with one `write` call, \
+then append each next part with `edit`. Keep each part under ~300 lines. \
+Copy this whole warning into EVERY sub-agent prompt.";
+
+/// Agent-specific temporary bug workarounds, injected into every prompt.
+/// Prompt templates carry an `{AGENT_BUG_WORKAROUNDS}` placeholder, and
+/// prompt-building tools substitute this text for it. Each entry documents a
+/// known upstream bug and the behavior that avoids it. Add new entries here
+/// when an agent backend needs a temporary fix, and remove them when the
+/// upstream fix ships.
+pub fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Kiro => "",
+        AgentKind::Claude => CLAUDE_ASYNC_SUBAGENT_WARNING,
+        AgentKind::OpenCode => OPENCODE_OUTPUT_CAP_WARNING,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustToolchainContext {
@@ -691,6 +724,33 @@ fn run_bash_agent(
         cmd.env("RUSTUP_TOOLCHAIN", toolchain);
     }
 
+    // Temporary workaround for an OpenCode bug (upstream issue #29363): each
+    // model response is capped at min(limit.output, 32000) output tokens.
+    // Raise the cap to the registry output limit through the experimental
+    // escape hatch. `extra_env` is applied after this, so a value from the
+    // run config wins. Remove once the upstream cap respects `limit.output`.
+    if invocation.agent == AgentKind::OpenCode {
+        if let Some(model) = invocation.model {
+            match load_opencode_model_limits(model) {
+                Ok(OpenCodeModelLimits {
+                    output: Some(output),
+                    ..
+                }) => {
+                    info!(
+                        "Injecting OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX={output} (opencode#29363 32k output-cap workaround)"
+                    );
+                    cmd.env("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", output.to_string());
+                }
+                Ok(_) => warn!(
+                    "OpenCode model {model} has no registry output limit; the 32k output cap stays (opencode#29363)"
+                ),
+                Err(e) => warn!(
+                    "Could not resolve OpenCode model limits; the 32k output cap stays (opencode#29363): {e}"
+                ),
+            }
+        }
+    }
+
     for (key, value) in invocation.extra_env {
         info!("Injecting env var: {key}");
         cmd.env(key, value);
@@ -1056,6 +1116,15 @@ mod tests {
         assert!(claude_uses_ccr(Some("openrouter,deepseek/deepseek-v4-pro")));
         assert!(!claude_uses_ccr(Some("sonnet")));
         assert!(!claude_uses_ccr(None));
+    }
+
+    #[test]
+    fn agent_bug_workarounds_are_agent_specific() {
+        assert_eq!(agent_bug_workarounds(AgentKind::Kiro), "");
+        assert!(agent_bug_workarounds(AgentKind::Claude).contains("run_in_background: false"));
+        let opencode = agent_bug_workarounds(AgentKind::OpenCode);
+        assert!(opencode.contains("#29363"));
+        assert!(opencode.contains("sub-agent prompt"));
     }
 
     #[test]
