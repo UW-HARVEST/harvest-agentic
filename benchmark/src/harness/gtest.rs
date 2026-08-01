@@ -423,9 +423,22 @@ fn execute_plan(
                 .unwrap_or_default()
         );
         let (mut results, mut errors) = run_gtest_batch(gtest_bin, ld_library_path, batch);
+        // List every batched test's verdict, the same way the per-case path
+        // does, so a batch is as legible as an individually-run set.
+        for r in &results {
+            if r.skipped {
+                log::info!("  ⏭️  Test {} skipped (GTEST_SKIP)", r.filename);
+            } else if r.passed {
+                log::info!("  ✅ Test {} passed", r.filename);
+            } else {
+                log::info!("  ❌ Test {} failed", r.filename);
+            }
+        }
         let passed = results.iter().filter(|r| r.passed).count();
+        let all_passed = passed == results.len();
         log::info!(
-            "Batch '{}': {}/{} passed",
+            "{} Batch '{}': {}/{} passed",
+            if all_passed { "✅" } else { "❌" },
             batch.filter,
             passed,
             results.len()
