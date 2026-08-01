@@ -38,7 +38,14 @@ from typing import Literal, Optional
 
 @dataclass
 class TokenUsage:
-    """Agent-agnostic token counts for one API call / step."""
+    """Agent-agnostic token counts for one API call / step.
+
+    `output_tokens` always includes reasoning/thinking tokens, so it can be
+    multiplied by the model's output price directly. Claude already reports
+    them that way; the OpenCode parsers fold `tokens.reasoning` in at
+    ingestion. `reasoning_tokens` is the informational subset, NOT an
+    addition — never sum it on top of `output_tokens`.
+    """
     input_tokens: int
     output_tokens: int
     cache_creation_tokens: int
@@ -282,12 +289,15 @@ class InitEvent:
 
 @dataclass
 class ModelUsage:
+    """Per-model session totals. `output_tokens` includes reasoning tokens
+    (see TokenUsage); `reasoning_tokens` is the informational subset."""
     model: str
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
     cache_creation_tokens: int
     cost_usd: float
+    reasoning_tokens: int = 0
 
 
 @dataclass
@@ -894,11 +904,11 @@ def print_session_stats(sessions: list[Session]) -> None:
                 sub_turns = len(st.conversation)
                 sub_tools = count_tools_in_conversation(st.conversation)
                 prog_steps = len(st.progress_snapshots)
-                in_flight = st.status in ("running", "pending")
-                if ag.frozen or (in_flight and _session_ended(s)):
+                unfinished = ag.frozen or st.status in ("running", "pending")
+                if unfinished and _session_ended(s):
                     frozen_note = "  ⚠ FROZEN (never completed; process ended mid-task)"
-                elif in_flight:
-                    frozen_note = "  ⏳ in progress (live trace — no result event yet)"
+                elif unfinished:
+                    frozen_note = "  ⏳ in progress (live trace — session still running)"
                 else:
                     frozen_note = ""
                 print(f"\n  --- Sub-agent [{st.description}] ---")
@@ -929,7 +939,13 @@ def print_session_stats(sessions: list[Session]) -> None:
             for model, mu in r.model_usage.items():
                 print(f"    [{model}]")
                 print(f"      input_tokens:  {mu.input_tokens}")
-                print(f"      output_tokens: {mu.output_tokens}")
+                if mu.reasoning_tokens:
+                    print(
+                        f"      output_tokens: {mu.output_tokens} "
+                        f"(incl. {mu.reasoning_tokens} reasoning)"
+                    )
+                else:
+                    print(f"      output_tokens: {mu.output_tokens}")
                 print(f"      cache_read:    {mu.cache_read_tokens}")
                 print(f"      cache_create:  {mu.cache_creation_tokens}")
                 print(f"      cost_usd:      ${mu.cost_usd:.4f}")
@@ -947,11 +963,34 @@ def _truncate(text: str, max_len: int = 30000) -> str:
     return text[:max_len] + f"  …[+{len(text) - max_len} chars]"
 
 
+def _apply_patch_files(patch_text: str) -> list[str]:
+    """
+    Extract per-file operations from an OpenAI `apply_patch` envelope
+    (`*** Add File: p`, `*** Update File: p`, `*** Delete File: p`).
+    GPT-family models on OpenCode write files through this tool instead of
+    write/edit, so the visualizer must treat it as a write action.
+    """
+    ops = []
+    for line in patch_text.splitlines():
+        line = line.strip()
+        for marker, tag in (("*** Add File:", "add"),
+                            ("*** Update File:", "update"),
+                            ("*** Delete File:", "delete")):
+            if line.startswith(marker):
+                ops.append(f"{tag} {line[len(marker):].strip()}")
+    return ops
+
+
 def _fmt_tool_input(name: str, inp: dict) -> str:
     """Format tool input as a compact one-or-few-liner."""
     name_lower = name.lower()
     if not isinstance(inp, dict):
         return str(inp)[:200]
+    if name_lower == "apply_patch":
+        patch = inp.get("patchText", inp.get("patch", "")) or ""
+        ops = _apply_patch_files(patch)
+        files = "; ".join(ops) if ops else "(no file headers in patch)"
+        return f"{files}  ({len(patch)} chars)"
     if name_lower == "bash":
         cmd = inp.get("command", inp.get("input", "")).strip().replace("\n", " ↵ ")
         desc = inp.get("description", "")
@@ -1004,7 +1043,11 @@ def _fmt_turns(turns: list[Turn], out: list[str], indent: str = "") -> None:
             icon = "🤖" if is_agent else "🔧"
             fmt_input = _fmt_tool_input(tu.name, tu.input)
             input_lines = fmt_input.splitlines()
-            out.append(f"{indent}│  {icon} Tool: {tu.name}  {input_lines[0]}")
+            # Interrupted/aborted tool calls (a killed session leaves
+            # `tool:"unknown"` stubs with `input:{}`) format to an empty
+            # string, so `input_lines` can be empty — guard the head access.
+            head = input_lines[0] if input_lines else ""
+            out.append(f"{indent}│  {icon} Tool: {tu.name}  {head}")
             for extra_line in input_lines[1:]:
                 out.append(f"{indent}│     {extra_line}")
 
@@ -1387,7 +1430,7 @@ def _classify_tool(tu: ToolUse) -> str:
     name_lower = tu.name.lower()
     if name_lower in ("read", "glob", "grep"):
         return CAT_READ
-    if name_lower in ("write", "edit", "notebookedit"):
+    if name_lower in ("write", "edit", "notebookedit", "apply_patch"):
         return CAT_WRITE
     if name_lower == "bash":
         cmd = tu.input.get("command", "") if isinstance(tu.input, dict) else ""
@@ -1408,6 +1451,12 @@ def _tool_size(tu: ToolUse) -> int:
         return len(tu.input.get("content", "")) if isinstance(tu.input, dict) else 0
     if name_lower == "edit":
         return len(tu.input.get("new_string", "")) if isinstance(tu.input, dict) else 0
+    if name_lower == "apply_patch":
+        # Weight by the patch body; a few events carry an empty patchText
+        # (observed for PLAN.md updates), fall back to the result size.
+        patch = tu.input.get("patchText", "") if isinstance(tu.input, dict) else ""
+        if patch:
+            return len(patch)
     # All others: characters that came back into context.
     return len(tu.result.content) if tu.result else 0
 
@@ -1529,6 +1578,8 @@ def _synthesize_workflow_agent_turns(
                 synthetic_input["command"] = tool_summary
             elif tool_name.lower() in ("read", "write", "edit"):
                 synthetic_input["file_path"] = tool_summary
+            elif tool_name.lower() == "apply_patch":
+                synthetic_input["patchText"] = tool_summary
             elif tool_name.lower() in ("glob", "grep"):
                 synthetic_input["pattern"] = tool_summary
 
@@ -1599,6 +1650,11 @@ def _segment_turn(turn: Turn) -> list[_Segment]:
         elif name_lower in ("write", "edit"):
             target = ((tu.input.get("file_path") or tu.input.get("filePath") or "") if isinstance(tu.input, dict) else "") or desc_fallback
             tip = f"{tu.name}: {target}"
+        elif name_lower == "apply_patch":
+            patch = tu.input.get("patchText", "") if isinstance(tu.input, dict) else ""
+            ops = _apply_patch_files(patch)
+            target = "; ".join(ops) or desc_fallback
+            tip = f"{tu.name}: {target}"
         elif name_lower in ("agent", "task", "workflow"):
             desc = ""
             prompt_text = ""
@@ -1659,11 +1715,18 @@ def _session_ended(s: Session) -> bool:
     or was killed hard. A sub-agent with status "running" must NOT be
     reported as frozen unless the session actually ended — otherwise every
     in-flight sync sub-agent in a live trace shows up as a false FROZEN.
-    OpenCode sessions come from post-mortem exports, so they count as ended.
+
+    OpenCode sessions can also be live: live-exports (and JSONL tails) of a
+    running session report in-flight tools as status "running" exactly like
+    a genuinely frozen one. The reliable end signal is the agent_runner
+    phase window: `process_wall_ms` is only set once the trace contains the
+    closing "Exporting"/"Appended" runner marker, which a live run has not
+    written yet. (Session.result is synthesized for OpenCode and says
+    nothing about liveness.)
     """
     if s.agent_type == "claude":
         return s.result is not None
-    return True
+    return bool(s.process_wall_ms)
 
 
 def _flatten_rows(sessions: list[Session]) -> tuple[list[_Row], list[_Group]]:
@@ -2013,22 +2076,29 @@ def render_timeline_svg(sessions: list[Session]) -> str:
     # `bar_inset` pixels to the left of the actual bars. Hovering the line
     # surfaces the same tooltip as the parent's purple Agent bar segment.
     group_color = CAT_COLORS.get(CAT_SUBAGENT, "#9b80c8")
-    frozen_color = "#d9534f"  # red: this sub-agent never completed
-    for grp in groups:
+    # Unfinished sub-agents keep the normal purple but the guide line fades
+    # out toward the bottom ("the thread was never closed") and ends in a
+    # small glyph: ✕ = still running when the process ended (killed),
+    # ○ = trace has no result event yet (session may still be live).
+    # Red is deliberately not used — it already means build/error elsewhere.
+    fade_defs: list[str] = []
+    for grp_i, grp in enumerate(groups):
         gx = label_w + grp.depth * indent_px + 3
         gy1 = row_y[grp.start_idx] + 1
         gy2 = row_y[grp.end_idx] + row_heights[grp.end_idx] - 1
-        # Status-based frozen inference is only valid once the session has
-        # actually ended; in a live trace a "running" sub-agent is just a
-        # sub-agent that is still running.
-        in_flight = (
-            grp.tool_use is not None
-            and grp.tool_use.subagent is not None
-            and grp.tool_use.subagent.status in ("running", "pending")
+        # "Never completed" evidence: an export that caught the tool still
+        # running (tu.frozen) or a sub-agent status stuck at running/pending.
+        # Either is only FROZEN once the session actually ended; in a live
+        # trace it just means the sub-agent is still running right now.
+        unfinished = grp.tool_use is not None and (
+            grp.tool_use.frozen
+            or (
+                grp.tool_use.subagent is not None
+                and grp.tool_use.subagent.status in ("running", "pending")
+            )
         )
-        frozen = grp.tool_use is not None and (
-            grp.tool_use.frozen or (grp.session_ended and in_flight)
-        )
+        frozen = unfinished and grp.session_ended
+        in_flight = unfinished and not grp.session_ended
         tooltip_lines = []
         if grp.tool_use is not None:
             tu = grp.tool_use
@@ -2059,20 +2129,52 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         tooltip = html.escape("\n".join(tooltip_lines)) if tooltip_lines else ""
         # Async sub-agents: dashed line, signaling that the row order is
         # only approximate (synthesized from progress snapshots, not a true
-        # API conversation). Frozen sub-agents: red line.
+        # API conversation).
         dash_attr = ' stroke-dasharray="5,3"' if grp.is_async else ''
-        line_color = frozen_color if frozen else group_color
-        if tooltip:
-            out.append(
-                f'<g><title>{tooltip}</title>'
-                f'<line x1="{gx}" y1="{gy1}" x2="{gx}" y2="{gy2}" '
-                f'stroke="{line_color}" stroke-width="3"{dash_attr}/></g>'
+        if unfinished:
+            grad_id = f"gfade{grp_i}"
+            fade_defs.append(
+                f'<linearGradient id="{grad_id}" gradientUnits="userSpaceOnUse" '
+                f'x1="0" y1="{gy1}" x2="0" y2="{gy2}">'
+                f'<stop offset="55%" stop-color="{group_color}" stop-opacity="1"/>'
+                f'<stop offset="100%" stop-color="{group_color}" stop-opacity="0"/>'
+                f'</linearGradient>'
             )
+            stroke = f"url(#{grad_id})"
         else:
-            out.append(
-                f'<line x1="{gx}" y1="{gy1}" x2="{gx}" y2="{gy2}" '
-                f'stroke="{line_color}" stroke-width="3"{dash_attr}/>'
+            stroke = group_color
+        parts = [
+            f'<line x1="{gx}" y1="{gy1}" x2="{gx}" y2="{gy2}" '
+            f'stroke="{stroke}" stroke-width="3"{dash_attr}/>'
+        ]
+        if frozen:
+            # Thick stroked ✕ at the line end (a text glyph renders too thin).
+            cy = gy2 - 3
+            parts.append(
+                f'<path d="M {gx - 4} {cy - 4} L {gx + 4} {cy + 4} '
+                f'M {gx - 4} {cy + 4} L {gx + 4} {cy - 4}" '
+                f'stroke="{group_color}" stroke-width="2.5" '
+                f'stroke-linecap="round" fill="none"/>'
             )
+        elif in_flight:
+            # Three chevrons pointing down ("still flowing"), drawn over the
+            # faded tail of the guide line.
+            chevrons = []
+            for k in range(3):
+                y0 = gy2 - 14 + k * 5
+                chevrons.append(
+                    f'<path d="M {gx - 4} {y0} L {gx} {y0 + 4} L {gx + 4} {y0}" '
+                    f'stroke="{group_color}" stroke-width="2.5" '
+                    f'stroke-linecap="round" fill="none"/>'
+                )
+            parts.extend(chevrons)
+        if tooltip:
+            out.append(f'<g><title>{tooltip}</title>{"".join(parts)}</g>')
+        else:
+            out.append("".join(parts))
+
+    if fade_defs:
+        out.append("<defs>" + "".join(fade_defs) + "</defs>")
 
     for idx, row in enumerate(rows):
         y = row_y[idx]
@@ -2350,8 +2452,11 @@ class OpenCodeParser:
                 # inflates input by the cache_read amount.  The `input` field
                 # already contains only the true non-cached input tokens.
                 in_tok = tokens.get("input", 0)
-                out_tok = tokens.get("output", 0)
+                # OpenCode reports reasoning separately from output, but the
+                # provider bills reasoning at the output rate — fold it in so
+                # output_tokens is directly usable for cost estimation.
                 reason_tok = tokens.get("reasoning", 0)
+                out_tok = tokens.get("output", 0) + reason_tok
                 turn_usage = TokenUsage(
                     input_tokens=in_tok,
                     output_tokens=out_tok,
@@ -2511,8 +2616,10 @@ class OpenCodeExportParser:
                     # reasoning`.  The `total` field includes cache_read, so
                     # the subtraction would inflate input by the cache_read amount.
                     in_tok = tokens.get("input", 0)
-                    out_tok = tokens.get("output", 0)
+                    # Fold reasoning into output: billed at the output rate
+                    # (see TokenUsage docstring).
                     reason_tok = tokens.get("reasoning", 0)
+                    out_tok = tokens.get("output", 0) + reason_tok
                     current_turn.usage = TokenUsage(
                         input_tokens=in_tok,
                         output_tokens=out_tok,
@@ -2541,13 +2648,17 @@ class OpenCodeExportParser:
         model_id = model_info.get("id", "unknown")
         model_usage = {}
         if info_tokens:
+            # Fold reasoning into output: billed at the output rate
+            # (see TokenUsage docstring).
+            reason_tok = int(info_tokens.get("reasoning", 0))
             model_usage[model_id] = ModelUsage(
                 model=model_id,
                 input_tokens=int(info_tokens.get("input", 0)),
-                output_tokens=int(info_tokens.get("output", 0)),
+                output_tokens=int(info_tokens.get("output", 0)) + reason_tok,
                 cache_read_tokens=int(info_tokens.get("cache", {}).get("read", 0)),
                 cache_creation_tokens=int(info_tokens.get("cache", {}).get("write", 0)),
                 cost_usd=float(info_cost) if info_cost else 0.0,
+                reasoning_tokens=reason_tok,
             )
         session.result = ResultEvent(
             is_error=False,
