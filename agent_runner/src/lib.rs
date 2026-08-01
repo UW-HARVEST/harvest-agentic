@@ -49,6 +49,10 @@ impl AgentPhase {
         }
     }
 
+    /// Compaction-recovery hint, injected per turn. Claude-only: the OpenCode
+    /// backend replaces this with the compaction-recovery plugin (see
+    /// `OPENCODE_COMPACTION_PLUGIN`), which fires exactly once per compaction
+    /// instead of diluting every turn's system prompt.
     fn append_system_prompt(self) -> &'static str {
         match self {
             AgentPhase::Translate => "After any context compaction, you MUST first read PLAN.md.",
@@ -56,6 +60,16 @@ impl AgentPhase {
                 "After any context compaction, you MUST first read PLAN.md and HYPOTHESES.md."
             }
             AgentPhase::Conform => "After any context compaction, you MUST first read CONFORM.md.",
+        }
+    }
+
+    /// The persistent memory files the agent must re-read to recover after a
+    /// context compaction. Only meaningful when plan files are enabled.
+    fn recovery_files(self) -> &'static [&'static str] {
+        match self {
+            AgentPhase::Translate => &["PLAN.md"],
+            AgentPhase::Verify => &["PLAN.md", "HYPOTHESES.md"],
+            AgentPhase::Conform => &["CONFORM.md"],
         }
     }
 }
@@ -577,13 +591,11 @@ fn prepare_agent_files(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn s
             OpenCodeAgentConfig {
                 name: invocation.phase.opencode_agent_name(),
                 description: invocation.phase.opencode_description(),
-                // The compaction-recovery hint references PLAN.md/HYPOTHESES.md,
-                // which do not exist when plan files are disabled.
-                system_prompt: if invocation.plan_files_enabled() {
-                    invocation.phase.append_system_prompt()
-                } else {
-                    ""
-                },
+                // The recovery files (PLAN.md/HYPOTHESES.md/CONFORM.md) do
+                // not exist when plan files are disabled.
+                recovery_command: invocation
+                    .plan_files_enabled()
+                    .then(|| format!("cat {}", invocation.phase.recovery_files().join(" "))),
             },
             invocation.model,
         ),
@@ -674,6 +686,14 @@ fn invoke_opencode(
         .model
         .map(|_| "--model \"$MODEL\" ")
         .unwrap_or_default();
+    // No `--pure`: its single effect (verified in the opencode source) is to
+    // clear the external-plugin list, which would also disable the
+    // project-local compaction-recovery plugin written by
+    // `write_opencode_agent`. Isolation from the user-global config is
+    // instead achieved by pointing XDG_CONFIG_HOME at a run-private empty
+    // directory in `run_bash_agent` — stronger than `--pure` (hides global
+    // plugins AND global config/instructions), while project-local
+    // `.opencode/` still loads.
     run_bash_agent(
         invocation,
         log_path,
@@ -682,7 +702,6 @@ fn invoke_opencode(
              --format json \
              --thinking \
              --dangerously-skip-permissions \
-             --pure \
              --agent {} \
              {model_flag}\
              \"$PROMPT\" \
@@ -722,6 +741,23 @@ fn run_bash_agent(
     if let Some(toolchain) = invocation.rust_toolchain {
         info!("Injecting RUSTUP_TOOLCHAIN={toolchain}");
         cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+
+    if invocation.agent == AgentKind::OpenCode {
+        // Hide the user-global OpenCode config from the run. OpenCode
+        // resolves its global config dir via xdg-basedir
+        // (XDG_CONFIG_HOME/opencode), so a run-private empty directory makes
+        // global plugins, global opencode.json{,c}, and global AGENTS.md
+        // instructions unreachable — the isolation `--pure` used to provide,
+        // without disabling the project-local compaction-recovery plugin.
+        // Auth (XDG data dir) and the models cache (XDG cache dir) are
+        // unaffected.
+        let xdg_config = run_tempdir(invocation.work_dir).join("xdg-config");
+        info!(
+            "Injecting XDG_CONFIG_HOME={} (run-private, replaces --pure isolation)",
+            xdg_config.display()
+        );
+        cmd.env("XDG_CONFIG_HOME", &xdg_config);
     }
 
     // Temporary workaround for an OpenCode bug (upstream issue #29363): each
@@ -969,8 +1005,20 @@ fn write_claude_sandbox(case_dir: &Path) -> Result<(), Box<dyn std::error::Error
 struct OpenCodeAgentConfig<'a> {
     name: &'a str,
     description: &'a str,
-    system_prompt: &'a str,
+    /// `cat <files>` command for post-compaction memory recovery; None when
+    /// plan files are disabled (nothing to recover). Some → the
+    /// compaction-recovery plugin is written next to the agent definition.
+    recovery_command: Option<String>,
 }
+
+/// Project-local OpenCode plugin (auto-loaded from `.opencode/plugin/`) that
+/// makes post-compaction plan-file recovery reliable. A per-turn system-prompt
+/// hint ("after any compaction, read PLAN.md first") is both wasteful and
+/// weakly followed (observed in trace_zstd_44: the instruction was present in
+/// the system prompt AND in the summary text, and was still skipped). See the
+/// plugin source for the mechanism; `{RECOVERY_CMD}` is substituted with the
+/// phase's recovery command before writing.
+const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("opencode_compaction_recovery.js");
 
 const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[
     ("bash", "allow"),
@@ -1097,13 +1145,31 @@ fn write_opencode_agent(
         permissions.push_str(&format!("  {tool}: {policy}\n"));
     }
 
+    // The agent .md body becomes `agent.prompt` and would REPLACE OpenCode's
+    // default provider system prompt (request assembly is
+    // `agent.prompt ? [agent.prompt] : SystemPrompt.provider(model)`; the md
+    // body is trimmed, and an empty string is falsy). Historically we put the
+    // compaction-recovery hint here, which silently dropped the entire
+    // default coding prompt (~2k tokens of tool-use/communication guidance).
+    // Deliberately keep the body EMPTY: the official default prompt is a
+    // stable prefix (billed once, then cache reads), and the recovery
+    // instruction now lives in the compaction plugin instead.
     fs::write(
         agents_dir.join(format!("{}.md", config.name)),
         format!(
-            "---\ndescription: {}\nmode: primary\npermission:\n{}---\n{}\n",
-            config.description, permissions, config.system_prompt
+            "---\ndescription: {}\nmode: primary\npermission:\n{}---\n",
+            config.description, permissions
         ),
     )?;
+
+    if let Some(recovery_command) = &config.recovery_command {
+        let plugin_dir = work_dir.join(".opencode/plugin");
+        fs::create_dir_all(&plugin_dir)?;
+        fs::write(
+            plugin_dir.join("compaction-recovery.js"),
+            OPENCODE_COMPACTION_PLUGIN.replace("{RECOVERY_CMD}", recovery_command),
+        )?;
+    }
     Ok(())
 }
 
@@ -1193,18 +1259,49 @@ mod tests {
             OpenCodeAgentConfig {
                 name: "harvest-translate",
                 description: "test",
-                system_prompt: "",
+                recovery_command: None,
             },
             None,
         )
         .unwrap();
         let config = fs::read_to_string(dir.path().join(".opencode/opencode.json")).unwrap();
         assert_eq!(config, opencode_project_config(dir.path(), None));
+        let agent_md = fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md"))
+            .unwrap();
+        // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
+        // official default provider system prompt applies; the compaction
+        // hint lives in the plugin, not here.
+        assert!(agent_md.ends_with("---\n"));
+        assert!(!agent_md.contains("compaction"));
+        // No recovery command -> no plugin.
         assert!(
-            dir.path()
-                .join(".opencode/agents/harvest-translate.md")
+            !dir.path()
+                .join(".opencode/plugin/compaction-recovery.js")
                 .exists()
         );
+    }
+
+    #[test]
+    fn write_opencode_agent_writes_compaction_recovery_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        write_opencode_agent(
+            dir.path(),
+            OpenCodeAgentConfig {
+                name: "harvest-verify",
+                description: "test",
+                recovery_command: Some("cat PLAN.md HYPOTHESES.md".to_string()),
+            },
+            None,
+        )
+        .unwrap();
+        let plugin = fs::read_to_string(dir.path().join(".opencode/plugin/compaction-recovery.js"))
+            .unwrap();
+        assert!(plugin.contains("run `cat PLAN.md HYPOTHESES.md` to restore"));
+        assert!(!plugin.contains("{RECOVERY_CMD}"));
+        assert!(plugin.contains("experimental.chat.messages.transform"));
+        assert!(plugin.contains("experimental.session.compacting"));
+        // Fallback predicate must not depend solely on the unstable metadata marker.
+        assert!(plugin.contains("Continue if you have next steps"));
     }
 
     #[test]
