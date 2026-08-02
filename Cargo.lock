@@ -1409,6 +1409,7 @@ dependencies = [
  "llm",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1429,6 +1430,7 @@ dependencies = [
  "harvest_core",
  "libc",
  "load_raw_source",
+ "load_translated_package",
  "modular_translation_llm",
  "raw_source_to_cargo_llm",
  "serde",
@@ -1877,6 +1879,16 @@ version = "0.1.0"
 dependencies = [
  "full_source",
  "harvest_core",
+ "tracing",
+]
+
+[[package]]
+name = "load_translated_package"
+version = "0.1.0"
+dependencies = [
+ "full_source",
+ "harvest_core",
+ "tempfile",
  "tracing",
 ]
 

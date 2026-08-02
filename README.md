@@ -1,33 +1,62 @@
 # Harvest Agentic Translator
 
-## Two-stage architecture
+## Stage-composable architecture
 
 When `--agentic` is set, the pipeline replaces the one-shot/modular LLM
-translation with two agent-driven stages:
+translation with agent-driven stages. The stages compose: `--agentic=STAGES`
+selects which ones run (bare `--agentic` means `translate,verify`), and a
+later stage can resume from an earlier run's output directory.
 
-1. **Translate** (`tools/translate_agentic`). A coding agent is launched in a
-   fresh working directory containing the C source under `c_src/`. It
-   translates the project into a Cargo package and iterates until
-   `cargo build --release` passes for every feature combination.
-2. **Verify & fix** (`tools/verify_fix_agentic`, enabled by
-   `--agentic-verify`). A second agent receives the Rust translation together
-   with the C source. It compiles the C code as a shared library and uses it
-   as the oracle: it writes differential tests, compares
-   C and Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
+1. **Translate** (`tools/translate_agentic`, stage `translate`/`t`). A coding
+   agent is launched in a fresh working directory containing the C source
+   under `c_src/`. It translates the project into a Cargo package and iterates
+   until `cargo build --release` passes for every feature combination.
+2. **Verify & fix** (`tools/verify_fix_agentic`, stage `verify`/`v`). A second
+   agent receives the Rust translation together with the C source. It builds a
+   comparison environment using the C as the oracle (GoogleTest by default,
+   optionally with FuzzTest; libloading as the legacy method), compares C and
+   Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
+3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`, runs alone). A
+   third agent is given the external test suite and refines the crate until it
+   passes; the result is graded against a pristine copy of the same tests.
 
 After the agent stages, Harvest freezes the result into its IR and compiles it
-one final time (`try_cargo_build`). The `benchmark` binary
-validates the result against the corpus test vectors and writes
-`results.csv`.
+one final time (`try_cargo_build`). The `benchmark` binary validates the
+result against the corpus test suite and writes `results.csv`.
+
+### Snapshots and resuming
+
+Every agentic run stamps each output program directory with a
+`harvest_stage.json` manifest (stage history, agent/model/prompt mode, the
+bench test case it came from plus a content hash of its `test_case/`, and the
+top-level entries that belong to the frozen Cargo package). That makes the
+output a **snapshot** that a later run can resume from:
+
+```bash
+# 1. Freeze a translator snapshot (no verify):
+benchmark --agentic=t --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_T1
+
+# 2. Run verify experiments against the SAME frozen translation, repeatedly:
+benchmark --agentic=v --agent claude --model sonnet ./out_lz4_T1 ./out_lz4_T1_v1
+benchmark --agentic=v --agent claude --model opus   ./out_lz4_T1 ./out_lz4_T1_v2
+```
+
+`INPUT_DIR` is always what the *first* selected stage consumes: a bench
+test-case root when the run starts at translate, a snapshot root when it
+starts at verify or conform. The verify-first run finds the bench case through
+the snapshot's manifest and fails fast if the bench `test_case/` content no
+longer matches the recorded hash (`--test-case <DIR>` overrides the bench
+location explicitly, downgrading the mismatch to a warning). The snapshot
+input is never modified; results always go to the fresh `OUTPUT_DIR`.
 
 ## Supported agents and models
 
 The corresponding agent CLI must be installed and authenticated on your PATH.
 
-**Claude Code** (`--agentic-agent claude`):
+**Claude Code** (`--agent claude`):
 
 - Anthropic models: pass short aliases (`sonnet`, `opus`, `haiku`) or full
-  model IDs via `--agentic-model`. Requires a logged-in `claude` CLI.
+  model IDs via `--model`. Requires a logged-in `claude` CLI.
 - Non-Anthropic models via CCR: pass `provider,model` (with a comma), e.g.
   `openrouter,deepseek/deepseek-v4-pro` or `opencode-go,mimo-v2.5`. Harvest
   then routes the `claude` CLI through
@@ -36,7 +65,7 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   beforehand (with the provider API keys exported in the same shell). Appending `[1m]` to the model name requests the 1M-context
   variant where the provider offers one.
 
-**OpenCode** (`--agentic-agent opencode`, alias `oc`):
+**OpenCode** (`--agent opencode`, alias `oc`):
 
 - Models use `provider/model` format, e.g. `openrouter/deepseek/deepseek-v4-pro`,
   `opencode-go/mimo-v2.5`, `xiaomi-token-plan-cn/mimo-v2.5-pro`. Any provider
@@ -46,7 +75,7 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
 - After each run, all OpenCode sessions (including sub-agents) are exported
   and appended to the logs, so traces are complete.
 
-**Kiro** (`--agentic-agent kiro`): legacy backend using per-project-kind prompts; kept for comparison.
+**Kiro** (`--agent kiro`): legacy backend using per-project-kind prompts; kept for comparison.
 
 ## Prompt modes
 
@@ -83,19 +112,23 @@ runner build would otherwise report all test vectors as failures.
 
 | Flag | Meaning |
 |------|---------|
-| `--agentic` | Use the agentic translator instead of one-shot/modular LLM translation |
-| `--agentic-verify` | Run the verify-and-fix agent stage after translation |
-| `--agentic-agent <A>` | `claude`, `opencode`/`oc`, or `kiro` |
-| `--agentic-model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default |
+| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify`. The value form requires `=` (`--agentic=v`, not `--agentic v`). Conform runs alone. |
+| `--agent <A>` | `claude`, `opencode`/`oc`, or `kiro` |
+| `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
+| `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
+| `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
+| `--fuzz` | With the gtest verify harness, also ship FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--no-plan-file` | Sub-agent guidance kept, plan files never mentioned |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
 | `--agent-tools` | Provide the agent with pre-built tools |
-| `--wait-until <TS>` | Delay the verify stage until a Unix timestamp (e.g. the next subscription quota window) |
-| `--test <PATH>` | Re-validate an already-translated output directory without re-translating |
+| `--wait-until <TS>` | Delay the first agentic stage of the run until a Unix timestamp (e.g. the next subscription quota window) |
+| `--test <PATH>` | Re-validate an already-translated output directory without running any stage |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
 
-`--timeout`, `--filter`, and `--exclude` work as in non-agentic benchmark runs.
+`--timeout`, `--test-harness`, `--filter`, and `--exclude` work as in
+non-agentic benchmark runs. Flags scoped to a stage (e.g. `--fuzz` to verify)
+are rejected when that stage is not part of the run.
 
 ## Examples
 
@@ -104,7 +137,7 @@ Small public test case, Claude Sonnet, full translate + verify (the trailing
 
 ```bash
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude --agentic-model sonnet \
+  --agentic --agent claude --model sonnet \
   ./Test-Corpus/Public-Tests/P00_perlin_noise/ ./out_perlin_1_cs &> ./trace_perlin_1_cs.txt
 ```
 
@@ -112,7 +145,7 @@ A real-world library from the adapted corpus (lz4):
 
 ```bash
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude --agentic-model sonnet \
+  --agentic --agent claude --model sonnet \
   ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_1_cs &> ./trace_lz4_1_cs.txt
 ```
 
@@ -120,8 +153,8 @@ Non-Claude model through OpenCode:
 
 ```bash
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent oc \
-  --agentic-model openrouter/deepseek/deepseek-v4-pro \
+  --agentic --agent oc \
+  --model openrouter/deepseek/deepseek-v4-pro \
   ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_2_ods4p &> ./trace_lz4_2_ods4p.txt
 ```
 
@@ -129,8 +162,8 @@ Non-Anthropic model driven by Claude Code through CCR (note the comma):
 
 ```bash
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude \
-  --agentic-model "openrouter,deepseek/deepseek-v4-flash" \
+  --agentic --agent claude \
+  --model "openrouter,deepseek/deepseek-v4-flash" \
   ./Test-Corpus/Public-Tests/P00_perlin_noise/ ./out_perlin_2_cds4f &> ./trace_perlin_2_cds4f.txt
 ```
 
@@ -139,18 +172,18 @@ Prompt-mode ablations on a large repo (zstd):
 ```bash
 # no-plan
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude --agentic-model opus --no-plan \
+  --agentic --agent claude --model opus --no-plan \
   ./Test-Corpus/Adapted-Tests/P03_zstd/ ./out_zstd_1_co_np &> ./trace_zstd_1_co_np.txt
 
 # workflow mode
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude --agentic-model sonnet \
+  --agentic --agent claude --model sonnet \
   --no-plan --workflow \
   ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
 
 # no-plan-file
 cargo run --bin=benchmark --release -- \
-  --agentic --agentic-verify --agentic-agent claude --agentic-model sonnet --no-plan-file \
+  --agentic --agent claude --model sonnet --no-plan-file \
   ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_4_cs_npf &> ./trace_lz4_4_cs_npf.txt
 ```
 
@@ -164,8 +197,8 @@ Single project through the `translate` binary (no test-vector validation;
 model set via config override):
 
 ```bash
-cargo run --bin=translate --release -- --agentic --agentic-verify \
-  --agentic-agent claude --config tools.translate_agentic.model=sonnet \
+cargo run --bin=translate --release -- --agentic \
+  --agent claude --config tools.translate_agentic.model=sonnet \
   ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/test_case/ -o out_lz4_translate
 ```
 
@@ -178,6 +211,9 @@ In addition to the standard benchmark outputs (`output.log`, `results.csv`,
 per-program translated Rust, `c_src/`, `failed_tests/`, `results.err`),
 agentic runs produce per program:
 
+- `harvest_stage.json`: the stage manifest that makes the directory a
+  resumable snapshot (stage history, agent/model/prompt mode, bench test-case
+  reference + content hash, and the top-level entries of the frozen package)
 - `plan_translate.md`: the translator's `PLAN.md`, if it wrote one
 - `hypotheses_verify.md`: the verifier's `HYPOTHESES.md`, if it wrote one
 - `tool_wishlist.json`: static-analysis tools the agent wished it had

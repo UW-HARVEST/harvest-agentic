@@ -17,3 +17,4 @@ pub use ir::{HarvestIR, Representation};
 pub mod cargo_utils;
 pub mod cmake_presets;
 pub mod config;
+pub mod stage_manifest;

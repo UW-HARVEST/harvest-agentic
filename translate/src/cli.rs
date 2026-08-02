@@ -4,7 +4,7 @@
 use clap::Parser;
 use config::FileFormat::Toml;
 use directories::ProjectDirs;
-use harvest_core::config::Config;
+use harvest_core::config::{Config, Stage};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,20 +25,33 @@ pub struct Args {
     #[arg(long, conflicts_with = "agentic")]
     pub modular: bool,
 
-    /// Use the agentic translation tool.
-    #[arg(long, conflicts_with = "modular")]
-    pub agentic: bool,
+    /// Run the agentic pipeline. The optional value selects the stages, in
+    /// pipeline order (aliases: t, v): `--agentic=translate`,
+    /// `--agentic=verify`, `--agentic=translate,verify`. Bare `--agentic`
+    /// means translate,verify. Stages other than translate require
+    /// --stage-input.
+    #[arg(
+        long,
+        conflicts_with = "modular",
+        num_args(0..=1),
+        require_equals = true,
+        default_missing_values = ["translate", "verify"],
+        value_delimiter = ',',
+        value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<Stage>())
+    )]
+    pub agentic: Option<Vec<Stage>>,
 
-    /// Run the agentic verify-and-fix stage after translation (requires --agentic).
+    /// A previous run's output program directory (carrying harvest_stage.json)
+    /// to use as the stage input when the first agentic stage is not translate.
     #[arg(long, requires = "agentic")]
-    pub agentic_verify: bool,
+    pub stage_input: Option<PathBuf>,
 
     /// Provide the agent with pre-built analysis tools (requires --agentic).
     #[arg(long, requires = "agentic")]
     pub agent_tools: bool,
 
     /// Which agent to use for agentic translation: kiro, claude, or opencode (requires --agentic).
-    #[arg(long, requires = "agentic", value_parser = parse_agent_kind)]
+    #[arg(long = "agent", requires = "agentic", value_parser = parse_agent_kind)]
     pub agentic_agent: Option<harvest_core::config::AgentKind>,
 
     /// Path to the directory containing the C code to translate.
@@ -137,15 +150,14 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
             .expect("settings override failed");
     }
 
-    if args.agentic {
+    if let Some(stages) = &args.agentic {
+        // Normalize to pipeline order (Stage's Ord is declaration order).
+        let mut stages = stages.clone();
+        stages.sort();
+        stages.dedup();
+        let stages: Vec<String> = stages.iter().map(ToString::to_string).collect();
         settings = settings
-            .set_override("agentic", "true")
-            .expect("settings override failed");
-    }
-
-    if args.agentic_verify {
-        settings = settings
-            .set_override("agentic_verify", "true")
+            .set_override("stages", stages)
             .expect("settings override failed");
     }
 
@@ -177,6 +189,12 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
             .expect("settings override failed");
     }
 
+    if args.stage_input.is_some() {
+        settings = settings
+            .set_override("stage_input", " ")
+            .expect("settings override failed");
+    }
+
     let mut config: Config = settings
         .build()
         .expect("failed to build settings")
@@ -187,6 +205,9 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
     }
     if let Some(ref output) = args.output {
         config.output = output.clone();
+    }
+    if let Some(ref stage_input) = args.stage_input {
+        config.stage_input = Some(stage_input.clone());
     }
     config
 }

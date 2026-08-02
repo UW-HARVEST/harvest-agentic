@@ -3,8 +3,7 @@
 force = false
 log_filter = "info"
 modular = false
-agentic = false
-agentic_verify = false
+stages = []
 agentic_agent = "kiro"
 
 [tools.raw_source_to_cargo_llm]

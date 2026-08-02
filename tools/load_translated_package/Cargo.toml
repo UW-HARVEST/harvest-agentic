@@ -1,0 +1,15 @@
+[package]
+name = "load_translated_package"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+full_source.workspace = true
+harvest_core.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

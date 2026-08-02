@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use harvest_core::config::{AgentKind, Stage};
 use std::path::PathBuf;
 
 /// Which validation harness to run translated projects against.
@@ -26,101 +27,100 @@ pub enum VerifyHarness {
     Libloading,
 }
 
+fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
+    match s.to_lowercase().as_str() {
+        "kiro" => Ok(AgentKind::Kiro),
+        "claude" => Ok(AgentKind::Claude),
+        "opencode" | "oc" => Ok(AgentKind::OpenCode),
+        other => Err(format!(
+            "unknown agent kind: {other} (expected: kiro, claude, opencode)"
+        )),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "harvest-benchmark")]
 #[command(
-    about = "Runs all benchmarks by translating C projects to Rust and validating them with test vectors"
+    about = "Runs benchmarks by translating C projects to Rust and validating them with test suites.\n\
+             The agentic pipeline is stage-composable: --agentic[=STAGES] selects which stages run,\n\
+             and INPUT_DIR is whatever the first selected stage consumes (a bench test-case root for\n\
+             translate; a previous run's output root for verify/conform)."
 )]
 pub struct Args {
-    /// Input directory containing subdirectories with benchmarks
-    #[arg(
-        required_unless_present = "test",
-        help = "Path to the directory containing example subdirectories (each with test_case/ and test_vectors/)"
-    )]
+    /// Input directory. Its meaning follows the first stage of the run:
+    /// for translate (and the non-agentic modes) it is a bench test-case root;
+    /// for verify/conform it is a previous run's output root (a snapshot
+    /// carrying harvest_stage.json manifests).
+    #[arg(required_unless_present = "test")]
     pub input_dir: Option<PathBuf>,
 
-    /// Output directory where the translated Rust projects will be written
-    #[arg(
-        required_unless_present = "test",
-        help = "Path to the output directory for all translated Rust projects"
-    )]
+    /// Output directory where this run's products will be written.
+    #[arg(required_unless_present = "test")]
     pub output_dir: Option<PathBuf>,
 
-    /// Test an already-translated output directory without running translation.
+    /// Test an already-translated output directory without running any stage.
     /// Accepts either an output root containing program subdirectories, or one
-    /// translated program directory with Cargo.toml, runner/, and test_vectors/.
+    /// translated program directory.
     #[arg(
         long,
         conflicts_with_all = [
             "modular",
             "agentic",
-            "agentic_verify",
-            "agentic_agent",
-            "agentic_model",
+            "agent",
+            "model",
             "no_plan",
             "no_plan_file",
             "workflow",
             "agent_tools",
             "config",
-            "wait_until",
+            "test_case",
             "input_dir",
             "output_dir"
         ]
     )]
     pub test: Option<PathBuf>,
 
-    /// Third-stage conformance refinement mode. Takes an already-translated
-    /// (post verify) program directory as input_dir and writes a refined copy
-    /// to output_dir. The external test suite (gtest_suite/ or the tractor
-    /// runner+vectors already present in the input) is revealed to the agent,
-    /// whose objective is to make every external test pass; the refined result
-    /// is then graded independently against a pristine copy of the same tests.
-    /// Decoupled from translate/verify. Requires --agentic-agent (and usually
-    /// --agentic-model). Test selection follows --test-harness (default auto,
-    /// gtest preferred).
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "test",
-            "modular",
-            "agentic",
-            "agentic_verify",
-            "no_plan",
-            "no_plan_file",
-            "workflow",
-            "agent_tools",
-            "wait_until"
-        ]
-    )]
-    pub conform: bool,
-
     /// Use modular translation rather than standard all-at-once translation.
     #[arg(long, conflicts_with = "agentic")]
     pub modular: bool,
 
-    /// Use the agentic translation tool.
-    #[arg(long, conflicts_with = "modular")]
-    pub agentic: bool,
+    /// Run the agentic pipeline. The optional value selects the stages, in
+    /// pipeline order (aliases: t, v, c): `--agentic=translate` freezes a
+    /// translator snapshot, `--agentic=verify` resumes from one,
+    /// `--agentic=conform` refines against the external suite. Bare
+    /// `--agentic` means translate,verify. Conform currently runs alone.
+    #[arg(
+        long,
+        conflicts_with = "modular",
+        num_args(0..=1),
+        require_equals = true,
+        default_missing_values = ["translate", "verify"],
+        value_delimiter = ',',
+        value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<Stage>())
+    )]
+    pub agentic: Option<Vec<Stage>>,
 
-    /// Run the agentic verify-and-fix stage after translation (requires --agentic).
-    #[arg(long, requires = "agentic")]
-    pub agentic_verify: bool,
+    /// Which agent to use: kiro, claude, or opencode.
+    #[arg(long, requires = "agentic", value_parser = parse_agent_kind)]
+    pub agent: Option<AgentKind>,
 
-    /// Which agent to use: kiro, claude, or opencode. Used by --agentic and by
-    /// --conform (both need an agent).
-    #[arg(long)]
-    pub agentic_agent: Option<String>,
-
-    /// Agent model to use for agentic translation/verification/conformance.
+    /// Agent model for the agentic stages of this run.
     /// Claude accepts short aliases ("sonnet", "opus", "haiku") or full model IDs.
     /// OpenCode expects provider/model format (for example, "opencode-go/deepseek-v4-pro").
-    #[arg(long)]
-    pub agentic_model: Option<String>,
+    #[arg(long, requires = "agentic")]
+    pub model: Option<String>,
+
+    /// Override the bench test-case location when resuming from a snapshot
+    /// (first stage verify/conform). By default the bench reference is read
+    /// from each snapshot's harvest_stage.json. Accepts a bench root
+    /// containing program subdirectories, or a single bench program directory.
+    #[arg(long, requires = "agentic")]
+    pub test_case: Option<PathBuf>,
 
     /// Use the pre-883e2e2 prompts (no PLAN.md / HYPOTHESES.md / Invariants /
     /// sub-agent push) and skip the `--append-system-prompt` flag. For
     /// controlled experiments measuring the impact of the anti-compaction
-    /// mechanism. Applies to both translator and verifier. Requires --agentic.
+    /// mechanism. Applies to the translate/verify stages of this run.
     #[arg(long, requires = "agentic")]
     pub no_plan: bool,
 
@@ -129,30 +129,28 @@ pub struct Args {
     /// writing plans to disk (the agent may still do so spontaneously), and
     /// skip the `--append-system-prompt` compaction-recovery hint. Isolates
     /// the effect of plan-file persistence from sub-agent usage. Applies to
-    /// both translator and verifier. Requires --agentic; mutually exclusive
-    /// with --no-plan.
+    /// the translate/verify stages of this run.
     #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
     pub no_plan_file: bool,
 
     /// Inject a prompt hint encouraging the agent to use dynamic workflows
     /// (Claude Code's multi-agent orchestration feature). Only meaningful with
-    /// --no-plan; requires --agentic and --agentic-agent claude.
+    /// --no-plan; requires --agent claude.
     #[arg(long, requires = "no_plan")]
     pub workflow: bool,
 
     /// Provide the agent with pre-built analysis tools (c_sandbox, symbol_diff).
-    /// Only meaningful when --agentic is set.
     #[arg(long, requires = "agentic")]
     pub agent_tools: bool,
 
-    /// Comparison mechanism the in-loop verification agent is given.
-    #[arg(long, value_enum, default_value_t = VerifyHarness::Gtest, requires = "agentic_verify")]
-    pub verify_harness: VerifyHarness,
+    /// Comparison mechanism the in-loop verification agent is given
+    /// (default: gtest). Requires the verify stage.
+    #[arg(long, value_enum, requires = "agentic")]
+    pub verify_harness: Option<VerifyHarness>,
 
-    /// With --verify-harness gtest, also describe FuzzTest
-    /// to the agent and ship its scaffolding. No effect
-    /// under the libloading harness.
-    #[arg(long, requires = "agentic_verify")]
+    /// With the gtest verify harness, also describe FuzzTest to the agent and
+    /// ship its scaffolding. Requires the verify stage.
+    #[arg(long, requires = "agentic")]
     pub fuzz: bool,
 
     /// Set a configuration value; format $NAME=$VALUE.
@@ -180,11 +178,132 @@ pub struct Args {
     /// Cannot be used together with --filter.
     #[arg(long, conflicts_with = "filter")]
     pub exclude: Option<String>,
+}
 
-    /// Unix timestamp. If set with --agentic-verify, the verification agent
-    /// will wait until this time before starting. Useful for aligning with
-    /// the 5-hour free window reset. If the current time is already past the
-    /// timestamp, verification starts immediately.
-    #[arg(long, requires = "agentic_verify")]
-    pub wait_until: Option<u64>,
+impl Args {
+    /// The agentic stages of this run, normalized to pipeline order and
+    /// deduplicated. Empty when the run is not agentic.
+    pub fn stages(&self) -> Vec<Stage> {
+        let mut stages = self.agentic.clone().unwrap_or_default();
+        stages.sort();
+        stages.dedup();
+        stages
+    }
+
+    /// Validates flag/stage combinations that clap cannot express (they
+    /// depend on the *value* of --agentic, not its presence).
+    pub fn validate_stages(&self, stages: &[Stage]) -> Result<(), String> {
+        let has = |s: Stage| stages.contains(&s);
+        let stages_str = || {
+            stages
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if self.agentic.is_some() && stages.is_empty() {
+            return Err("--agentic requires at least one stage".to_owned());
+        }
+        if has(Stage::Conform) && stages.len() > 1 {
+            return Err(format!(
+                "stage conform currently runs alone (got --agentic={})",
+                stages_str()
+            ));
+        }
+        let verify_only_flags = [
+            (self.fuzz, "--fuzz"),
+            (self.verify_harness.is_some(), "--verify-harness"),
+        ];
+        for (set, flag) in verify_only_flags {
+            if set && !has(Stage::Verify) {
+                return Err(format!(
+                    "{flag} requires the verify stage (got --agentic={})",
+                    stages_str()
+                ));
+            }
+        }
+        let translate_or_verify_flags = [
+            (self.no_plan, "--no-plan"),
+            (self.no_plan_file, "--no-plan-file"),
+            (self.workflow, "--workflow"),
+            (self.agent_tools, "--agent-tools"),
+        ];
+        for (set, flag) in translate_or_verify_flags {
+            if set && !has(Stage::Translate) && !has(Stage::Verify) {
+                return Err(format!(
+                    "{flag} requires the translate or verify stage (got --agentic={})",
+                    stages_str()
+                ));
+            }
+        }
+        if self.test_case.is_some() && stages.first() != Some(&Stage::Verify) {
+            return Err(format!(
+                "--test-case only applies when resuming from a snapshot with verify as \
+                 the first stage (got --agentic={}); conform grades against the snapshot's \
+                 own suite",
+                stages_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn bare_agentic_means_translate_verify() {
+        let args = parse(&["bench", "--agentic", "in", "out"]).unwrap();
+        assert_eq!(args.stages(), [Stage::Translate, Stage::Verify]);
+        args.validate_stages(&args.stages()).unwrap();
+    }
+
+    #[test]
+    fn stage_aliases_and_normalization() {
+        let args = parse(&["bench", "--agentic=v,T,v", "in", "out"]).unwrap();
+        assert_eq!(args.stages(), [Stage::Translate, Stage::Verify]);
+        let args = parse(&["bench", "--agentic=c", "in", "out"]).unwrap();
+        assert_eq!(args.stages(), [Stage::Conform]);
+    }
+
+    #[test]
+    fn space_separated_stage_value_is_rejected() {
+        // require_equals: `--agentic verify` must not swallow a positional.
+        let args = parse(&["bench", "--agentic", "in", "out"]).unwrap();
+        assert_eq!(args.input_dir.as_deref().unwrap().to_str(), Some("in"));
+        assert!(parse(&["bench", "--agentic", "verify", "in", "out"]).is_err());
+    }
+
+    #[test]
+    fn fuzz_requires_verify_stage() {
+        let args = parse(&["bench", "--agentic=t", "--fuzz", "in", "out"]).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(err.contains("--fuzz"), "{err}");
+    }
+
+    #[test]
+    fn conform_must_run_alone() {
+        let args = parse(&["bench", "--agentic=v,c", "in", "out"]).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(err.contains("conform"), "{err}");
+    }
+
+    #[test]
+    fn test_case_only_for_verify_first() {
+        let args = parse(&["bench", "--agentic=t,v", "--test-case", "tc", "in", "out"]).unwrap();
+        assert!(args.validate_stages(&args.stages()).is_err());
+        let args = parse(&["bench", "--agentic=v", "--test-case", "tc", "in", "out"]).unwrap();
+        args.validate_stages(&args.stages()).unwrap();
+    }
+
+    #[test]
+    fn test_mode_conflicts_with_agentic() {
+        assert!(parse(&["bench", "--test", "out", "--agentic"]).is_err());
+        assert!(parse(&["bench", "--test", "out"]).is_ok());
+    }
 }

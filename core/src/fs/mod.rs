@@ -271,6 +271,54 @@ impl RawDir {
         Ok((RawDir(result), directories, files))
     }
 
+    /// Like [`RawDir::populate_from_filtered`], but additionally includes only
+    /// the top-level entries (files or directories) whose name satisfies
+    /// `keep_top`. Used to reconstruct a frozen `CargoPackage` from a snapshot
+    /// program directory whose top level mixes package entries with sidecars
+    /// (c_src/, gtest_suite/, results.*, ...): the manifest's `package_entries`
+    /// list drives `keep_top`, and `skip_dir` still applies at every depth.
+    pub fn populate_from_toplevel_selected(
+        read_dir: ReadDir,
+        keep_top: &dyn Fn(&OsStr) -> bool,
+        skip_dir: &dyn Fn(&OsStr) -> bool,
+    ) -> std::io::Result<(Self, usize, usize)> {
+        let mut directories = 0;
+        let mut files = 0;
+        let mut result = BTreeMap::default();
+        for entry in read_dir {
+            let entry = entry?;
+            if !keep_top(&entry.file_name()) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                if skip_dir(&entry.file_name()) {
+                    continue;
+                }
+                let (subdir, dirs, fs) =
+                    RawDir::populate_from_filtered(std::fs::read_dir(entry.path())?, skip_dir)?;
+                directories += dirs + 1;
+                files += fs;
+                result.insert(entry.file_name(), RawEntry::Dir(subdir));
+            } else if metadata.is_file() {
+                let contents = std::fs::read(entry.path())?;
+                result.insert(entry.file_name(), RawEntry::File(contents));
+                files += 1;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "snapshot package entry {:?} is a symlink; snapshots must be symlink-free",
+                    entry.file_name()
+                )));
+            }
+        }
+        Ok((RawDir(result), directories, files))
+    }
+
+    /// Returns the names of this directory's top-level entries.
+    pub fn toplevel_entries(&self) -> impl Iterator<Item = &OsStr> {
+        self.0.keys().map(OsString::as_os_str)
+    }
+
     /// Print a representation of the directory to standard out.
     ///
     /// # Arguments

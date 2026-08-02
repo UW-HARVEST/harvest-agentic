@@ -1,17 +1,55 @@
 use std::fmt;
+use std::str::FromStr;
 use std::{collections::HashMap, path::PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Which external agent to invoke for agentic translation and verification.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     #[default]
     Kiro,
     Claude,
     OpenCode,
+}
+
+/// One agentic pipeline stage. Stages compose in pipeline order
+/// (translate < verify < conform); a run executes an ordered subset.
+/// `Conform` is driven by the benchmark binary and never enters
+/// [`crate::HarvestIR`]-based scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stage {
+    Translate,
+    Verify,
+    Conform,
+}
+
+impl fmt::Display for Stage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stage::Translate => write!(f, "translate"),
+            Stage::Verify => write!(f, "verify"),
+            Stage::Conform => write!(f, "conform"),
+        }
+    }
+}
+
+impl FromStr for Stage {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "translate" | "t" => Ok(Stage::Translate),
+            "verify" | "v" => Ok(Stage::Verify),
+            "conform" | "c" => Ok(Stage::Conform),
+            other => Err(format!(
+                "unknown stage: {other} (expected: translate/t, verify/v, conform/c)"
+            )),
+        }
+    }
 }
 
 impl fmt::Display for AgentKind {
@@ -53,12 +91,18 @@ pub struct Config {
     // If false, use standard all-at-once translation.
     pub modular: bool,
 
-    /// If true, use the agentic translation tool instead of the direct LLM translation tools.
-    pub agentic: bool,
-
-    /// If true, run the agentic verify-and-fix stage after translation (requires `agentic = true`).
+    /// Which agentic stages to run, in pipeline order. Empty means the run is
+    /// not agentic (direct LLM translation tools are used instead).
+    /// `Stage::Conform` is not valid here (the benchmark drives conform
+    /// outside the IR pipeline).
     #[serde(default)]
-    pub agentic_verify: bool,
+    pub stages: Vec<Stage>,
+
+    /// When the first stage in `stages` is not `translate`, the path to the
+    /// stage-input snapshot: an already-translated program directory
+    /// (a previous run's output, carrying a `harvest_stage.json` manifest).
+    #[serde(default)]
+    pub stage_input: Option<PathBuf>,
 
     /// If true, provide the agent with pre-built analysis tools (c_sandbox, symbol_diff).
     #[serde(default)]
@@ -92,8 +136,8 @@ impl Config {
             diagnostics_dir: None,
             force: false,
             modular: false,
-            agentic: false,
-            agentic_verify: false,
+            stages: Vec::new(),
+            stage_input: None,
             agent_tools: false,
             agentic_agent: AgentKind::default(),
             log_filter: "off".to_owned(),
@@ -105,9 +149,14 @@ impl Config {
     /// Returns formatted llm info.
     /// Printed at the start of translation and benchmarking runs to aid in reproduction of results.
     pub fn model_info(&self) -> Option<String> {
-        if self.agentic {
-            let verify = if self.agentic_verify { " + verify" } else { "" };
-            return Some(format!("agentic({}){verify}", self.agentic_agent));
+        if !self.stages.is_empty() {
+            let stages = self
+                .stages
+                .iter()
+                .map(Stage::to_string)
+                .collect::<Vec<_>>()
+                .join("+");
+            return Some(format!("agentic({}) stages={stages}", self.agentic_agent));
         }
         let tool_name = if self.modular {
             "modular_translation_llm"
