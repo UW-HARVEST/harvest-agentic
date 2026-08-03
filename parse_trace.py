@@ -1992,6 +1992,20 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
     return "   ".join(parts)
 
 
+# Chars that are illegal in XML 1.0 no matter how they are escaped
+# (control chars other than \t \n \r, plus DEL). Trace text can contain
+# them verbatim — e.g. an agent echoing raw pcre2 bytecode dumped a literal
+# \x1f into a message, which made the whole SVG unparseable in browsers.
+_XML_INVALID_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def _svg_escape(text: str) -> str:
+    # Keep the chars visible (`\x1f`) rather than dropping them: tooltips
+    # exist for debugging and the raw byte is often the interesting part.
+    text = _XML_INVALID_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+    return html.escape(text)
+
+
 def render_timeline_svg(sessions: list[Session]) -> str:
     rows, groups = _flatten_rows(sessions)
     if not rows:
@@ -2039,7 +2053,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
     title = f"Trace timeline — {n_turn_rows} turns"
     out.append(
         f'<text x="20" y="28" font-size="16" font-weight="bold" fill="{_TITLE}">'
-        f'{html.escape(title)}</text>'
+        f'{_svg_escape(title)}</text>'
     )
 
     legend_x = 20
@@ -2126,7 +2140,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
             tooltip_lines.append(f"[task] {desc}")
             tooltip_lines.append(f"[prompt] {prompt_preview}")
             tooltip_lines.append(f"[result] {result_preview}")
-        tooltip = html.escape("\n".join(tooltip_lines)) if tooltip_lines else ""
+        tooltip = _svg_escape("\n".join(tooltip_lines)) if tooltip_lines else ""
         # Async sub-agents: dashed line, signaling that the row order is
         # only approximate (synthesized from progress snapshots, not a true
         # API conversation).
@@ -2197,7 +2211,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
             out.append(
                 f'<text x="{band_x + 8}" y="{y + 11}" '
                 f'fill="{_TITLE}" font-size="11" font-weight="bold">'
-                f'{html.escape(row.summary_text)}</text>'
+                f'{_svg_escape(row.summary_text)}</text>'
             )
             continue
 
@@ -2213,7 +2227,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
                 if ev.pre_tokens or ev.post_tokens else
                 "token counts unavailable"
             )
-            tooltip = html.escape(
+            tooltip = _svg_escape(
                 f"context compaction ({ev.trigger})\n"
                 f"{token_line}\n"
                 f"duration: {ev.duration_ms / 1000:.1f}s"
@@ -2229,7 +2243,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
                 f'<line x1="{band_x}" y1="{cy:.1f}" x2="{band_x + band_w}" y2="{cy:.1f}" '
                 f'stroke="{compact_color}" stroke-width="1" stroke-dasharray="4,3"/>'
                 f'<text x="{band_x + 10}" y="{cy + 4:.1f}" '
-                f'fill="{compact_color}" font-size="10">{html.escape(label)}</text>'
+                f'fill="{compact_color}" font-size="10">{_svg_escape(label)}</text>'
                 f'</g>'
             )
             continue
@@ -2250,14 +2264,14 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         label_fill = _TEXT_DIM if row.depth > 0 else _TEXT
         out.append(
             f'<text x="{gutter_x - 5}" y="{y + 11}" text-anchor="end" '
-            f'fill="{label_fill}">{html.escape(row.label)}</text>'
+            f'fill="{label_fill}">{_svg_escape(row.label)}</text>'
         )
         x = float(bar_start)
         seg_gap = 2.0  # px gap between adjacent segments so equal-color blocks read separately
         for i, seg in enumerate(row.segments):
             w = max(seg.size / max_total * bar_w, 0.5)
             color = CAT_COLORS.get(seg.category, "#999")
-            tooltip = html.escape(
+            tooltip = _svg_escape(
                 f"{seg.category}: {seg.size:,} chars\n{seg.tooltip}"
             )
             out.append(
@@ -2320,7 +2334,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         out.append(
             f'<text x="{band_x + 8}" y="{grand_y + 11}" '
             f'fill="{_TITLE}" font-size="11" font-weight="bold">'
-            f'{html.escape(grand_text)}</text>'
+            f'{_svg_escape(grand_text)}</text>'
         )
 
     out.append('</svg>')
