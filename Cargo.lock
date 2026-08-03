@@ -924,7 +924,10 @@ name = "conform_agentic"
 version = "0.1.0"
 dependencies = [
  "agent_runner",
+ "full_source",
  "harvest_core",
+ "serde",
+ "serde_json",
  "tempfile",
  "tracing",
 ]
@@ -1207,6 +1210,7 @@ name = "full_source"
 version = "0.1.0"
 dependencies = [
  "harvest_core",
+ "serde",
 ]
 
 [[package]]
@@ -1386,11 +1390,11 @@ dependencies = [
  "agent_runner",
  "build_project_spec",
  "clap",
- "conform_agentic",
  "csv",
  "full_source",
  "harvest_core",
  "harvest_translate",
+ "load_test_suite",
  "log",
  "regex",
  "serde",
@@ -1426,10 +1430,12 @@ dependencies = [
  "c_ast",
  "clap",
  "config",
+ "conform_agentic",
  "directories",
  "harvest_core",
  "libc",
  "load_raw_source",
+ "load_test_suite",
  "load_translated_package",
  "modular_translation_llm",
  "raw_source_to_cargo_llm",
@@ -1879,6 +1885,18 @@ version = "0.1.0"
 dependencies = [
  "full_source",
  "harvest_core",
+ "tracing",
+]
+
+[[package]]
+name = "load_test_suite"
+version = "0.1.0"
+dependencies = [
+ "full_source",
+ "harvest_core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 

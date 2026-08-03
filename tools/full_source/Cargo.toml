@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 harvest_core.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

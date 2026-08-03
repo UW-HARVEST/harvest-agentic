@@ -16,38 +16,33 @@ later stage can resume from an earlier run's output directory.
    comparison environment using the C as the oracle (GoogleTest by default,
    optionally with FuzzTest; libloading as the legacy method), compares C and
    Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
-3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`, runs alone). A
-   third agent is given the external test suite and refines the crate until it
-   passes; the result is graded against a pristine copy of the same tests.
+3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). A third agent is
+   given the external test suite and refines the crate until it passes. This is
+   a research instrument, not part of the evaluation pipeline.
 
-After the agent stages, Harvest freezes the result into its IR and compiles it
-one final time (`try_cargo_build`). The `benchmark` binary validates the
-result against the corpus test suite and writes `results.csv`.
+After the agent stages, Harvest freezes the result into its IR
+and compiles it one final time (`try_cargo_build`). The `benchmark` binary
+validates the result against the corpus test suite and writes `results.csv`.
 
 ### Snapshots and resuming
 
-Every agentic run stamps each output program directory with a
-`harvest_stage.json` manifest (stage history, agent/model/prompt mode, the
-bench test case it came from plus a content hash of its `test_case/`, and the
-top-level entries that belong to the frozen Cargo package). That makes the
-output a **snapshot** that a later run can resume from:
+Every agentic run writes each program's result as a **self-contained
+snapshot**: the crate at the top level, and everything the framework owns —
+including the read-only reference inputs — under a single `.harvest/`
+directory.
 
 ```bash
 # 1. Freeze a translator snapshot (no verify):
-benchmark --agentic=t --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_T1
+benchmark --agentic=t --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_1_cs5_t
 
 # 2. Run verify experiments against the SAME frozen translation, repeatedly:
-benchmark --agentic=v --agent claude --model sonnet ./out_lz4_T1 ./out_lz4_T1_v1
-benchmark --agentic=v --agent claude --model opus   ./out_lz4_T1 ./out_lz4_T1_v2
-```
+benchmark --agentic=v --agent claude --model sonnet ./out_lz4_1_cs5_t ./out_lz4_1_cs5_tv
+benchmark --agentic=v --agent claude --model opus   ./out_lz4_1_cs5_t ./out_lz4_1_cs5_t_co5_v
 
-`INPUT_DIR` is always what the *first* selected stage consumes: a bench
-test-case root when the run starts at translate, a snapshot root when it
-starts at verify or conform. The verify-first run finds the bench case through
-the snapshot's manifest and fails fast if the bench `test_case/` content no
-longer matches the recorded hash (`--test-case <DIR>` overrides the bench
-location explicitly, downgrading the mismatch to a warning). The snapshot
-input is never modified; results always go to the fresh `OUTPUT_DIR`.
+# 3. Third-round conform on a verified snapshot (or all three in one run):
+benchmark --agentic=c     --agent claude --model sonnet ./out_lz4_1_cs5_tv ./out_lz4_1_cs5_tvc
+benchmark --agentic=t,v,c --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_2_cs5_tvc
+```
 
 ## Supported agents and models
 
@@ -112,7 +107,7 @@ runner build would otherwise report all test vectors as failures.
 
 | Flag | Meaning |
 |------|---------|
-| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify`. The value form requires `=` (`--agentic=v`, not `--agentic v`). Conform runs alone. |
+| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify`. The value form requires `=` (`--agentic=v`, not `--agentic v`). |
 | `--agent <A>` | `claude`, `opencode`/`oc`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
@@ -204,19 +199,6 @@ cargo run --bin=translate --release -- --agentic \
 
 The `out_*` / `trace_*` naming used above is just a convention:
 `<project>_<run#>_<model shorthand>[_np|_npf][_wf]`.
-
-## Output directory contents (agentic runs)
-
-In addition to the standard benchmark outputs (`output.log`, `results.csv`,
-per-program translated Rust, `c_src/`, `failed_tests/`, `results.err`),
-agentic runs produce per program:
-
-- `harvest_stage.json`: the stage manifest that makes the directory a
-  resumable snapshot (stage history, agent/model/prompt mode, bench test-case
-  reference + content hash, and the top-level entries of the frozen package)
-- `plan_translate.md`: the translator's `PLAN.md`, if it wrote one
-- `hypotheses_verify.md`: the verifier's `HYPOTHESES.md`, if it wrote one
-- `tool_wishlist.json`: static-analysis tools the agent wished it had
 
 ## Trace capture and visualization
 

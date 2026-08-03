@@ -1,79 +1,69 @@
 //! Reconstructs a [`CargoPackage`](full_source::CargoPackage) from a pipeline
-//! snapshot: the output directory of a previous translate (or verify) run.
+//! snapshot: the output directory of a previous run.
 //!
-//! This is the re-entry half of the pipeline's cross-process contract. A run
-//! freezes its final `CargoPackage` by materializing it into the output
-//! program directory and stamping a `harvest_stage.json` manifest whose
-//! `package_entries` list names the top-level entries that belong to the
-//! package. This tool reads that manifest and lifts exactly those entries
-//! back into the IR, so a later invocation can run the verify stage (or grade)
-//! against a frozen translation without re-running the translator.
+//! This is the re-entry half of the pipeline's cross-process contract, and it
+//! is driven entirely by the snapshot layout (see
+//! [`harvest_core::stage_manifest`]): the package is every top-level entry
+//! except the framework's own `.harvest/` directory and cargo's `target/`.
+//! Nothing has to be listed anywhere, so a file added to the crate directory —
+//! by a later stage, by hand, or by a tool nobody thought about — is part of
+//! the crate.
 
 use full_source::CargoPackage;
 use harvest_core::fs::RawDir;
-use harvest_core::stage_manifest::{STAGE_MANIFEST_FILE, StageManifest};
+use harvest_core::stage_manifest::{self, StageManifest};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
-/// Directories that are never part of a frozen package, at any depth:
-/// cargo build output and hidden runtime directories (.claude/, .opencode/,
-/// .git/, ...) that may appear if a snapshot was graded or inspected in place.
-fn is_runtime_dir(name: &OsStr) -> bool {
-    let name = name.to_string_lossy();
-    name == "target" || name.starts_with('.')
+/// Hidden directories that agent runtimes leave behind (`.claude/`,
+/// `.opencode/`, `.git/`, ...). Tools already strip these before freezing;
+/// skipping them here too keeps a hand-edited snapshot loadable.
+fn is_hidden_dir(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
 }
 
-/// Loads the frozen `CargoPackage` from a snapshot program directory, driven
-/// by the manifest's `package_entries`.
+/// Loads the frozen `CargoPackage` from a snapshot program directory.
 pub fn load_snapshot(directory: &Path) -> Result<CargoPackage, Box<dyn std::error::Error>> {
-    let manifest = StageManifest::read_from_dir(directory).map_err(|e| {
-        format!(
-            "cannot load snapshot {}: no readable {STAGE_MANIFEST_FILE} ({e}). \
-             Only outputs produced by a stage-aware run can be used as stage input.",
-            directory.display()
-        )
-    })?;
-
-    let entries: BTreeSet<String> = manifest.package_entries.iter().cloned().collect();
-    if entries.is_empty() {
+    if !stage_manifest::is_snapshot(directory) {
         return Err(format!(
-            "{} in {} lists no package_entries",
-            STAGE_MANIFEST_FILE,
-            directory.display()
+            "{} is not a pipeline snapshot (no {}/{})",
+            directory.display(),
+            stage_manifest::HARVEST_META_DIR,
+            stage_manifest::STAGE_MANIFEST_FILE
         )
         .into());
     }
 
-    // Warn about manifest entries missing on disk (e.g. a manually pruned
-    // snapshot); loading proceeds with what exists.
-    for name in &entries {
-        if !directory.join(name).exists() {
-            warn!(
-                "manifest lists package entry {name:?}, but it does not exist in {}",
-                directory.display()
-            );
-        }
-    }
-
     let (dir, directories, files) = RawDir::populate_from_toplevel_selected(
         read_dir(directory)?,
-        &|name| entries.contains(&*name.to_string_lossy()),
-        &is_runtime_dir,
+        &|name| !stage_manifest::is_reserved_toplevel(name),
+        &is_hidden_dir,
     )?;
+    if dir.toplevel_entries().next().is_none() {
+        return Err(format!(
+            "snapshot {} contains no crate files (only {}/)",
+            directory.display(),
+            stage_manifest::HARVEST_META_DIR
+        )
+        .into());
+    }
+
+    let stages = StageManifest::read_from_dir(directory)
+        .map(|m| {
+            m.stages
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .unwrap_or_else(|_| "unknown".to_owned());
     info!(
-        "Loaded snapshot {} (stages: {}) with {directories} directories and {files} files",
+        "Loaded snapshot {} (stages: {stages}) with {directories} directories and {files} files",
         directory.display(),
-        manifest
-            .stages
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("+"),
     );
     Ok(CargoPackage { dir })
 }
@@ -110,71 +100,89 @@ mod tests {
     use harvest_core::config::{AgentKind, Stage};
     use std::fs;
 
-    fn write_manifest(dir: &Path, package_entries: &[&str]) {
-        let manifest = StageManifest {
+    fn write_manifest(dir: &Path) {
+        StageManifest {
             schema_version: 1,
             stages: vec![Stage::Translate],
-            agent: AgentKind::Claude,
+            agent: Some(AgentKind::Claude),
             model: None,
             prompt_mode: "plan".to_owned(),
             harvest_version: "test".to_owned(),
-            bench_program_dir: PathBuf::from("/bench/prog"),
-            test_case_hash: "sha256:test".to_owned(),
-            package_entries: package_entries.iter().map(|s| s.to_string()).collect(),
+            bench_program: "prog".to_owned(),
+            bench_revision: None,
+            test_corpus_root: None,
+            test_corpus_revision: None,
+            reference_modified: Vec::new(),
             created_unix: 0,
-        };
-        manifest.write_to_dir(dir).unwrap();
+        }
+        .write_to_dir(dir)
+        .unwrap();
     }
 
-    #[test]
-    fn loads_only_package_entries() {
+    fn snapshot() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        fs::create_dir(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "// rust").unwrap();
-        // Sidecars that must not be lifted:
-        fs::create_dir(dir.path().join("c_src")).unwrap();
-        fs::write(dir.path().join("c_src/a.c"), "int x;").unwrap();
-        fs::create_dir(dir.path().join("gtest_suite")).unwrap();
-        fs::write(dir.path().join("plan_translate.md"), "plan").unwrap();
-        fs::create_dir(dir.path().join("target")).unwrap();
-        write_manifest(dir.path(), &["Cargo.toml", "src"]);
+        let p = dir.path();
+        fs::write(p.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(p.join("Cargo.lock"), "# lock").unwrap();
+        fs::create_dir(p.join("src")).unwrap();
+        fs::write(p.join("src/lib.rs"), "// rust").unwrap();
+        write_manifest(p);
+        // Framework-owned and build output: never part of the package.
+        fs::create_dir_all(p.join(".harvest/c_src")).unwrap();
+        fs::write(p.join(".harvest/c_src/a.c"), "int x;").unwrap();
+        fs::create_dir_all(p.join("target/release")).unwrap();
+        fs::write(p.join("target/release/junk"), "x").unwrap();
+        dir
+    }
 
-        let package = load_snapshot(dir.path()).unwrap();
-        let names: Vec<String> = package
+    fn toplevel(package: &CargoPackage) -> Vec<String> {
+        package
             .dir
             .toplevel_entries()
             .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["Cargo.toml", "src"]);
+            .collect()
+    }
+
+    #[test]
+    fn package_is_everything_but_the_reserved_entries() {
+        let dir = snapshot();
+        let package = load_snapshot(dir.path()).unwrap();
+        assert_eq!(toplevel(&package), ["Cargo.lock", "Cargo.toml", "src"]);
         assert!(package.dir.get_file("src/lib.rs").is_ok());
     }
 
     #[test]
-    fn target_dir_is_never_lifted_even_if_listed() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        fs::create_dir(dir.path().join("target")).unwrap();
-        fs::write(dir.path().join("target/junk"), "x").unwrap();
-        write_manifest(dir.path(), &["Cargo.toml", "target"]);
-
+    fn files_added_by_hand_are_picked_up() {
+        let dir = snapshot();
+        fs::write(dir.path().join("build.rs"), "fn main(){}").unwrap();
+        fs::create_dir(dir.path().join("benches")).unwrap();
+        fs::write(dir.path().join("benches/b.rs"), "// bench").unwrap();
         let package = load_snapshot(dir.path()).unwrap();
-        let names: Vec<String> = package
-            .dir
-            .toplevel_entries()
-            .map(|n| n.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["Cargo.toml"]);
+        assert_eq!(
+            toplevel(&package),
+            ["Cargo.lock", "Cargo.toml", "benches", "build.rs", "src"]
+        );
     }
 
     #[test]
-    fn missing_manifest_is_an_error() {
+    fn a_directory_without_a_manifest_is_not_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
         let err = match load_snapshot(dir.path()) {
-            Ok(_) => panic!("expected an error for a manifest-less snapshot"),
+            Ok(_) => panic!("expected an error for a manifest-less directory"),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains(STAGE_MANIFEST_FILE), "{err}");
+        assert!(err.contains("not a pipeline snapshot"), "{err}");
+    }
+
+    #[test]
+    fn a_snapshot_with_no_crate_files_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path());
+        let err = match load_snapshot(dir.path()) {
+            Ok(_) => panic!("expected an error for a crate-less snapshot"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no crate files"), "{err}");
     }
 }

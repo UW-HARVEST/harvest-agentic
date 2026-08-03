@@ -32,7 +32,7 @@
 use crate::error::HarvestResult;
 use crate::harness::library;
 use crate::stats::TestResult;
-use harvest_core::cargo_utils::{self, CargoToml};
+use harvest_core::cargo_utils::CargoToml;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -59,32 +59,25 @@ const LD_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 /// Grace the harness waits beyond an invocation's budget before SIGKILLing it.
 const KILL_GRACE_SECS: u64 = 5;
 
-/// Validates a translated Rust library by building and running the test case's
-/// GoogleTest suite against the compiled cdylib.
+/// Validates a translated Rust project by building and running a GoogleTest
+/// suite against its compiled cdylib.
 ///
-/// # Arguments
-/// * `program_name` - Name of the program being tested
-/// * `input_dir` - Directory containing the original test case (source of
-///   `gtest_suite/`; equal to `output_dir` in test-only reruns)
-/// * `output_dir` - Directory containing the translated Rust project
-/// * `timeout` - Fallback timeout in seconds for tests without a manifest entry
+/// `suite_dir` is the suite the snapshot carries
+/// (`.harvest/suite/gtest_suite/`) and is read in place: nothing is copied next
+/// to the crate, and the CMake build tree goes under the project's `target/`.
+/// Keeping the suite out of the crate directory is what stops a later stage
+/// from picking it up as crate content — for a suite that rounds 1 and 2 hold
+/// out, that would be a leak.
 ///
 /// # Returns
 /// Tuple of (test_results, error_messages). One `TestResult` per gtest test,
 /// with `filename` set to the full `Suite.Test` name.
 pub fn run_gtest_validation(
     program_name: &str,
-    input_dir: &Path,
+    suite_dir: &Path,
     output_dir: &Path,
     timeout: u64,
 ) -> HarvestResult<(Vec<TestResult>, Vec<String>)> {
-    // Copy the suite from the original test case unless this is a test-only
-    // rerun of an already-translated output directory.
-    let suite_dir = output_dir.join(GTEST_SUITE_DIR);
-    if input_dir != output_dir {
-        cargo_utils::copy_directory_recursive(&input_dir.join(GTEST_SUITE_DIR), &suite_dir)
-            .map_err(|e| format!("Failed to copy gtest_suite directory: {}", e))?;
-    }
     if !suite_dir.is_dir() {
         return Err(format!("gtest_suite directory not found at {}", suite_dir.display()).into());
     }
@@ -115,7 +108,7 @@ pub fn run_gtest_validation(
     let lib_path = lib_path.canonicalize().unwrap_or(lib_path);
     log::info!("Located library at: {}", lib_path.display());
 
-    let gtest_bin = build_gtest_suite(output_dir, &suite_dir, &lib_path)?;
+    let gtest_bin = build_gtest_suite(output_dir, suite_dir, &lib_path)?;
     log::info!("GoogleTest suite built at: {}", gtest_bin.display());
 
     let ld_library_path = lib_path
@@ -126,7 +119,7 @@ pub fn run_gtest_validation(
     let test_names = list_gtest_tests(&gtest_bin, &ld_library_path)?;
     log::info!("Discovered {} GoogleTest test(s)", test_names.len());
 
-    let manifest = load_gtest_manifest(&suite_dir);
+    let manifest = load_gtest_manifest(suite_dir);
     let plan = build_execution_plan(&test_names, manifest.as_ref(), timeout);
     log::info!(
         "Execution plan: {} batch invocation(s), {} per-case invocation(s)",

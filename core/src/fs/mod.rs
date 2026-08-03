@@ -42,6 +42,163 @@ pub use dir::{Dir, DirEntry, ResolvedEntry};
 pub use file::{File, TextFile};
 pub(crate) use freezer::Freezer;
 
+/// Hashes a directory tree deterministically: SHA-256 over each file's
+/// directory-relative path and contents, visited in sorted order. Symlinks are
+/// hashed by their target path. Used to detect whether an agent modified a
+/// read-only reference directory (see [`ReferenceGuard`]).
+pub fn hash_dir(root: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read as _;
+
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, PathBuf>,
+    ) -> io::Result<()> {
+        for entry in read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                collect(root, &path, out)?;
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("walked path is under root")
+                    .to_path_buf();
+                out.insert(rel, path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = std::collections::BTreeMap::new();
+    collect(root, root, &mut files)?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    for (rel, path) in files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update([0u8]);
+        if path.is_symlink() {
+            hasher.update(read_link(&path)?.to_string_lossy().as_bytes());
+        } else {
+            let mut f = std::fs::File::open(&path)?;
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+        }
+        hasher.update([0u8]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Tracks the read-only reference directories an agentic tool hands to an
+/// agent — the C source (`c_src/`) and, for the conform stage, the external
+/// test suite.
+pub struct ReferenceGuard {
+    /// (entry name, hash at the time it was handed to the agent)
+    entries: Vec<(String, String)>,
+}
+
+impl ReferenceGuard {
+    /// Fingerprints each of `names` under `work_dir`, right after they were
+    /// materialized. Names that do not exist are ignored.
+    pub fn capture(work_dir: &Path, names: &[&str]) -> io::Result<Self> {
+        let mut entries = Vec::new();
+        for name in names {
+            let path = work_dir.join(name);
+            if path.is_dir() {
+                entries.push(((*name).to_owned(), hash_dir(&path)?));
+            }
+        }
+        Ok(ReferenceGuard { entries })
+    }
+
+    /// Re-checks each reference directory and removes it from `work_dir` so it
+    /// is not frozen into the IR. A directory the agent modified is first
+    /// preserved under `rejected_dir` (when one is configured) and reported.
+    ///
+    /// Returns the names of the modified references, for the caller to record.
+    pub fn strip(&self, work_dir: &Path, rejected_dir: Option<&Path>) -> io::Result<Vec<String>> {
+        let mut modified = Vec::new();
+        for (name, original) in &self.entries {
+            let path = work_dir.join(name);
+            if !path.is_dir() {
+                tracing::warn!("agent deleted the read-only reference {name}/");
+                modified.push(name.clone());
+                continue;
+            }
+            if hash_dir(&path)? != *original {
+                tracing::warn!(
+                    "agent modified the read-only reference {name}/ — the change is discarded; \
+                     preserving a copy for review"
+                );
+                modified.push(name.clone());
+                if let Some(rejected) = rejected_dir {
+                    let dest = rejected.join(name);
+                    if dest.exists() {
+                        std::fs::remove_dir_all(&dest)?;
+                    }
+                    std::fs::create_dir_all(rejected)?;
+                    crate::cargo_utils::copy_directory_recursive(&path, &dest)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                }
+            }
+            std::fs::remove_dir_all(&path)?;
+        }
+        Ok(modified)
+    }
+}
+
+/// Removes hidden entries (names starting with `.`) under `dir`, including
+/// nested ones. Agentic tools call this before freezing an agent's working
+/// directory into the IR, so runtime artifacts like `.opencode/` or `.git/`
+/// never enter a [RawDir].
+pub fn remove_hidden_entries(dir: &Path) -> io::Result<()> {
+    let Ok(entries) = read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                if path.is_dir() {
+                    tracing::warn!("Failed to remove hidden directory {}: {e}", path.display());
+                } else if let Err(e2) = remove_file(&path) {
+                    tracing::warn!("Failed to remove hidden entry {}: {e2}", path.display());
+                }
+            }
+        } else if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            remove_hidden_entries(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collects symlink paths under `dir`, for diagnostics before a freeze
+/// ([RawDir] does not support symlinks).
+pub fn collect_symlinks(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.file_type().is_symlink() {
+                out.push(path.display().to_string());
+            } else if metadata.is_dir() {
+                out.extend(collect_symlinks(&path));
+            }
+        }
+    }
+    out
+}
+
 /// Utility to recursively delete a TempDir that contains read-only files and directories. Provided
 /// to make it easier to delete the diagnostics directory (note that [DiagnosticsDir] automatically
 /// deletes the diagnostic directory on drop if it is a TempDir).
@@ -602,6 +759,59 @@ mod tests {
             read_link(other_symlink).unwrap(),
             AsRef::<Path>::as_ref("other_file")
         );
+    }
+
+    #[test]
+    fn reference_guard_detects_and_quarantines_edits() {
+        let work = tempdir().unwrap();
+        let rejected = tempdir().unwrap();
+        create_dir(work.path().join("c_src")).unwrap();
+        write(work.path().join("c_src/a.c"), "int x;").unwrap();
+        create_dir(work.path().join("gtest_suite")).unwrap();
+        write(work.path().join("gtest_suite/t.cc"), "TEST(A,B){}").unwrap();
+
+        let guard = ReferenceGuard::capture(work.path(), &["c_src", "gtest_suite"]).unwrap();
+        // The agent "fixes" the oracle and leaves the suite alone.
+        write(work.path().join("c_src/a.c"), "int x = 1;").unwrap();
+
+        let modified = guard.strip(work.path(), Some(rejected.path())).unwrap();
+        assert_eq!(modified, ["c_src"]);
+        // Both references are gone from the working directory...
+        assert!(!work.path().join("c_src").exists());
+        assert!(!work.path().join("gtest_suite").exists());
+        // ...and only the edited one is preserved, with the agent's content.
+        assert_eq!(
+            read(rejected.path().join("c_src/a.c")).unwrap(),
+            b"int x = 1;"
+        );
+        assert!(!rejected.path().join("gtest_suite").exists());
+    }
+
+    #[test]
+    fn reference_guard_reports_a_deleted_reference() {
+        let work = tempdir().unwrap();
+        create_dir(work.path().join("c_src")).unwrap();
+        write(work.path().join("c_src/a.c"), "int x;").unwrap();
+        let guard = ReferenceGuard::capture(work.path(), &["c_src"]).unwrap();
+        std::fs::remove_dir_all(work.path().join("c_src")).unwrap();
+        assert_eq!(guard.strip(work.path(), None).unwrap(), ["c_src"]);
+    }
+
+    #[test]
+    fn reference_guard_is_quiet_when_nothing_changed() {
+        let work = tempdir().unwrap();
+        let rejected = tempdir().unwrap();
+        create_dir(work.path().join("c_src")).unwrap();
+        write(work.path().join("c_src/a.c"), "int x;").unwrap();
+        let guard = ReferenceGuard::capture(work.path(), &["c_src"]).unwrap();
+        assert!(
+            guard
+                .strip(work.path(), Some(rejected.path()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!work.path().join("c_src").exists());
+        assert_eq!(read_dir(rejected.path()).unwrap().count(), 0);
     }
 
     #[test]

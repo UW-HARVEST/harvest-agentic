@@ -15,13 +15,13 @@ use crate::io::{
     collect_program_dirs, ensure_output_directory, log_failing_programs, log_found_programs,
     log_summary_stats, validate_input_directory, write_csv_results, write_error_file,
 };
-use crate::ir_utils::{cargo_build_result, raw_cargo_package, raw_source};
+use crate::ir_utils::{cargo_build_result, external_test_suite, raw_cargo_package, raw_source};
 use crate::logger::TeeLogger;
 use crate::stats::{ProgramEvalStats, SummaryStats, TestResult};
 use build_project_spec::{detect_project_kind, ProjectKind};
 use clap::Parser;
 use harvest_core::config::{AgentKind, Stage};
-use harvest_core::stage_manifest::{hash_dir, StageManifest};
+use harvest_core::stage_manifest::{self, StageManifest};
 use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
 use harvest_translate::{transpile, util::set_user_only_umask};
@@ -36,22 +36,12 @@ pub struct TranspilationResult {
     build_success: bool,
     rust_binary_path: Option<PathBuf>,
     build_error: Option<String>,
-    /// Top-level entries of the final CargoPackage, recorded in the stage
-    /// manifest so a later run can reconstruct the package from the output.
-    package_entries: Vec<String>,
 }
 
 impl TranspilationResult {
     /// Extract relevant info from HarvestIR
     pub fn from_ir(ir: &HarvestIR) -> Self {
         let translation_success = raw_cargo_package(ir).is_ok();
-        let package_entries = raw_cargo_package(ir)
-            .map(|dir| {
-                dir.toplevel_entries()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
         let (build_success, rust_binary_path, build_error) = match cargo_build_result(ir) {
             Ok(artifacts) => {
                 if artifacts.is_empty() {
@@ -85,7 +75,6 @@ impl TranspilationResult {
             build_success,
             rust_binary_path,
             build_error,
-            package_entries,
         }
     }
 }
@@ -131,14 +120,9 @@ pub fn translate_c_directory_to_rust_project(
     );*/
     match transpile(config.into()) {
         Ok(ir) => {
-            match raw_source(&ir) {
-                Ok(raw_c_source) => {
-                    if let Err(e) = raw_c_source.materialize(output_dir.join("c_src")) {
-                        log::warn!("Failed to materialize C source: {}", e);
-                    }
-                }
-                Err(e) => log::warn!("Failed to retrieve raw C source from IR: {}", e),
-            }
+            // Re-emit the read-only reference inputs, so this output stands on
+            // its own as the next stage's (and the grader's) input.
+            write_snapshot_references(output_dir, &ir);
             TranspilationResult::from_ir(&ir)
         }
         Err(e) => {
@@ -148,7 +132,6 @@ pub fn translate_c_directory_to_rust_project(
                 build_success: false,
                 rust_binary_path: None,
                 build_error: Some(format!("Failed to transpile: {}", e)),
-                package_entries: Vec::new(),
             }
         }
     }
@@ -170,6 +153,7 @@ pub struct RunOptions {
     pub test_harness: TestHarness,
     pub verify_harness: crate::cli::VerifyHarness,
     pub fuzz: bool,
+    pub force: bool,
 }
 
 impl RunOptions {
@@ -177,7 +161,12 @@ impl RunOptions {
         self.stages.contains(&stage)
     }
 
+    /// How this run produces the crate, for the manifest: the agentic prompt
+    /// mode, or which non-agentic translator ran.
     fn prompt_mode(&self) -> &'static str {
+        if self.stages.is_empty() {
+            return if self.modular { "modular" } else { "one_shot" };
+        }
         if self.workflow {
             "workflow"
         } else if self.no_plan {
@@ -190,12 +179,53 @@ impl RunOptions {
     }
 }
 
-/// One program's work item: the bench test case it is translated from and
-/// graded against, and (when resuming from a snapshot) the snapshot program
-/// directory the first stage loads instead of translating.
+/// One program's work item, with every input already resolved to a concrete
+/// location. A run that starts at translate reads them from the bench test
+/// case; a run that resumes reads them from the snapshot, which carries its
+/// own copies — that is what lets a snapshot be graded and refined after the
+/// bench directory has moved or changed.
 pub struct ProgramRun {
-    pub bench_program_dir: PathBuf,
+    pub name: String,
+    /// C source root, handed to the pipeline as `config.input`: the bench
+    /// `test_case/`, or the snapshot's `.harvest/c_src/`.
+    pub c_source_dir: PathBuf,
+    /// Directory whose children are the external test suite directories: the
+    /// bench program directory, or the snapshot's `.harvest/suite/`.
+    /// `None` when the test case ships no external suite.
+    pub suite_root: Option<PathBuf>,
+    /// The snapshot the first stage loads its `CargoPackage` from, if resuming.
     pub stage_input: Option<PathBuf>,
+    /// Stage history carried over from the input snapshot.
+    pub prior_stages: Vec<Stage>,
+    /// Bench test case this lineage came from, and the revision of the bench
+    /// checkout it was taken at. Provenance only, carried forward unchanged.
+    pub bench_program: String,
+    pub bench_revision: Option<String>,
+    /// Test-Corpus checkout for the toolchain contract, from the input
+    /// snapshot's manifest or detected now.
+    pub test_corpus_root: Option<PathBuf>,
+}
+
+/// Makes `output_dir` ready to receive a snapshot: it must not already hold
+/// one run's results when a second run writes into it.
+fn prepare_output_dir(output_dir: &Path, force: bool) -> HarvestResult<()> {
+    let occupied = std::fs::read_dir(output_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if occupied {
+        if !force {
+            return Err(format!(
+                "output program directory {} is not empty; pass --force to overwrite it \
+                 (reusing a populated directory mixes two runs' results)",
+                output_dir.display()
+            )
+            .into());
+        }
+        log::warn!("--force: erasing existing {}", output_dir.display());
+        std::fs::remove_dir_all(output_dir)?;
+    }
+    std::fs::create_dir_all(output_dir)?;
+    Ok(())
 }
 
 /// Run all benchmarks for a list of programs
@@ -219,46 +249,89 @@ pub fn run_all_benchmarks(
     Ok(results)
 }
 
-/// Stamps the output program directory with a stage manifest, making it a
-/// self-describing snapshot a later run can resume from (see
-/// `harvest_core::stage_manifest`). Failures are logged, not fatal: the
-/// grading result of this run is unaffected.
-fn write_stage_manifest(
-    output_dir: &Path,
-    bench_program_dir: &Path,
-    stage_input: Option<&Path>,
-    opts: &RunOptions,
-    package_entries: Vec<String>,
-) {
+/// Writes the read-only reference inputs the IR is carrying into the output
+/// program directory, replacing whatever was there.
+fn write_snapshot_references(output_dir: &Path, ir: &HarvestIR) {
+    let replace = |dest: PathBuf, what: &str, write: &dyn Fn(&Path) -> std::io::Result<()>| {
+        if dest.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dest) {
+                log::warn!("Failed to clear stale {what} at {}: {e}", dest.display());
+                return;
+            }
+        }
+        if let Err(e) = write(&dest) {
+            log::warn!("Failed to write {what} to {}: {e}", dest.display());
+        }
+    };
+    match raw_source(ir) {
+        Ok(c_source) => replace(
+            stage_manifest::c_source_dir(output_dir),
+            "C source",
+            &|dest| c_source.materialize(dest),
+        ),
+        Err(e) => log::warn!("Failed to retrieve C source from IR: {e}"),
+    }
+    if let Some(suite) = external_test_suite(ir) {
+        replace(stage_manifest::suite_dir(output_dir), "test suite", &|dest| {
+            suite.dir.materialize(dest)
+        });
+    }
+}
+
+/// Stamps the output program directory with a stage manifest. The manifest is
+/// provenance, not protocol — the layout is what a later run reads — so a
+/// failure here is logged rather than fatal.
+fn write_stage_manifest(output_dir: &Path, run: &ProgramRun, opts: &RunOptions) {
     // Accumulate stages across runs: resuming appends to the input snapshot's
     // history.
-    let mut stages = stage_input
-        .and_then(|p| StageManifest::read_from_dir(p).ok())
-        .map(|m| m.stages)
-        .unwrap_or_default();
+    let mut stages = run.prior_stages.clone();
     stages.extend(opts.stages.iter().copied());
     stages.sort();
     stages.dedup();
 
-    let bench_program_dir = std::path::absolute(bench_program_dir)
-        .unwrap_or_else(|_| bench_program_dir.to_path_buf());
-    let test_case_hash = match hash_dir(&bench_program_dir.join("test_case")) {
-        Ok(h) => h,
-        Err(e) => {
-            log::warn!("Failed to hash test_case/ for the stage manifest: {e}");
-            String::new()
-        }
-    };
+    // Any reference directory an agent modified was quarantined here by the
+    // stage that caught it.
+    let reference_modified = std::fs::read_dir(
+        stage_manifest::meta_dir(output_dir).join(stage_manifest::REJECTED_DIR),
+    )
+    .map(|entries| {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .flat_map(|stage| std::fs::read_dir(stage.path()).ok())
+            .flat_map(|refs| refs.flatten())
+            .map(|r| r.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    })
+    .unwrap_or_default();
+    if !reference_modified.is_empty() {
+        log::warn!(
+            "An agent modified read-only reference input(s): {}. The change was discarded; \
+             copies are preserved under {}/{}/. Treat this run's results with suspicion.",
+            reference_modified.join(", "),
+            stage_manifest::HARVEST_META_DIR,
+            stage_manifest::REJECTED_DIR
+        );
+    }
+
     let manifest = StageManifest {
         schema_version: 1,
         stages,
-        agent: opts.agent.unwrap_or_default(),
+        agent: opts.agent,
         model: opts.model.clone(),
         prompt_mode: opts.prompt_mode().to_owned(),
         harvest_version: get_version().to_owned(),
-        bench_program_dir,
-        test_case_hash,
-        package_entries,
+        bench_program: run.bench_program.clone(),
+        bench_revision: run.bench_revision.clone(),
+        // Re-read rather than carried: the checkout can move under a resumed run.
+        test_corpus_revision: run
+            .test_corpus_root
+            .as_ref()
+            .and_then(harvest_core::utils::git_revision),
+        test_corpus_root: run.test_corpus_root.clone(),
+        reference_modified,
         created_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -267,8 +340,8 @@ fn write_stage_manifest(
     match manifest.write_to_dir(output_dir) {
         Ok(()) => log::info!(
             "Stage manifest written to {}",
-            output_dir
-                .join(harvest_core::stage_manifest::STAGE_MANIFEST_FILE)
+            stage_manifest::meta_dir(output_dir)
+                .join(stage_manifest::STAGE_MANIFEST_FILE)
                 .display()
         ),
         Err(e) => log::warn!("Failed to write stage manifest: {e}"),
@@ -350,22 +423,20 @@ fn benchmark_single_program(
     output_root_dir: &Path,
     opts: &RunOptions,
 ) -> ProgramEvalStats {
-    let program_dir = program_run.bench_program_dir.as_path();
     let stage_input = program_run.stage_input.as_deref();
     let timeout = opts.timeout;
     let test_harness = opts.test_harness;
-    let agentic = !opts.stages.is_empty();
 
-    let program_name = program_dir
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
+    let program_name = program_run.name.clone();
+    let test_case_dir = program_run.c_source_dir.clone();
     let mut result = ProgramEvalStats::new(&program_name);
 
     log::info!("Processing program: {}", program_name);
-    log::info!("Bench directory: {}", program_dir.display());
+    log::info!("C source: {}", test_case_dir.display());
+    match &program_run.suite_root {
+        Some(suite) => log::info!("External test suite: {}", suite.display()),
+        None => log::info!("External test suite: none"),
+    }
     if let Some(snapshot) = stage_input {
         log::info!("Stage input (snapshot): {}", snapshot.display());
     }
@@ -373,16 +444,6 @@ fn benchmark_single_program(
     // Get program output directory
     let output_dir = output_root_dir.join(&program_name);
     log::info!("Output directory: {}", output_dir.display());
-
-    // Check for required subdirectories & log error if we don't find them
-    // We use the test_case root (not src/) so translate can see CMakeLists.txt.
-    let (test_case_dir, test_vectors_dir) = match parse_benchmark_dir(program_dir) {
-        Ok(dirs) => dirs,
-        Err(e) => {
-            result.error_message = Some(e.to_string());
-            return result;
-        }
-    };
 
     // Detect project kind from the C source root (same heuristic as build_project_spec).
     let project_kind = detect_project_kind(&test_case_dir);
@@ -394,18 +455,22 @@ fn benchmark_single_program(
             .unwrap_or_else(|| "unknown".to_string())
     );
 
-    // Parse test vectors. gtest-only test cases (gtest_suite/ and no
-    // test_vectors/) define their test set in the suite instead.
-    let test_cases = if test_vectors_dir.is_dir() {
-        match parse_test_vectors(&test_vectors_dir) {
+    // Parse JSON test vectors, when the suite has them. gtest-only test cases
+    // define their test set in the suite instead.
+    let test_vectors_dir = program_run
+        .suite_root
+        .as_ref()
+        .map(|root| root.join("test_vectors"))
+        .filter(|dir| dir.is_dir());
+    let test_cases = match &test_vectors_dir {
+        Some(dir) => match parse_test_vectors(dir) {
             Ok(vectors) => vectors,
             Err(e) => {
                 result.error_message = Some(e.to_string());
                 return result;
             }
-        }
-    } else {
-        Vec::new()
+        },
+        None => Vec::new(),
     };
 
     result.total_tests = test_cases.len();
@@ -415,37 +480,70 @@ fn benchmark_single_program(
         log::info!("✅ Successfully parsed {} test case(s)", test_cases.len());
     }
 
+    // Guard the output: a snapshot is only self-contained if nothing from an
+    // earlier run survives in it. Materializing into a populated directory
+    // leaves stale files behind, which then travel forward as if they were
+    // this run's output.
+    if let Err(e) = prepare_output_dir(&output_dir, opts.force) {
+        result.error_message = Some(e.to_string());
+        log::error!("{e}");
+        return result;
+    }
+
     // Inject per-stage tool config for the agentic stages that actually run
     // in this invocation. Both agents share the wishlist file; the verify
-    // phase appends to whatever the translate phase wrote.
-    // Ensure per-program output artifacts can be written before injecting paths.
-    std::fs::create_dir_all(&output_dir).ok();
+    // phase appends to whatever the translate phase wrote. Everything the
+    // framework owns lives under the snapshot's meta directory.
+    let meta_dir = stage_manifest::meta_dir(&output_dir);
+    std::fs::create_dir_all(&meta_dir).ok();
 
-    let wishlist_path = output_dir.join("tool_wishlist.json");
+    let wishlist_path = meta_dir.join("tool_wishlist.json");
     // Translate-phase PLAN.md is dumped under a dedicated name so a later verify
     // rewrite of the CargoPackage cannot overwrite or delete it.
-    let plan_translate_path = output_dir.join("plan_translate.md");
+    let plan_translate_path = meta_dir.join("plan_translate.md");
     // Verify-phase HYPOTHESES.md captures the agent's hypothesis log across
     // compactions, for post-hoc analysis of how it approached debugging.
-    let hypotheses_verify_path = output_dir.join("hypotheses_verify.md");
+    let hypotheses_verify_path = meta_dir.join("hypotheses_verify.md");
     // The output.log path lets each tool append the agent's full JSON trace
     // to the same log file as benchmark messages.
     let output_log_path = output_root_dir.join("output.log");
+    let rejected_dir = meta_dir.join(stage_manifest::REJECTED_DIR);
     let mut effective_overrides = opts.config_overrides.clone();
-    // Stage-uniform flags apply to every agentic stage running in this
+    // Stage-uniform settings apply to every agentic stage running in this
     // invocation; use -c tools.<tool>.<key>=... for per-stage overrides.
-    let stage_overrides = |overrides: &mut Vec<String>, tool: &str| {
-        overrides.push(format!(
-            "tools.{tool}.wishlist_output_path={}",
-            wishlist_path.display()
-        ));
+    let stage_overrides = |overrides: &mut Vec<String>, tool: &str, stage: Stage| {
         overrides.push(format!(
             "tools.{tool}.output_log_path={}",
             output_log_path.display()
         ));
+        overrides.push(format!(
+            "tools.{tool}.rejected_output_dir={}",
+            rejected_dir.join(stage.to_string()).display()
+        ));
+        if let Some(root) = &program_run.test_corpus_root {
+            overrides.push(format!("tools.{tool}.test_corpus_root={}", root.display()));
+        }
         if let Some(m) = &opts.model {
             overrides.push(format!("tools.{tool}.model={m}"));
         }
+    };
+    // The suite is loaded on every run, whichever translator produces the
+    // crate, so the output can re-emit it and stand on its own; only the
+    // conform stage is given it as an input.
+    if let Some(suite_root) = &program_run.suite_root {
+        effective_overrides.push(format!(
+            "tools.load_test_suite.input_path={}",
+            suite_root.display()
+        ));
+        if let Some(kind) = opts.test_harness.suite_kind() {
+            effective_overrides.push(format!("tools.load_test_suite.harness={kind}"));
+        }
+    }
+    let prompt_mode_overrides = |overrides: &mut Vec<String>, tool: &str| {
+        overrides.push(format!(
+            "tools.{tool}.wishlist_output_path={}",
+            wishlist_path.display()
+        ));
         if opts.no_plan {
             overrides.push(format!("tools.{tool}.no_plan=true"));
         }
@@ -457,14 +555,16 @@ fn benchmark_single_program(
         }
     };
     if opts.has(Stage::Translate) {
-        stage_overrides(&mut effective_overrides, "translate_agentic");
+        stage_overrides(&mut effective_overrides, "translate_agentic", Stage::Translate);
+        prompt_mode_overrides(&mut effective_overrides, "translate_agentic");
         effective_overrides.push(format!(
             "tools.translate_agentic.plan_output_path={}",
             plan_translate_path.display()
         ));
     }
     if opts.has(Stage::Verify) {
-        stage_overrides(&mut effective_overrides, "verify_fix_agentic");
+        stage_overrides(&mut effective_overrides, "verify_fix_agentic", Stage::Verify);
+        prompt_mode_overrides(&mut effective_overrides, "verify_fix_agentic");
         effective_overrides.push(format!(
             "tools.verify_fix_agentic.hypotheses_output_path={}",
             hypotheses_verify_path.display()
@@ -476,8 +576,19 @@ fn benchmark_single_program(
             effective_overrides.push("tools.verify_fix_agentic.fuzz=true".to_owned());
         }
     }
+    if opts.has(Stage::Conform) {
+        stage_overrides(&mut effective_overrides, "conform_agentic", Stage::Conform);
+        effective_overrides.push(format!(
+            "tools.conform_agentic.notes_output_path={}",
+            meta_dir.join("conform_notes.md").display()
+        ));
+        effective_overrides.push(format!(
+            "tools.conform_agentic.report_output_path={}",
+            meta_dir.join("conform_report.md").display()
+        ));
+    }
 
-    // Run the stage pipeline (translate and/or verify, or the non-agentic
+    // Run the stage pipeline (translate/verify/conform, or the non-agentic
     // translators), starting from the C source or the snapshot.
     let translation_result = translate_c_directory_to_rust_project(
         &test_case_dir,
@@ -505,18 +616,14 @@ fn benchmark_single_program(
         return result;
     }
 
-    // The output program directory now holds a materialized CargoPackage:
-    // stamp it as a resumable snapshot. Build failure does not gate this —
-    // a broken translate-only snapshot is a legitimate verify-stage input.
-    if agentic {
-        write_stage_manifest(
-            &output_dir,
-            program_dir,
-            stage_input,
-            opts,
-            translation_result.package_entries.clone(),
-        );
-    }
+    // The output program directory now holds a materialized CargoPackage plus
+    // its reference inputs: stamp it as a resumable snapshot. This is the
+    // framework's one output format, so it applies to the non-agentic
+    // translators too — their results are gradeable and stage-resumable on the
+    // same terms (a one-shot translation can be handed to the verify stage).
+    // Build failure does not gate it either: a snapshot whose build is broken
+    // is exactly the kind a verify run should be able to pick up.
+    write_stage_manifest(&output_dir, program_run, opts);
 
     if translation_result.build_success {
         log::info!("✅ Rust build completed successfully!");
@@ -530,20 +637,25 @@ fn benchmark_single_program(
         return result;
     }
 
-    // Validation harness selection.
-    // - gtest: a gtest_suite/ in the test case is preferred when present
-    //   (auto), or forced via --test-harness gtest.
+    // Validation harness selection. The suite graded against is the one the
+    // snapshot now carries under .harvest/suite/ — the same content the tools
+    // saw, re-emitted from the IR, so grading never depends on the bench
+    // directory still being in place.
+    let graded_suite_root = stage_manifest::suite_dir(&output_dir);
+    // - gtest: a gtest_suite/ in the suite is preferred when present (auto),
+    //   or forced via --test-harness gtest.
     // - Library projects always use cando2 (runner + test_vectors via FFI).
     // - Configurable projects can be tested either way; pick library validation only
-    //   when an input `runner/` exists, otherwise fall back to running the driver
+    //   when a `runner/` exists, otherwise fall back to running the driver
     //   binary against test_vectors (executable-style tests).
     // - Executable projects run the binary directly against test vectors.
     // - Unknown project kinds fall back to the binary path if available.
-    let gtest_available = program_dir.join(harness::gtest::GTEST_SUITE_DIR).is_dir();
+    let gtest_suite_dir = graded_suite_root.join(harness::gtest::GTEST_SUITE_DIR);
+    let gtest_available = gtest_suite_dir.is_dir();
     if test_harness == TestHarness::Gtest && !gtest_available {
         let error = format!(
-            "--test-harness gtest requested, but {} has no gtest_suite/ directory",
-            program_dir.display()
+            "--test-harness gtest requested, but no gtest_suite/ was carried into {}",
+            graded_suite_root.display()
         );
         log::error!("{}", error);
         result.error_message = Some(error);
@@ -554,7 +666,7 @@ fn benchmark_single_program(
         TestHarness::Auto => gtest_available,
         TestHarness::Lib | TestHarness::Bin => false,
     };
-    let runner_exists = program_dir.join("runner").is_dir();
+    let runner_exists = graded_suite_root.join("runner").is_dir();
     let use_library_validation = match test_harness {
         TestHarness::Lib => true,
         TestHarness::Bin => false,
@@ -565,8 +677,12 @@ fn benchmark_single_program(
         },
     };
     let (test_results, error_messages) = if use_gtest_validation {
-        match harness::gtest::run_gtest_validation(&program_name, program_dir, &output_dir, timeout)
-        {
+        match harness::gtest::run_gtest_validation(
+            &program_name,
+            &gtest_suite_dir,
+            &output_dir,
+            timeout,
+        ) {
             Ok(r) => {
                 // gtest defines its own test set; the vector count no longer applies.
                 result.total_tests = r.0.len();
@@ -584,7 +700,7 @@ fn benchmark_single_program(
             (true, _) => {
                 match harness::library::run_library_validation(
                     &program_name,
-                    program_dir,
+                    &graded_suite_root,
                     &output_dir,
                     &test_cases,
                     timeout,
@@ -635,9 +751,9 @@ fn benchmark_single_program(
         result.success_rate()
     );
 
-    // Write error messages to results.err file in the output directory if it was created
+    // Write error messages to results.err in the snapshot's meta directory
     if !error_messages.is_empty() {
-        let error_file_path = output_dir.join("results.err");
+        let error_file_path = stage_manifest::meta_dir(&output_dir).join("results.err");
         if let Err(e) = write_error_file(&error_file_path, &error_messages) {
             log::info!("Warning: Failed to write error file: {}", e);
         }
@@ -703,13 +819,13 @@ fn apply_regex_filter(
     Ok(())
 }
 
-/// A translated program directory carries its test definition either as
-/// cando2/stdio JSON vectors (`test_vectors/`) or as a GoogleTest suite
-/// (`gtest_suite/`).
+/// Recognizes a pipeline snapshot by its stage manifest. This is the only
+/// marker that works for every role: a snapshot whose build failed never
+/// reached grading, and one that was never graded carries no results — but
+/// both carry their manifest, their C source, and their test suite, which is
+/// all a resumed stage or a re-grade needs.
 fn is_translated_program_dir(path: &Path) -> bool {
-    path.join("Cargo.toml").exists()
-        && (path.join("test_vectors").is_dir()
-            || path.join(harness::gtest::GTEST_SUITE_DIR).is_dir())
+    stage_manifest::is_snapshot(path)
 }
 
 fn translated_program_dirs(path: &Path) -> HarvestResult<Vec<PathBuf>> {
@@ -743,10 +859,13 @@ fn test_existing_program(
     log::info!("Testing translated program: {}", program_name);
     log::info!("Program directory: {}", program_dir.display());
 
-    let gtest_available = program_dir.join(harness::gtest::GTEST_SUITE_DIR).is_dir();
+    // Everything graded against comes from the snapshot's own suite.
+    let suite_root = stage_manifest::suite_dir(program_dir);
+    let gtest_suite_dir = suite_root.join(harness::gtest::GTEST_SUITE_DIR);
+    let gtest_available = gtest_suite_dir.is_dir();
 
     // gtest-only programs need no JSON vectors: the suite defines the test set.
-    let test_vectors_dir = program_dir.join("test_vectors");
+    let test_vectors_dir = suite_root.join("test_vectors");
     let test_cases = if test_vectors_dir.is_dir() {
         match parse_test_vectors(&test_vectors_dir) {
             Ok(vectors) => vectors,
@@ -759,8 +878,9 @@ fn test_existing_program(
         Vec::new()
     } else {
         result.error_message = Some(format!(
-            "Required test_vectors directory not found: {}",
-            test_vectors_dir.display()
+            "Snapshot {} carries no external test suite under {}",
+            program_dir.display(),
+            suite_root.display()
         ));
         return result;
     };
@@ -768,8 +888,8 @@ fn test_existing_program(
 
     if test_harness == TestHarness::Gtest && !gtest_available {
         result.error_message = Some(format!(
-            "--test-harness gtest requested, but {} has no gtest_suite/ directory",
-            program_dir.display()
+            "--test-harness gtest requested, but {} carries no gtest_suite/",
+            suite_root.display()
         ));
         return result;
     }
@@ -781,11 +901,15 @@ fn test_existing_program(
     let use_library_validation = match test_harness {
         TestHarness::Lib => true,
         TestHarness::Bin => false,
-        TestHarness::Auto | TestHarness::Gtest => program_dir.join("runner").is_dir(),
+        TestHarness::Auto | TestHarness::Gtest => suite_root.join("runner").is_dir(),
     };
     let (test_results, error_messages) = if use_gtest_validation {
-        match harness::gtest::run_gtest_validation(&program_name, program_dir, program_dir, timeout)
-        {
+        match harness::gtest::run_gtest_validation(
+            &program_name,
+            &gtest_suite_dir,
+            program_dir,
+            timeout,
+        ) {
             Ok(r) => {
                 result.rust_build_success = true;
                 // gtest defines its own test set; the vector count no longer applies.
@@ -801,7 +925,7 @@ fn test_existing_program(
     } else if use_library_validation {
         match harness::library::run_library_validation(
             &program_name,
-            program_dir,
+            &suite_root,
             program_dir,
             &test_cases,
             timeout,
@@ -859,7 +983,7 @@ fn test_existing_program(
     result.test_results = test_results;
 
     if !error_messages.is_empty() {
-        let error_file_path = program_dir.join("results.err");
+        let error_file_path = stage_manifest::meta_dir(program_dir).join("results.err");
         if let Err(e) = write_error_file(&error_file_path, &error_messages) {
             log::info!("Warning: Failed to write error file: {}", e);
         }
@@ -890,245 +1014,105 @@ fn run_test_only(
         .collect())
 }
 
-/// Overall wall-clock budget for the conform agent (not per-test). Matches the
-/// verify stage's default; the per-test grading timeout is the `--timeout` flag.
-const CONFORM_AGENT_TIMEOUT_SECS: u64 = 36000;
-
-/// Determines which external test harness a translated program directory
-/// carries, and the directory names that constitute it, honoring an explicit
-/// `--test-harness` override.
-fn detect_conform_harness(
-    program_dir: &Path,
-    test_harness: TestHarness,
-) -> HarvestResult<(conform_agentic::ConformHarness, Vec<String>)> {
-    use conform_agentic::ConformHarness as H;
-    let has_gtest = program_dir.join(harness::gtest::GTEST_SUITE_DIR).is_dir();
-    let has_runner = program_dir.join("runner").is_dir();
-    let has_vectors = program_dir.join("test_vectors").is_dir();
-    let gtest = || (H::Gtest, vec!["gtest_suite".to_string()]);
-    let lib = || {
-        (
-            H::Lib,
-            vec!["runner".to_string(), "test_vectors".to_string()],
-        )
-    };
-    let bin = || (H::Bin, vec!["test_vectors".to_string()]);
-    match test_harness {
-        TestHarness::Gtest => has_gtest.then(gtest).ok_or_else(|| {
-            format!(
-                "--test-harness gtest, but {} has no gtest_suite/",
-                program_dir.display()
-            )
-            .into()
-        }),
-        TestHarness::Lib => has_runner.then(lib).ok_or_else(|| {
-            format!(
-                "--test-harness lib, but {} has no runner/",
-                program_dir.display()
-            )
-            .into()
-        }),
-        TestHarness::Bin => has_vectors.then(bin).ok_or_else(|| {
-            format!(
-                "--test-harness bin, but {} has no test_vectors/",
-                program_dir.display()
-            )
-            .into()
-        }),
-        TestHarness::Auto => {
-            if has_gtest {
-                Ok(gtest())
-            } else if has_runner {
-                Ok(lib())
-            } else if has_vectors {
-                Ok(bin())
-            } else {
-                Err(format!(
-                    "no external test suite found in {} (looked for gtest_suite/, runner/, test_vectors/)",
-                    program_dir.display()
-                )
-                .into())
-            }
-        }
+/// Resolves a program's inputs for a run that starts from a bench test case:
+/// the C source is the bench `test_case/`, and the external suite (if any)
+/// sits beside it in the bench program directory.
+fn start_from_bench(bench_program_dir: &Path, name: String) -> HarvestResult<ProgramRun> {
+    let (c_source_dir, _) = parse_benchmark_dir(bench_program_dir)?;
+    let suite_root =
+        load_test_suite::has_suite(bench_program_dir).then(|| bench_program_dir.to_path_buf());
+    if suite_root.is_none() {
+        log::warn!(
+            "bench case {} ships no external test suite",
+            bench_program_dir.display()
+        );
     }
+    Ok(ProgramRun {
+        // The toolchain contract is derived from the corpus the bench case
+        // lives in; recording it now is what lets a later run find it once the
+        // C source has moved inside a snapshot.
+        test_corpus_root: agent_runner::locate_test_corpus(&c_source_dir),
+        c_source_dir,
+        suite_root,
+        stage_input: None,
+        prior_stages: Vec::new(),
+        bench_revision: harvest_core::utils::git_revision(bench_program_dir),
+        bench_program: name.clone(),
+        name,
+    })
 }
 
-/// Third-stage conformance mode: refine each already-translated program in
-/// `input_root` so its external tests pass, writing refined copies under
-/// `output_root`. The agent runs tempdir-isolated (never touching the input);
-/// grading afterward uses a pristine copy of the same external tests taken
-/// from the untouched input, so editing the tests cannot help the agent.
-fn run_conform(
-    input_root: &Path,
-    output_root: &Path,
-    agent: harvest_core::config::AgentKind,
-    model: Option<&str>,
-    grading_timeout: u64,
-    test_harness: TestHarness,
-    output_log_path: &Path,
-) -> HarvestResult<Vec<ProgramEvalStats>> {
-    validate_input_directory(input_root)?;
-    let program_dirs = translated_program_dirs(input_root)?;
-    log_found_programs(&program_dirs, input_root)?;
-
-    let env = std::collections::HashMap::new();
-    let mut results = Vec::new();
-
-    for in_prog in &program_dirs {
-        let name = in_prog
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let out_prog = output_root.join(&name);
-        let mut result = ProgramEvalStats::new(&name);
-
-        log::info!("\n{}", "=".repeat(80));
-        log::info!("Conform: refining {}", name);
-        log::info!("{}", "=".repeat(80));
-
-        let (harness_kind, test_dirs) = match detect_conform_harness(in_prog, test_harness) {
-            Ok(hk) => hk,
-            Err(e) => {
-                result.error_message = Some(e.to_string());
-                results.push(result);
-                continue;
-            }
-        };
-
-        // 1. Run the refinement agent (tempdir-isolated) into out_prog.
-        if let Err(e) = conform_agentic::run(conform_agentic::ConformParams {
-            input_project_dir: in_prog,
-            output_project_dir: &out_prog,
-            harness: harness_kind,
-            test_dirs: &test_dirs,
-            agent,
-            model,
-            timeout_secs: CONFORM_AGENT_TIMEOUT_SECS,
-            env: &env,
-            output_log_path: Some(output_log_path),
-        }) {
-            result.error_message = Some(format!("Conform agent failed: {e}"));
-            results.push(result);
-            continue;
-        }
-
-        // 2. Re-copy a pristine external test suite from the untouched input
-        //    into the refined output, so the grade is against tests the agent
-        //    could not have edited.
-        let mut copy_failed = None;
-        for d in &test_dirs {
-            let src = in_prog.join(d);
-            let dst = out_prog.join(d);
-            if dst.exists() {
-                let _ = std::fs::remove_dir_all(&dst);
-            }
-            if let Err(e) = harvest_core::cargo_utils::copy_directory_recursive(&src, &dst) {
-                copy_failed = Some(format!("Failed to stage pristine {d}: {e}"));
-                break;
-            }
-        }
-        if let Some(e) = copy_failed {
-            result.error_message = Some(e);
-            results.push(result);
-            continue;
-        }
-
-        // Propagate the stage manifest (appending conform to the stage
-        // history) so the refined output stays a self-describing snapshot.
-        match StageManifest::read_from_dir(in_prog) {
-            Ok(mut manifest) => {
-                if !manifest.stages.contains(&Stage::Conform) {
-                    manifest.stages.push(Stage::Conform);
-                }
-                manifest.agent = agent;
-                manifest.model = model.map(str::to_owned);
-                manifest.prompt_mode = "conform".to_owned();
-                manifest.harvest_version = get_version().to_owned();
-                if let Err(e) = manifest.write_to_dir(&out_prog) {
-                    log::warn!("Failed to propagate stage manifest to conform output: {e}");
-                }
-            }
-            Err(_) => log::info!(
-                "Input snapshot {} has no stage manifest; conform output not stamped",
-                in_prog.display()
-            ),
-        }
-
-        // 3. Grade independently, exactly like --test mode.
-        results.push(test_existing_program(
-            &out_prog,
-            grading_timeout,
-            test_harness,
-        ));
-    }
-
-    Ok(results)
-}
-
-/// Resolves the bench program directory a snapshot grades against, when the
-/// run resumes from a snapshot (first stage verify). The reference comes from
-/// the snapshot's manifest, or from --test-case (which may point at a bench
-/// root containing a same-named program subdirectory, or at one bench program
-/// directory). The bench case's test_case/ content hash is checked against the
-/// manifest: drift is fatal when using the manifest's own reference, and a
-/// loud warning when the user explicitly overrode the location.
-fn resolve_bench_reference(
-    snapshot_prog_dir: &Path,
-    test_case_override: Option<&Path>,
-) -> HarvestResult<PathBuf> {
-    let manifest = StageManifest::read_from_dir(snapshot_prog_dir).map_err(|e| {
+/// Resolves a program's inputs for a run that resumes from a snapshot. Every
+/// input comes from the snapshot itself; the bench directory is not consulted,
+/// and does not have to still exist. `--test-case` overrides the suite with a
+/// bench directory's current one, for deliberately re-running against an
+/// updated test suite.
+fn resume_from(
+    snapshot_dir: &Path,
+    name: String,
+    suite_override: Option<&Path>,
+) -> HarvestResult<ProgramRun> {
+    let manifest = StageManifest::read_from_dir(snapshot_dir).map_err(|e| {
         format!(
             "snapshot {} has no readable stage manifest ({e}); only outputs of a \
              stage-aware run can be resumed from",
-            snapshot_prog_dir.display()
+            snapshot_dir.display()
         )
     })?;
-    let name = snapshot_prog_dir.file_name().unwrap_or_default();
-    let bench_dir = match test_case_override {
-        Some(tc) => {
-            let candidate = tc.join(name);
-            if parse_benchmark_dir(&candidate).is_ok() {
+    let c_source_dir = stage_manifest::c_source_dir(snapshot_dir);
+    if !c_source_dir.is_dir() {
+        return Err(format!(
+            "snapshot {} carries no C source at {}",
+            snapshot_dir.display(),
+            c_source_dir.display()
+        )
+        .into());
+    }
+
+    // Replacing the suite also replaces what `bench_revision` describes: it
+    // records where the snapshot's reference material came from, so carrying
+    // the origin's revision forward past a suite swap would misattribute the
+    // tests this run was actually graded against.
+    let mut bench_revision = manifest.bench_revision;
+    let suite_root = match suite_override {
+        Some(bench) => {
+            let candidate = bench.join(&name);
+            let chosen = if load_test_suite::has_suite(&candidate) {
                 candidate
-            } else if parse_benchmark_dir(tc).is_ok() {
-                tc.to_path_buf()
+            } else if load_test_suite::has_suite(bench) {
+                bench.to_path_buf()
             } else {
                 return Err(format!(
-                    "--test-case {} is neither a bench program directory nor a bench root \
-                     containing {:?}",
-                    tc.display(),
+                    "--test-case {} holds no external test suite (looked in it and in {:?})",
+                    bench.display(),
                     name
                 )
                 .into());
-            }
-        }
-        None => manifest.bench_program_dir.clone(),
-    };
-    parse_benchmark_dir(&bench_dir).map_err(|e| {
-        format!(
-            "bench reference {} for snapshot {} is not a valid bench program directory: {e}",
-            bench_dir.display(),
-            snapshot_prog_dir.display()
-        )
-    })?;
-
-    if !manifest.test_case_hash.is_empty() {
-        let current = hash_dir(&bench_dir.join("test_case"))?;
-        if current != manifest.test_case_hash {
-            let msg = format!(
-                "test_case/ content of {} does not match the hash recorded when {} was \
-                 produced (bench case changed, or wrong pairing)",
-                bench_dir.display(),
-                snapshot_prog_dir.display()
+            };
+            log::info!(
+                "Using the current suite from {} instead of the one {} carries",
+                chosen.display(),
+                snapshot_dir.display()
             );
-            if test_case_override.is_some() {
-                log::warn!("{msg} — proceeding because --test-case was given explicitly");
-            } else {
-                return Err(format!("{msg}; pass --test-case to override explicitly").into());
-            }
+            bench_revision = harvest_core::utils::git_revision(&chosen);
+            Some(chosen)
         }
-    }
-    Ok(bench_dir)
+        None => {
+            let carried = stage_manifest::suite_dir(snapshot_dir);
+            load_test_suite::has_suite(&carried).then_some(carried)
+        }
+    };
+
+    Ok(ProgramRun {
+        name,
+        c_source_dir,
+        suite_root,
+        stage_input: Some(snapshot_dir.to_path_buf()),
+        prior_stages: manifest.stages,
+        bench_program: manifest.bench_program,
+        bench_revision,
+        test_corpus_root: manifest.test_corpus_root,
+    })
 }
 
 fn run(args: Args) -> HarvestResult<()> {
@@ -1136,43 +1120,6 @@ fn run(args: Args) -> HarvestResult<()> {
 
     let stages = args.stages();
     args.validate_stages(&stages)?;
-
-    if stages.contains(&Stage::Conform) {
-        let input_dir = args
-            .input_dir
-            .as_ref()
-            .expect("clap requires input_dir unless --test is used");
-        let output_dir = args
-            .output_dir
-            .as_ref()
-            .expect("clap requires output_dir unless --test is used");
-        let agent = args
-            .agent
-            .ok_or("--agentic=conform requires --agent")?;
-        validate_input_directory(input_dir)?;
-        ensure_output_directory(output_dir)?;
-        log::info!(
-            "Conform mode: {} -> {}",
-            input_dir.display(),
-            output_dir.display()
-        );
-        let results = run_conform(
-            input_dir,
-            output_dir,
-            agent,
-            args.model.as_deref(),
-            args.timeout,
-            args.test_harness,
-            &output_dir.join("output.log"),
-        )?;
-        let csv_output_path = output_dir.join("results.csv");
-        write_csv_results(&csv_output_path, &results)?;
-        let summary_stats = SummaryStats::from_results(&results);
-        log_summary_stats(&summary_stats);
-        log_failing_programs(&results);
-        log::info!("\nConform processing complete.");
-        return Ok(());
-    }
 
     if let Some(test_path) = &args.test {
         log::info!("Test-only mode: {}", test_path.display());
@@ -1231,7 +1178,7 @@ fn run(args: Args) -> HarvestResult<()> {
     // Build the per-program work list. INPUT_DIR is what the first stage
     // consumes: bench test cases for translate (and the non-agentic modes),
     // or a previous run's snapshot root when resuming from verify.
-    let resume_from_snapshot = stages.first() == Some(&Stage::Verify);
+    let resume_from_snapshot = matches!(stages.first(), Some(Stage::Verify | Stage::Conform));
     let mut program_dirs = if resume_from_snapshot {
         translated_program_dirs(input_dir)?
     } else if parse_benchmark_dir(input_dir).is_ok() {
@@ -1251,31 +1198,19 @@ fn run(args: Args) -> HarvestResult<()> {
 
     log_found_programs(&program_dirs, input_dir)?;
 
-    let program_runs: Vec<ProgramRun> = if resume_from_snapshot {
-        let mut runs = Vec::new();
-        for snapshot_dir in &program_dirs {
-            let bench_program_dir =
-                resolve_bench_reference(snapshot_dir, args.test_case.as_deref())?;
-            log::info!(
-                "Snapshot {} grades against bench case {}",
-                snapshot_dir.display(),
-                bench_program_dir.display()
-            );
-            runs.push(ProgramRun {
-                bench_program_dir,
-                stage_input: Some(snapshot_dir.clone()),
-            });
-        }
-        runs
-    } else {
-        program_dirs
-            .iter()
-            .map(|dir| ProgramRun {
-                bench_program_dir: dir.clone(),
-                stage_input: None,
-            })
-            .collect()
-    };
+    let mut program_runs: Vec<ProgramRun> = Vec::new();
+    for dir in &program_dirs {
+        let name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        program_runs.push(if resume_from_snapshot {
+            resume_from(dir, name, args.test_case.as_deref())?
+        } else {
+            start_from_bench(dir, name)?
+        });
+    }
 
     let opts = RunOptions {
         config_overrides: args.config.clone(),
@@ -1291,6 +1226,7 @@ fn run(args: Args) -> HarvestResult<()> {
         test_harness: args.test_harness,
         verify_harness: args.verify_harness.unwrap_or_default(),
         fuzz: args.fuzz,
+        force: args.force,
     };
     let results = run_all_benchmarks(&program_runs, output_dir, &opts)?;
     let csv_output_path = output_dir.join("results.csv");

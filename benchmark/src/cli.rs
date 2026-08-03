@@ -16,6 +16,19 @@ pub enum TestHarness {
     Bin,
 }
 
+impl TestHarness {
+    /// The external-suite kind this selection forces on the conform stage, or
+    /// `None` for `auto` (let the loader detect it from the bench directory).
+    pub fn suite_kind(self) -> Option<full_source::TestSuiteKind> {
+        match self {
+            TestHarness::Auto => None,
+            TestHarness::Gtest => Some(full_source::TestSuiteKind::Gtest),
+            TestHarness::Lib => Some(full_source::TestSuiteKind::Lib),
+            TestHarness::Bin => Some(full_source::TestSuiteKind::Bin),
+        }
+    }
+}
+
 /// Which comparison mechanism the in-loop verification agent is given.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VerifyHarness {
@@ -49,8 +62,8 @@ fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
 pub struct Args {
     /// Input directory. Its meaning follows the first stage of the run:
     /// for translate (and the non-agentic modes) it is a bench test-case root;
-    /// for verify/conform it is a previous run's output root (a snapshot
-    /// carrying harvest_stage.json manifests).
+    /// for verify/conform it is a previous run's output root, whose program
+    /// directories are self-contained snapshots (see .harvest/).
     #[arg(required_unless_present = "test")]
     pub input_dir: Option<PathBuf>,
 
@@ -88,7 +101,7 @@ pub struct Args {
     /// pipeline order (aliases: t, v, c): `--agentic=translate` freezes a
     /// translator snapshot, `--agentic=verify` resumes from one,
     /// `--agentic=conform` refines against the external suite. Bare
-    /// `--agentic` means translate,verify. Conform currently runs alone.
+    /// `--agentic` means translate,verify.
     #[arg(
         long,
         conflicts_with = "modular",
@@ -110,9 +123,9 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub model: Option<String>,
 
-    /// Override the bench test-case location when resuming from a snapshot
-    /// (first stage verify/conform). By default the bench reference is read
-    /// from each snapshot's harvest_stage.json. Accepts a bench root
+    /// Grade and refine against a bench directory's *current* external test
+    /// suite instead of the one the snapshot carries. Only applies when
+    /// resuming (first stage verify or conform). Accepts a bench root
     /// containing program subdirectories, or a single bench program directory.
     #[arg(long, requires = "agentic")]
     pub test_case: Option<PathBuf>,
@@ -178,6 +191,13 @@ pub struct Args {
     /// Cannot be used together with --filter.
     #[arg(long, conflicts_with = "filter")]
     pub exclude: Option<String>,
+
+    /// Erase an output program directory that already holds results, instead
+    /// of refusing to write into it. Without this, a populated directory is an
+    /// error: materializing over one leaves the previous run's files in place
+    /// and the mixture travels forward as if it were a single run's output.
+    #[arg(long)]
+    pub force: bool,
 }
 
 impl Args {
@@ -203,12 +223,6 @@ impl Args {
         };
         if self.agentic.is_some() && stages.is_empty() {
             return Err("--agentic requires at least one stage".to_owned());
-        }
-        if has(Stage::Conform) && stages.len() > 1 {
-            return Err(format!(
-                "stage conform currently runs alone (got --agentic={})",
-                stages_str()
-            ));
         }
         let verify_only_flags = [
             (self.fuzz, "--fuzz"),
@@ -236,11 +250,10 @@ impl Args {
                 ));
             }
         }
-        if self.test_case.is_some() && stages.first() != Some(&Stage::Verify) {
+        if self.test_case.is_some() && matches!(stages.first(), None | Some(Stage::Translate)) {
             return Err(format!(
-                "--test-case only applies when resuming from a snapshot with verify as \
-                 the first stage (got --agentic={}); conform grades against the snapshot's \
-                 own suite",
+                "--test-case only applies when resuming from a snapshot, i.e. when the first \
+                 stage is verify or conform (got --agentic={})",
                 stages_str()
             ));
         }
@@ -287,18 +300,23 @@ mod tests {
     }
 
     #[test]
-    fn conform_must_run_alone() {
-        let args = parse(&["bench", "--agentic=v,c", "in", "out"]).unwrap();
-        let err = args.validate_stages(&args.stages()).unwrap_err();
-        assert!(err.contains("conform"), "{err}");
+    fn conform_composes_with_the_other_stages() {
+        for spec in ["--agentic=c", "--agentic=v,c", "--agentic=t,v,c"] {
+            let args = parse(&["bench", spec, "in", "out"]).unwrap();
+            let stages = args.stages();
+            assert_eq!(stages.last(), Some(&Stage::Conform), "{spec}");
+            args.validate_stages(&stages).unwrap();
+        }
     }
 
     #[test]
-    fn test_case_only_for_verify_first() {
+    fn test_case_only_when_resuming_from_a_snapshot() {
         let args = parse(&["bench", "--agentic=t,v", "--test-case", "tc", "in", "out"]).unwrap();
         assert!(args.validate_stages(&args.stages()).is_err());
-        let args = parse(&["bench", "--agentic=v", "--test-case", "tc", "in", "out"]).unwrap();
-        args.validate_stages(&args.stages()).unwrap();
+        for spec in ["--agentic=v", "--agentic=c"] {
+            let args = parse(&["bench", spec, "--test-case", "tc", "in", "out"]).unwrap();
+            args.validate_stages(&args.stages()).unwrap();
+        }
     }
 
     #[test]

@@ -153,6 +153,10 @@ pub fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
 pub struct RustToolchainContext {
     pub required_version: String,
     pub prompt_block: String,
+    /// The Test-Corpus / cando2 checkout the contract was read from, if one
+    /// was found. Recorded in the stage manifest so a run resuming from a
+    /// snapshot can find it again without the C source's original location.
+    pub test_corpus_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,12 +205,33 @@ pub fn render_model_limits_block(limits: &OpenCodeModelLimits) -> String {
     lines.join("\n")
 }
 
+/// Detects the Rust toolchain contract for a run.
+///
+/// The version comes from the Test-Corpus / cando2 checkout, found by walking
+/// up from `input_path`. That walk only works while the C source still sits
+/// inside the corpus, which stops being true once a run resumes from a
+/// self-contained snapshot (whose C source lives under the snapshot's own
+/// `.harvest/c_src/`). So the corpus root is detected once, on the run that
+/// starts from the bench directory, recorded in the stage manifest, and passed
+/// back in as `test_corpus_root` by later runs. The resolved root is reported
+/// in [`RustToolchainContext::test_corpus_root`] for the caller to persist.
 pub fn detect_rust_toolchain_context(
     input_path: &Path,
+    test_corpus_root: Option<&Path>,
 ) -> Result<RustToolchainContext, Box<dyn std::error::Error>> {
     let repo_root = std::env::current_dir()?;
     let root_toolchain = read_toolchain_channel(&repo_root);
-    let test_corpus_root = find_test_corpus_root(input_path, &repo_root);
+    let test_corpus_root = match test_corpus_root {
+        Some(root) if root.is_dir() => Some(root.to_path_buf()),
+        Some(root) => {
+            warn!(
+                "recorded Test-Corpus root {} no longer exists; falling back to detection",
+                root.display()
+            );
+            find_test_corpus_root(input_path, &repo_root)
+        }
+        None => find_test_corpus_root(input_path, &repo_root),
+    };
     let test_corpus_toolchain = test_corpus_root
         .as_ref()
         .and_then(|root| read_toolchain_channel(root));
@@ -268,7 +293,16 @@ pub fn detect_rust_toolchain_context(
     Ok(RustToolchainContext {
         required_version,
         prompt_block,
+        test_corpus_root,
     })
+}
+
+/// Locates the Test-Corpus / cando2 checkout for `input_path` without
+/// performing the toolchain checks, so a caller can record it (see
+/// [`detect_rust_toolchain_context`]) before any agent runs.
+pub fn locate_test_corpus(input_path: &Path) -> Option<PathBuf> {
+    let repo_root = std::env::current_dir().ok()?;
+    find_test_corpus_root(input_path, &repo_root)
 }
 
 fn find_test_corpus_root(input_path: &Path, repo_root: &Path) -> Option<PathBuf> {

@@ -10,7 +10,7 @@ use agent_runner::{AgentInvocation, AgentPhase};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cmake_presets::{TestConfig, find_test_config};
 use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::RawDir;
+use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
@@ -123,6 +123,8 @@ impl Tool for VerifyFixAgentic {
         let c_src_dir = translated.join("c_src");
         fs::create_dir_all(&c_src_dir)?;
         raw_source.dir.materialize(&c_src_dir)?;
+        // c_src/ is this stage's oracle. It is a read-only input.
+        let reference_guard = ReferenceGuard::capture(&translated, &["c_src"])?;
 
         info!("Working directory: {}", case_dir.display());
 
@@ -150,7 +152,10 @@ impl Tool for VerifyFixAgentic {
         // without any special permissions. The absolute path is injected into the prompt.
         let local_wishlist = translated.join("tool_wishlist.json");
         let rust_toolchain_context =
-            agent_runner::detect_rust_toolchain_context(&context.config.input)?;
+            agent_runner::detect_rust_toolchain_context(
+                &context.config.input,
+                config.test_corpus_root.as_deref(),
+            )?;
 
         // Look near the original input dir; the case_dir tempdir does not contain
         // CMakePresets.json because raw_source only mirrors `test_case/` content.
@@ -305,17 +310,8 @@ impl Tool for VerifyFixAgentic {
         // 2) Remove known intermediate build/source artifacts.
         // 3) Surface any remaining symlinks for diagnostics.
         remove_hidden_entries(&translated)?;
+        reference_guard.strip(&translated, config.rejected_output_dir.as_deref())?;
 
-        let c_src_out = translated.join("c_src");
-        if c_src_out.exists() {
-            if let Err(e) = fs::remove_dir_all(&c_src_out) {
-                warn!(
-                    "Failed to remove c_src output dir {}: {}",
-                    c_src_out.display(),
-                    e
-                );
-            }
-        }
         let target_out = translated.join("target");
         if target_out.exists() {
             if let Err(e) = fs::remove_dir_all(&target_out) {
@@ -523,52 +519,6 @@ fn load_verify_prompt(
     }
 }
 
-/// Remove hidden entries (names starting with `.`) under `dir`, including nested ones.
-/// This prevents agent-runtime artifacts like `.opencode/` from leaking into the IR.
-fn remove_hidden_entries(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let hidden = name.to_string_lossy().starts_with('.');
-            if hidden {
-                let path = entry.path();
-                if let Err(e) = fs::remove_dir_all(&path) {
-                    if path.is_dir() {
-                        warn!(
-                            "Failed to remove hidden directory {}: {}",
-                            path.display(),
-                            e
-                        );
-                    } else if let Err(e2) = fs::remove_file(&path) {
-                        warn!("Failed to remove hidden entry {}: {}", path.display(), e2);
-                    }
-                }
-            } else if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                remove_hidden_entries(&entry.path())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Collects symlink paths under `dir` for debugging.
-fn collect_symlinks(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.file_type().is_symlink() {
-                    out.push(path.display().to_string());
-                } else if metadata.is_dir() {
-                    out.extend(collect_symlinks(&path));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Render `TestConfig` as the markdown block that the verify prompt expects in
 /// place of `{ALL_CONFIGURATIONS}`. Empty when there are no project knobs to
 /// switch — in that case the conditional "If configurations are listed below"
@@ -664,6 +614,15 @@ pub struct Config {
     /// Injected by the benchmark at runtime so the agent's full trace
     /// (JSON stream) is appended to the same log file as benchmark messages.
     pub output_log_path: Option<PathBuf>,
+
+    /// Directory where a read-only reference the agent modified is preserved
+    /// for review (`.harvest/rejected/<stage>/`). Injected by the benchmark.
+    pub rejected_output_dir: Option<PathBuf>,
+
+    /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
+    /// Injected from the stage manifest when resuming from a snapshot, whose
+    /// C source no longer sits inside the corpus.
+    pub test_corpus_root: Option<PathBuf>,
 
     #[serde(flatten)]
     unknown: HashMap<String, serde_json::Value>,

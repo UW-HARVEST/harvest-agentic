@@ -2,7 +2,7 @@ use crate::error::HarvestResult;
 use harvest_core::fs::RawDir;
 use harvest_core::HarvestIR;
 
-use full_source::{CargoPackage, RawSource};
+use full_source::{CargoPackage, ExternalTestSuite, RawSource};
 use try_cargo_build::{Artifact, CargoBuildResult};
 
 /// Extract the final CargoPackage representation from the IR.
@@ -31,6 +31,14 @@ pub fn raw_source(ir: &HarvestIR) -> HarvestResult<&RawDir> {
         1 => Ok(raw_sources[0]),
         n => Err(format!("Found {} RawSource representations, expected at most 1", n).into()),
     }
+}
+
+/// Extract the external test suite from the IR, if the run loaded one. Absent
+/// for test cases that ship no external suite.
+pub fn external_test_suite(ir: &HarvestIR) -> Option<&ExternalTestSuite> {
+    ir.get_by_representation::<ExternalTestSuite>()
+        .last()
+        .map(|(_, r)| r)
 }
 
 /// Extract cargo build results from the IR.

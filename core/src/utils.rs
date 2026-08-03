@@ -58,6 +58,23 @@ pub fn get_version() -> &'static str {
     concat!(env!("GIT_SHA"), " (", env!("GIT_DATE"), ")")
 }
 
+/// Returns the git revision of the checkout containing `dir`, in the same
+/// format as [`get_version`]'s SHA (`<sha>` with a trailing `*` when the
+/// working tree is dirty), or `None` when `dir` is not in a git checkout.
+pub fn git_revision<P: AsRef<Path>>(dir: P) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir.as_ref())
+        .args(["describe", "--always", "--abbrev=0", "--dirty=*"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!revision.is_empty()).then_some(revision)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(miri))]

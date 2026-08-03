@@ -8,10 +8,12 @@ pub mod util;
 
 use build_project_spec::BuildProjectSpec;
 use c_ast::ParseToAst;
+use conform_agentic::ConformAgentic;
 use harvest_core::config::{Config, Stage};
 use harvest_core::utils::get_version;
 use harvest_core::{HarvestIR, diagnostics};
 use load_raw_source::LoadRawSource;
+use load_test_suite::LoadTestSuite;
 use load_translated_package::LoadTranslatedPackage;
 use modular_translation_llm::ModularTranslationLlm;
 use raw_source_to_cargo_llm::RawSourceToCargoLlm;
@@ -25,10 +27,6 @@ use verify_fix_agentic::VerifyFixAgentic;
 
 /// Performs the complete transpilation process using the scheduler.
 pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::Error>> {
-    if config.stages.contains(&Stage::Conform) {
-        return Err("stage `conform` is driven by the benchmark binary, not the IR pipeline".into());
-    }
-
     // Basic tool setup
     let collector = diagnostics::Collector::initialize(&config)?;
     let mut ir = HarvestIR::default();
@@ -41,9 +39,19 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
     // Setup a schedule for the transpilation. The C source is always loaded:
     // it is the translate input, and the verify stage's ground truth.
     let load_src = scheduler.queue(LoadRawSource::new(&config.input));
+
+    // The external test suite is loaded for every run, whichever translator
+    // produces the crate, so that the run can write it back out and its output
+    // is a self-contained snapshot. Loading it is not the same as revealing it:
+    // only the conform stage declares it as an input, which is what holds it
+    // out of the other stages.
+    let suite = load_test_suite::configured_input_path(&config)
+        .filter(|path| load_test_suite::has_suite(path))
+        .map(|_| scheduler.queue(LoadTestSuite));
+
     let translate = if !config.stages.is_empty() {
-        // Agentic pipeline. The initial CargoPackage comes from the translate
-        // stage when it runs, otherwise from a previous run's snapshot.
+        // The initial CargoPackage comes from the translate stage when it
+        // runs, otherwise from a previous run's snapshot.
         let package = if config.stages.contains(&Stage::Translate) {
             let project_spec = scheduler.queue_after(BuildProjectSpec, &[load_src]);
             scheduler.queue_after(TranslateAgentic, &[load_src, project_spec])
@@ -53,8 +61,17 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
             )?;
             scheduler.queue(LoadTranslatedPackage::new(snapshot))
         };
-        if config.stages.contains(&Stage::Verify) {
+        let package = if config.stages.contains(&Stage::Verify) {
             scheduler.queue_after(VerifyFixAgentic, &[package, load_src])
+        } else {
+            package
+        };
+        if config.stages.contains(&Stage::Conform) {
+            let suite = suite.ok_or(
+                "the conform stage needs an external test suite, but none was found at \
+                 tools.load_test_suite.input_path",
+            )?;
+            scheduler.queue_after(ConformAgentic, &[package, load_src, suite])
         } else {
             package
         }
