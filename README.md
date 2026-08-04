@@ -117,7 +117,6 @@ runner build would otherwise report all test vectors as failures.
 | `--no-plan-file` | Sub-agent guidance kept, plan files never mentioned |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
 | `--agent-tools` | Provide the agent with pre-built tools |
-| `--wait-until <TS>` | Delay the first agentic stage of the run until a Unix timestamp (e.g. the next subscription quota window) |
 | `--test <PATH>` | Re-validate an already-translated output directory without running any stage |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
 

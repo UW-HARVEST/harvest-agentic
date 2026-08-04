@@ -41,7 +41,7 @@ pub struct Args {
     )]
     pub agentic: Option<Vec<Stage>>,
 
-    /// A previous run's output program directory (carrying harvest_stage.json)
+    /// A previous run's output program directory (carrying stage.json)
     /// to use as the stage input when the first agentic stage is not translate.
     #[arg(long, requires = "agentic")]
     pub stage_input: Option<PathBuf>,

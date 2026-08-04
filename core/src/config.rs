@@ -100,7 +100,7 @@ pub struct Config {
 
     /// When the first stage in `stages` is not `translate`, the path to the
     /// stage-input snapshot: an already-translated program directory
-    /// (a previous run's output, carrying a `harvest_stage.json` manifest).
+    /// (a previous run's output, carrying a `stage.json` manifest).
     #[serde(default)]
     pub stage_input: Option<PathBuf>,
 
