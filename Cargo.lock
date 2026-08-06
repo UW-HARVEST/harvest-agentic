@@ -1384,6 +1384,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harvest-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "wait-timeout",
+]
+
+[[package]]
 name = "harvest-benchmark"
 version = "0.1.0"
 dependencies = [
@@ -1392,6 +1403,7 @@ dependencies = [
  "clap",
  "csv",
  "full_source",
+ "harvest-bench",
  "harvest_core",
  "harvest_translate",
  "load_test_suite",
