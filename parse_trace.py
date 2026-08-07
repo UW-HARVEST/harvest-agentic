@@ -328,7 +328,12 @@ class Session:
     while keeping the top-level view clean.
     """
     session_id: str
-    phase: str   # "translation" | "verification" | "unknown"
+    # Which pipeline stage produced this session ("translation",
+    # "verification", "conformance"), or None when the trace does not say.
+    # Only the runner's own "Invoking … agent" lines are authoritative: the
+    # stages run independently now, so a session's position in the file
+    # implies nothing about which stage it is. Unknown renders as no name.
+    phase: Optional[str]
     agent_type: str = "claude"  # "claude" | "opencode"
     data_source: str = "jsonl"  # "export" | "live-export" | "jsonl" | "sqlite"
 
@@ -428,11 +433,12 @@ class TraceParser:
             sid = obj.get("session_id", "unknown")
             by_session[sid].append((lineno, obj))
 
-        sessions = []
-        for idx, (sid, events) in enumerate(by_session.items()):
-            phases = ["translation", "verification", "unknown"]
-            phase = phases[min(idx, 2)]
-            sessions.append(self._parse_session(sid, phase, events))
+        # The stage is not guessed from position; _apply_runner_phases fills
+        # it in from the runner's markers when the trace has them.
+        sessions = [
+            self._parse_session(sid, None, events)
+            for sid, events in by_session.items()
+        ]
         return sessions
 
     def _parse_session(
@@ -859,7 +865,8 @@ def print_session_stats(sessions: list[Session]) -> None:
         r = s.result
         print(f"{'=' * 60}")
         source_hint = f" source={s.data_source}" if s.agent_type == "opencode" else ""
-        print(f"Session [{s.phase}] ({s.agent_type}{source_hint})  id={s.session_id[:8]}...")
+        phase_hint = f"[{s.phase}] " if s.phase else ""
+        print(f"Session {phase_hint}({s.agent_type}{source_hint})  id={s.session_id[:8]}...")
         print(f"{'=' * 60}")
 
         if s.init:
@@ -1220,7 +1227,10 @@ def build_readable_history(sessions: list[Session]) -> str:
 
         out.append("")
         out.append("=" * 70)
-        out.append(f"  Session {idx}/{total} — {s.phase.upper()}")
+        heading = f"  Session {idx}/{total}"
+        if s.phase:
+            heading += f" — {s.phase.upper()}"
+        out.append(heading)
         out.append(
             f"  model: {s.init.model if s.init else '?'}  "
             f"duration: {duration_s}  cost: {cost}"
@@ -1915,7 +1925,7 @@ def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
 
 
 def _format_session_summary(s: Session, s_idx: int) -> str:
-    parts = [f"S{s_idx} {s.phase}:"]
+    parts = [f"S{s_idx} {s.phase}:" if s.phase else f"S{s_idx}:"]
     r = s.result
     if s.agent_type == "opencode":
         parts.append(f"[{s.data_source}]")
@@ -2390,11 +2400,12 @@ class OpenCodeParser:
             sid = obj.get("sessionID", "unknown")
             by_session[sid].append((lineno, obj))
 
-        sessions = []
-        for idx, (sid, events) in enumerate(by_session.items()):
-            phases = ["translation", "verification", "unknown"]
-            phase = phases[min(idx, 2)]
-            sessions.append(self._parse_session(sid, phase, events))
+        # The stage is not guessed from position; _apply_runner_phases fills
+        # it in from the runner's markers when the trace has them.
+        sessions = [
+            self._parse_session(sid, None, events)
+            for sid, events in by_session.items()
+        ]
         return sessions
 
     def _parse_session(
@@ -2521,11 +2532,19 @@ class OpenCodeExportParser:
         session_id = info.get("id", "unknown")
         title = info.get("title", "")
         agent_type = "opencode"
-        phase = "unknown"
-        if "translate" in title.lower() or "translate" in info.get("agent", "").lower():
-            phase = "translation"
-        elif "verify" in title.lower() or "verify" in info.get("agent", "").lower():
-            phase = "verification"
+        # OpenCode names its agent definitions harvest-translate /
+        # harvest-verify / harvest-conform, so the export itself usually says
+        # which stage this was; leave it unknown rather than guess.
+        haystack = f"{title} {info.get('agent', '')}".lower()
+        phase = None
+        for needle, name in (
+            ("translate", "translation"),
+            ("verify", "verification"),
+            ("conform", "conformance"),
+        ):
+            if needle in haystack:
+                phase = name
+                break
 
         session = Session(session_id=session_id, phase=phase, agent_type=agent_type, data_source="export")
 
@@ -2982,23 +3001,38 @@ def _fetch_live_opencode_exports(
 _ISO_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
 
 
-def _extract_runner_phase_windows(path: str) -> list[tuple[str, int, int]]:
+# agent_runner logs one of these per agent process, e.g.
+#   Invoking OpenCode verification agent (model=..., timeout=...)
+#   Invoking Claude Code translation agent (model=..., no_plan=...)
+# The phase word is whatever AgentPhase::label() returns, so a stage added on
+# the Rust side shows up here without this script being taught about it.
+_RUNNER_INVOKE_RE = re.compile(r"Invoking .+? (\w+) agent\b")
+
+
+def _extract_runner_phase_windows(path: str) -> list[tuple[str, int, Optional[int]]]:
     """Extract per-phase agent *process* windows from agent_runner log lines.
 
     The benchmark trace interleaves the agent's JSON stream with agent_runner
     tracing lines (ISO-8601 timestamps). The window from
-    "Invoking OpenCode <phase> agent" to the first post-exit marker
+    "Invoking <agent> <phase> agent" to the first post-exit marker
     ("Exporting OpenCode session" / "Appended agent trace") is the real
     process lifetime — including any stall between the session's last
     activity and the harness timeout kill, which is invisible in the
     session's own data.
 
-    Returns a list of (phase, start_ms, end_ms) in file order; windows with
-    no end marker are omitted.
+    These lines are also the trace's only authoritative record of *which*
+    stages ran: since the stages became independently runnable, a trace may
+    hold a verify alone, a conform alone, or any combination, so position in
+    the file says nothing about which stage a session is.
+
+    Returns (phase, start_ms, end_ms) in file order. `end_ms` is None for a
+    window that never closed (the process was killed, or the run died), which
+    is kept rather than dropped so the list stays aligned with the agent
+    processes that actually started.
     """
     from datetime import datetime
 
-    windows: list[tuple[str, int, int]] = []
+    windows: list[tuple[str, int, Optional[int]]] = []
     open_phase: Optional[str] = None
     open_start_ms = 0
 
@@ -3017,29 +3051,54 @@ def _extract_runner_phase_windows(path: str) -> list[tuple[str, int, int]]:
             for line in f:
                 if line.lstrip().startswith("{"):
                     continue  # JSON event/export content, not a runner log line
-                if "Invoking OpenCode" in line and "agent" in line:
+                m = _RUNNER_INVOKE_RE.search(line)
+                if m:
                     ts = _iso_ms(line)
                     if ts is None:
                         continue
-                    phase = (
-                        "translation" if "translation agent" in line
-                        else "verification" if "verification agent" in line
-                        else "unknown"
-                    )
-                    open_phase = phase
+                    if open_phase is not None:
+                        windows.append((open_phase, open_start_ms, None))
+                    open_phase = m.group(1)
                     open_start_ms = ts
                 elif open_phase is not None and (
                     "Exporting OpenCode session" in line
                     or "Appended agent trace" in line
                 ):
                     ts = _iso_ms(line)
-                    if ts is not None and ts >= open_start_ms:
-                        windows.append((open_phase, open_start_ms, ts))
+                    end_ms = ts if ts is not None and ts >= open_start_ms else None
+                    windows.append((open_phase, open_start_ms, end_ms))
                     open_phase = None
     except OSError:
         return []
 
+    if open_phase is not None:
+        windows.append((open_phase, open_start_ms, None))
     return windows
+
+
+def _apply_runner_phases(path: str, sessions: list[Session]) -> list[Session]:
+    """Name root sessions after the stages the runner actually invoked, and
+    give them their agent-process wall time.
+
+    Pairing is by order of appearance: the Nth agent process the runner
+    started produced the Nth root session. A session with no corresponding
+    marker keeps `phase = None` and is rendered without a stage name — an
+    unnamed lane is honest, a mislabeled one is not.
+    """
+    windows = _extract_runner_phase_windows(path)
+    if not windows:
+        return sessions
+    if len(windows) != len(sessions):
+        # Something is missing on one side (a crashed export, an unparsed
+        # session). Pairing by position would start mislabeling from the first
+        # gap onwards, so name nothing.
+        return sessions
+    for session, (phase, start_ms, end_ms) in zip(sessions, windows):
+        if session.phase is None:
+            session.phase = phase
+        if session.process_wall_ms == 0 and end_ms is not None:
+            session.process_wall_ms = end_ms - start_ms
+    return sessions
 
 
 def parse_mixed_trace_file(path: str, fmt: str = "auto") -> list[Session]:
@@ -3069,7 +3128,7 @@ def parse_mixed_trace_file(path: str, fmt: str = "auto") -> list[Session]:
         fmt = _detect_format(peek_records)
 
     if fmt == "claude":
-        return TraceParser().parse_file(path)
+        return _apply_runner_phases(path, TraceParser().parse_file(path))
 
     # OpenCode path: read mixed file, prefer export blocks.
     exports, jsonl_events = _read_mixed_trace(path)
@@ -3101,47 +3160,28 @@ def parse_mixed_trace_file(path: str, fmt: str = "auto") -> list[Session]:
     child_export_sids = _attach_opencode_child_sessions(combined_exports, parsed_exports)
     seen_sids: set[str] = set(parsed_exports)
 
-    # Phase assignment: first root session = translation, second = verification.
-    phase_counter = 0
-
-    # First/second: in-file exports and live exports, but only root sessions.
+    # Root sessions, in file order. The export usually names its own stage
+    # (OpenCode's agent definitions are harvest-translate/-verify/-conform);
+    # anything still unnamed is resolved from the runner's markers below.
     for sid in combined_exports:
         if sid in child_export_sids:
             continue
-        session = parsed_exports[sid]
-        session.phase = ["translation", "verification", "unknown"][min(phase_counter, 2)]
-        phase_counter += 1
-        sessions.append(session)
+        sessions.append(parsed_exports[sid])
 
-    # Third: parse remaining sessions from JSONL (only if no export for that sid).
+    # Then sessions that only exist as JSONL events (no export for that sid).
     for sid, events in jsonl_events.items():
         if sid in seen_sids:
             continue
-        session = jsonl_parser._parse_session(
-            sid,
-            ["translation", "verification", "unknown"][min(phase_counter, 2)],
-            events,
-        )
-        phase_counter += 1
-        sessions.append(session)
+        sessions.append(jsonl_parser._parse_session(sid, None, events))
 
     # If we found nothing at all, fall back to the raw parsers.
     if not sessions:
         return OpenCodeParser().parse_file(path)
 
-    # Attach agent-process wall time from agent_runner markers, so stall
-    # time between the session's last activity and the process's death
-    # (timeout kill) becomes visible. Match windows to root sessions by
-    # phase, in file order.
-    for phase, start_ms, end_ms in _extract_runner_phase_windows(path):
-        for session in sessions:
-            if session.process_wall_ms == 0 and (
-                session.phase == phase or phase == "unknown"
-            ):
-                session.process_wall_ms = end_ms - start_ms
-                break
-
-    return sessions
+    # Name the stages and attach agent-process wall time from the runner's
+    # markers, so stall time between a session's last activity and the
+    # process's death (timeout kill) becomes visible.
+    return _apply_runner_phases(path, sessions)
 
 
 def parse_trace_file(path: str, fmt: str = "auto") -> list[Session]:
