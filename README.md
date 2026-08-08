@@ -1,5 +1,31 @@
 # Harvest Agentic Translator
 
+Harvest translates C projects into pure-Rust Cargo packages by driving coding
+agents (Claude Code, OpenCode, Kiro) through staged translation and
+verification, then grades the result against an external GoogleTest suite
+built from the C library's own upstream tests.
+The agentic translator builds on the ideas of
+[ACTOR](https://homes.cs.washington.edu/~mernst/pubs/c-to-rust-ieeesp2026-abstract.html); the older
+non-agentic translation paths are documented in the collapsed upstream README
+at the bottom.
+
+## Building and running
+
+Requirements: [rustup](https://rustup.rs) (the pinned toolchain in
+[rust-toolchain.toml](./rust-toolchain.toml) installs automatically),
+`libclang` (`apt-get install libclang-dev` on Ubuntu), CMake and a C/C++
+compiler for building the test suites, and Python 3 for the trace
+visualizer.
+
+```bash
+cargo build --release
+```
+
+The examples in this README use `cargo run --bin=benchmark --release -- ...`,
+which rebuilds as needed and runs in one step. If you prefer, invoke the
+built binary directly instead: `./target/release/benchmark ...` takes exactly
+the arguments that follow the `--`.
+
 ## Stage-composable architecture
 
 When `--agentic` is set, the pipeline replaces the one-shot/modular LLM
@@ -16,9 +42,11 @@ later stage can resume from an earlier run's output directory.
    comparison environment using the C as the oracle (GoogleTest by default,
    optionally with FuzzTest; libloading as the legacy method), compares C and
    Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
-3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). A third agent is
-   given the external test suite and refines the crate until it passes. This is
-   a research instrument, not part of the evaluation pipeline.
+3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). Experimental,
+   research use only: not part of the standard translation pipeline, and bare
+   `--agentic` never runs it. A third agent is given the external test suite
+   and refines the crate until it passes, to study the gap between internal
+   and external testing.
 
 After the agent stages, Harvest freezes the result into its IR
 and compiles it one final time (`try_cargo_build`). The `benchmark` binary
@@ -27,21 +55,27 @@ validates the result against the corpus test suite and writes `results.csv`.
 ### Snapshots and resuming
 
 Every agentic run writes each program's result as a **self-contained
-snapshot**: the crate at the top level, and everything the framework owns —
-including the read-only reference inputs — under a single `.harvest/`
+snapshot**: the crate at the top level, and everything the framework owns
+(including the read-only reference inputs) under a single `.harvest/`
 directory.
 
 ```bash
 # 1. Freeze a translator snapshot (no verify):
-benchmark --agentic=t --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_1_cs5_t
+cargo run --bin=benchmark --release -- --agentic=t --agent claude --model sonnet \
+  ./harvest-bench/tests/lz4 ./out_lz4_1_cs5_t
 
 # 2. Run verify experiments against the SAME frozen translation, repeatedly:
-benchmark --agentic=v --agent claude --model sonnet ./out_lz4_1_cs5_t ./out_lz4_1_cs5_tv
-benchmark --agentic=v --agent claude --model opus   ./out_lz4_1_cs5_t ./out_lz4_1_cs5_t_co5_v
+cargo run --bin=benchmark --release -- --agentic=v --agent claude --model sonnet \
+  ./out_lz4_1_cs5_t ./out_lz4_1_cs5_tv
+cargo run --bin=benchmark --release -- --agentic=v --agent claude --model opus \
+  ./out_lz4_1_cs5_t ./out_lz4_1_cs5_t_co5_v
 
-# 3. Third-round conform on a verified snapshot (or all three in one run):
-benchmark --agentic=c     --agent claude --model sonnet ./out_lz4_1_cs5_tv ./out_lz4_1_cs5_tvc
-benchmark --agentic=t,v,c --agent claude --model sonnet ./harvest-bench/tests/lz4 ./out_lz4_2_cs5_tvc
+# 3. Experimental research stage: conform on a verified snapshot
+#    (not part of the standard pipeline; all three stages in one run also works):
+cargo run --bin=benchmark --release -- --agentic=c --agent claude --model sonnet \
+  ./out_lz4_1_cs5_tv ./out_lz4_1_cs5_tvc
+cargo run --bin=benchmark --release -- --agentic=t,v,c --agent claude --model sonnet \
+  ./harvest-bench/tests/lz4 ./out_lz4_2_cs5_tvc
 ```
 
 ## Supported agents and models
@@ -89,25 +123,27 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   Claude Code to orchestrate the run with its dynamic multi-agent workflow
   feature.
 
-## Test corpus
+## Test cases
 
-The benchmarks come from the TRACTOR
-[Test-Corpus](https://github.com/UW-HARVEST/Test-Corpus/tree/adapted) (use
-the `adapted` branch, which adds real-world libraries such as lz4, jansson,
-and zstd under `Adapted-Tests/`). Cloning it into the repository root is the
-recommended setup, since the examples below and the toolchain check assume
-that location.
+The test cases come from
+[harvest-bench](https://github.com/UW-HARVEST/harvest-bench), a standalone
+benchmark of real-world C libraries. Each
+case ships the pinned C source (`test_case/`) and a self-contained GoogleTest
+external suite (`gtest_suite/`) built from the library's own upstream tests;
+harvest-bench's README is the authoritative description of the layout and of
+its standalone runner. Clone it into this repository's root as
+`./harvest-bench`; the examples below assume that location.
 
-Note on toolchains: the repository's `rust-toolchain.toml` must agree with
-the Test-Corpus / cando2 required Rust version (currently 1.94.1). This is
+Note on toolchains: the agents and the harness must build with the same
+pinned Rust version (`rust-toolchain.toml`, currently 1.94.1). This is
 checked at startup and the run fails fast on a mismatch, because a mismatched
-runner build would otherwise report all test vectors as failures.
+harness build would otherwise report every test as a failure.
 
 ## Benchmark CLI flags (agentic)
 
 | Flag | Meaning |
 |------|---------|
-| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify`. The value form requires `=` (`--agentic=v`, not `--agentic v`). |
+| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`conform` is an experimental research stage). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
 | `--agent <A>` | `claude`, `opencode`/`oc`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
@@ -118,6 +154,7 @@ runner build would otherwise report all test vectors as failures.
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
 | `--agent-tools` | Provide the agent with pre-built tools |
 | `--test <PATH>` | Re-validate an already-translated output directory without running any stage |
+| `--force` | Erase an output program directory that already holds results (otherwise a populated directory is an error) |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
 
 `--timeout`, `--test-harness`, `--filter`, and `--exclude` work as in
@@ -126,21 +163,13 @@ are rejected when that stage is not part of the run.
 
 ## Examples
 
-Small public test case, Claude Sonnet, full translate + verify (the trailing
-`&>` captures the trace -- see the visualization section below):
+A real-world library (lz4), Claude Sonnet, full translate + verify (the
+trailing `&>` captures the trace -- see the visualization section below):
 
 ```bash
 cargo run --bin=benchmark --release -- \
   --agentic --agent claude --model sonnet \
-  ./Test-Corpus/Public-Tests/P00_perlin_noise/ ./out_perlin_1_cs &> ./trace_perlin_1_cs.txt
-```
-
-A real-world library from the adapted corpus (lz4):
-
-```bash
-cargo run --bin=benchmark --release -- \
-  --agentic --agent claude --model sonnet \
-  ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_1_cs &> ./trace_lz4_1_cs.txt
+  ./harvest-bench/tests/lz4/ ./out_lz4_1_cs &> ./trace_lz4_1_cs.txt
 ```
 
 Non-Claude model through OpenCode:
@@ -149,7 +178,7 @@ Non-Claude model through OpenCode:
 cargo run --bin=benchmark --release -- \
   --agentic --agent oc \
   --model openrouter/deepseek/deepseek-v4-pro \
-  ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_2_ods4p &> ./trace_lz4_2_ods4p.txt
+  ./harvest-bench/tests/jansson/ ./out_jansson_1_ods4p &> ./trace_jansson_1_ods4p.txt
 ```
 
 Non-Anthropic model driven by Claude Code through CCR (note the comma):
@@ -158,27 +187,27 @@ Non-Anthropic model driven by Claude Code through CCR (note the comma):
 cargo run --bin=benchmark --release -- \
   --agentic --agent claude \
   --model "openrouter,deepseek/deepseek-v4-flash" \
-  ./Test-Corpus/Public-Tests/P00_perlin_noise/ ./out_perlin_2_cds4f &> ./trace_perlin_2_cds4f.txt
+  ./harvest-bench/tests/mujs/ ./out_mujs_1_cds4f &> ./trace_mujs_1_cds4f.txt
 ```
 
-Prompt-mode ablations on a large repo (zstd):
+Prompt-mode ablations, including a large repo (zstd):
 
 ```bash
 # no-plan
 cargo run --bin=benchmark --release -- \
   --agentic --agent claude --model opus --no-plan \
-  ./Test-Corpus/Adapted-Tests/P03_zstd/ ./out_zstd_1_co_np &> ./trace_zstd_1_co_np.txt
+  ./harvest-bench/tests/zstd/ ./out_zstd_1_co_np &> ./trace_zstd_1_co_np.txt
 
 # workflow mode
 cargo run --bin=benchmark --release -- \
   --agentic --agent claude --model sonnet \
   --no-plan --workflow \
-  ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
+  ./harvest-bench/tests/lz4/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
 
 # no-plan-file
 cargo run --bin=benchmark --release -- \
   --agentic --agent claude --model sonnet --no-plan-file \
-  ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/ ./out_lz4_4_cs_npf &> ./trace_lz4_4_cs_npf.txt
+  ./harvest-bench/tests/lz4/ ./out_lz4_4_cs_npf &> ./trace_lz4_4_cs_npf.txt
 ```
 
 Re-run only the test-vector validation on an existing output:
@@ -193,11 +222,12 @@ model set via config override):
 ```bash
 cargo run --bin=translate --release -- --agentic \
   --agent claude --config tools.translate_agentic.model=sonnet \
-  ./Test-Corpus/Adapted-Tests/P01_lz4/001_lz4_lib/test_case/ -o out_lz4_translate
+  ./harvest-bench/tests/lz4/test_case/ -o out_lz4_translate
 ```
 
 The `out_*` / `trace_*` naming used above is just a convention:
-`<project>_<run#>_<model shorthand>[_np|_npf][_wf]`.
+`<project>_<run#>_<model shorthand>[_np|_npf][_wf]`, plus a stage suffix
+(`_t`, `_tv`, `_tvc`) when a run freezes a partial-stage snapshot.
 
 ## Trace capture and visualization
 
@@ -228,7 +258,7 @@ python3 parse_trace.py <file> [-v] [-r] [-f] [--format auto|claude|opencode]
 
   <file>          Path to the trace file (trace_*.txt or output.log)
   (no flags)      Print session statistics (turns, tools, sub-agents, tokens, cost)
-  -v, --visualize Generate <file>_timeline.svg — the SVG timeline
+  -v, --visualize Generate <file>_timeline.svg, the SVG timeline
   -r, --readable  Generate a human-readable text transcript
   -f, --file-io   Generate a per-file I/O analysis JSON
   --format        Force the trace format (default: auto-detect)
@@ -248,30 +278,6 @@ To keep visualizations up to date during long runs:
 
 Open the generated `trace_*_timeline.svg` in a browser tab and refresh to
 follow the run's progress in real time.
-
-## Known issue: Claude Code async sub-agents can be killed mid-run
-
-**This problem is mitigated by prompting the agent to only use synchronous sub-agents.**
-
-As of Claude Code 2.1.201 (and some earlier 2.1.x versions), Claude Code
-changed the default sub-agent execution mode from synchronous to
-asynchronous. In the terminal UI, launching a sub-agent frees the input
-box while the sub-agent runs in the background, and its completion is later
-delivered to the main agent as a system message.
-
-We suspect this caused a bug for the non-interactive `claude -p` mode
-that Harvest uses. When only background sub-agents are running and the main
-agent has no foreground task, the state that "frees the input box" in the
-terminal UI appears to be treated as the end of the `claude -p` process. The
-process then exits and kills still-running sub-agents.
-
-We have observed this in real runs. The main agent ends a turn with
-"waiting for the background agents", the process exits, and the trace shows
-`task_notification` events with `"status":"stopped"` (instead of
-`"completed"`) for sub-agents that were killed mid-translation, leaving
-declared Rust modules whose files were never written. If a run fails with
-seemingly unfinished work, check the trace for `"status":"stopped"`
-notifications to identify this kind of failure.
 
 <details>
 <summary>Upstream README</summary>
