@@ -94,13 +94,9 @@ pub fn detect_kind(
         }
         return Ok(kind);
     }
-    [
-        TestSuiteKind::Gtest,
-        TestSuiteKind::Lib,
-        TestSuiteKind::Bin,
-    ]
-    .into_iter()
-    .find(|&k| present(k))
+    TestSuiteKind::ALL
+        .into_iter()
+        .find(|&k| present(k))
     .ok_or_else(|| {
         format!(
             "no external test suite found in {} (looked for gtest_suite/, runner/ + test_vectors/, test_vectors/)",

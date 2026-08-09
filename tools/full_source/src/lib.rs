@@ -63,9 +63,14 @@ pub enum TestSuiteKind {
 }
 
 impl TestSuiteKind {
+    /// Every suite kind, in the benchmark grader's `auto` detection order:
+    /// GoogleTest first, then the cando2 runner, then plain vectors.
+    pub const ALL: [TestSuiteKind; 3] =
+        [TestSuiteKind::Gtest, TestSuiteKind::Lib, TestSuiteKind::Bin];
+
     /// The top-level directory names that constitute a suite of this kind.
     /// Each is reserved by [`harvest_core::stage_manifest::is_reserved_toplevel`].
-    pub fn dirs(self) -> &'static [&'static str] {
+    pub const fn dirs(self) -> &'static [&'static str] {
         match self {
             TestSuiteKind::Gtest => &["gtest_suite"],
             TestSuiteKind::Lib => &["runner", "test_vectors"],
@@ -113,5 +118,26 @@ impl Representation for ExternalTestSuite {
 
     fn materialize(&self, path: &Path) -> std::io::Result<()> {
         self.dir.materialize(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `stage_manifest::SUITE_DIR_NAMES` is the flat list core uses to carve
+    /// suite directories out of a snapshot; it must stay in lockstep with the
+    /// per-kind directory sets defined here.
+    #[test]
+    fn suite_dir_names_match_kind_dirs() {
+        let mut from_kinds: Vec<&str> = TestSuiteKind::ALL
+            .iter()
+            .flat_map(|k| k.dirs().iter().copied())
+            .collect();
+        from_kinds.sort();
+        from_kinds.dedup();
+        let mut from_core = harvest_core::stage_manifest::SUITE_DIR_NAMES.to_vec();
+        from_core.sort();
+        assert_eq!(from_kinds, from_core);
     }
 }

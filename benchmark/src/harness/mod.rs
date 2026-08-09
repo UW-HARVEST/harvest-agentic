@@ -135,24 +135,30 @@ pub fn parse_benchmark_dir(input_dir: &Path) -> HarvestResult<(PathBuf, PathBuf)
         .into());
     }
 
-    // Accept test_case/src (normal layout) or test_case/app (configurable layout).
+    // Accept test_case/src (normal layout) or test_case/app (configurable
+    // layout). Test cases that ship a GoogleTest suite promise only that
+    // test_case/ is a CMake project producing a shared library, so the
+    // src/app convention is not enforced for them (e.g. libsodium keeps the
+    // upstream `test_case/libsodium/**` layout).
     let has_src = test_case_dir.join("src").is_dir();
     let has_app = test_case_dir.join("app").is_dir();
-    if !has_src && !has_app {
+    let has_gtest = matches!(
+        load_test_suite::detect_kind(input_dir, None),
+        Ok(full_source::TestSuiteKind::Gtest)
+    );
+    if !has_src && !has_app && !has_gtest {
         return Err(format!(
-            "Required test_case/src or test_case/app directory not found under: {}",
-            test_case_dir.display()
+            "Required test_case/src or test_case/app directory not found under: {} \
+             (and no {}/ beside test_case/)",
+            test_case_dir.display(),
+            crate::harness::gtest::GTEST_SUITE_DIR
         )
         .into());
     }
 
     // JSON vectors are optional for test cases that ship a GoogleTest suite
     // instead (gtest_suite/); everything else still requires test_vectors/.
-    if (!test_vectors_dir.exists() || !test_vectors_dir.is_dir())
-        && !input_dir
-            .join(crate::harness::gtest::GTEST_SUITE_DIR)
-            .is_dir()
-    {
+    if (!test_vectors_dir.exists() || !test_vectors_dir.is_dir()) && !has_gtest {
         return Err(format!(
             "Required test_vectors directory not found: {}",
             test_vectors_dir.display()
@@ -308,5 +314,66 @@ pub fn validate_binary_output(
             actual_stdout,
             actual_stderr
         ).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a bench program directory with the given subdirectory paths.
+    fn bench_dir(subdirs: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("create tempdir");
+        for sub in subdirs {
+            fs::create_dir_all(root.path().join(sub)).expect("create subdir");
+        }
+        root
+    }
+
+    #[test]
+    fn cando2_layout_is_accepted() {
+        let dir = bench_dir(&["test_case/src", "test_vectors"]);
+        assert!(parse_benchmark_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn configurable_app_layout_is_accepted() {
+        let dir = bench_dir(&["test_case/app", "test_vectors"]);
+        assert!(parse_benchmark_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn gtest_case_without_src_is_accepted() {
+        // The libsodium shape: test_case/ keeps the upstream layout (no src/
+        // or app/), and the test set lives in gtest_suite/.
+        let dir = bench_dir(&["test_case/libsodium/crypto_box", "gtest_suite"]);
+        assert!(parse_benchmark_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn gtest_case_needs_no_test_vectors() {
+        let dir = bench_dir(&["test_case/src", "gtest_suite"]);
+        assert!(parse_benchmark_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn missing_src_without_gtest_is_rejected() {
+        let dir = bench_dir(&["test_case/libsodium", "test_vectors"]);
+        let err = parse_benchmark_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("src"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn missing_test_case_is_rejected() {
+        let dir = bench_dir(&["gtest_suite"]);
+        let err = parse_benchmark_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("test_case"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn missing_vectors_without_gtest_is_rejected() {
+        let dir = bench_dir(&["test_case/src"]);
+        let err = parse_benchmark_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("test_vectors"), "unexpected error: {err}");
     }
 }

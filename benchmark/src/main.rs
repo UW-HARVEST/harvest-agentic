@@ -348,6 +348,70 @@ fn write_stage_manifest(output_dir: &Path, run: &ProgramRun, opts: &RunOptions) 
     }
 }
 
+/// Which harness grades a program's tests. Resolved once from the CLI choice
+/// and the suite the snapshot carries; both the fresh-run and the re-grade
+/// paths dispatch on this instead of re-deriving it.
+#[derive(Debug)]
+enum ValidationHarness {
+    /// GoogleTest suite; carries the resolved `gtest_suite/` directory.
+    Gtest { suite_dir: PathBuf },
+    /// cando2 library validation (`runner/` + JSON vectors via FFI).
+    Library,
+    /// Run the `driver` binary directly against JSON vectors.
+    Binary,
+}
+
+/// Resolves which validation harness grades `suite_root`.
+///
+/// `library_auto` is the caller's auto-mode preference for library validation
+/// when no gtest suite applies: a fresh bench run consults the detected C
+/// project kind, while a snapshot re-grade only has the suite directories to
+/// go by. Explicit `--test-harness lib|bin` overrides it either way.
+fn select_validation_harness(
+    requested: TestHarness,
+    suite_root: &Path,
+    library_auto: bool,
+) -> Result<ValidationHarness, String> {
+    let gtest_available = matches!(
+        load_test_suite::detect_kind(suite_root, None),
+        Ok(full_source::TestSuiteKind::Gtest)
+    );
+    let use_gtest = match requested {
+        TestHarness::Gtest if !gtest_available => {
+            return Err(format!(
+                "--test-harness gtest requested, but {} carries no gtest_suite/",
+                suite_root.display()
+            ));
+        }
+        TestHarness::Gtest => true,
+        TestHarness::Auto => gtest_available,
+        TestHarness::Lib | TestHarness::Bin => false,
+    };
+    if use_gtest {
+        return Ok(ValidationHarness::Gtest {
+            suite_dir: suite_root.join(harness::gtest::GTEST_SUITE_DIR),
+        });
+    }
+    let use_library = match requested {
+        TestHarness::Lib => true,
+        TestHarness::Bin => false,
+        TestHarness::Auto | TestHarness::Gtest => library_auto,
+    };
+    Ok(if use_library {
+        ValidationHarness::Library
+    } else {
+        ValidationHarness::Binary
+    })
+}
+
+/// The `runner/` directory of a cando2 library suite (the first entry of
+/// [`full_source::TestSuiteKind::Lib`]'s directory set).
+fn runner_dir_exists(suite_root: &Path) -> bool {
+    suite_root
+        .join(full_source::TestSuiteKind::Lib.dirs()[0])
+        .is_dir()
+}
+
 /// Run list of tests and output result/errors
 fn run_test_validation(
     binary_path: &Path,
@@ -642,82 +706,65 @@ fn benchmark_single_program(
     // saw, re-emitted from the IR, so grading never depends on the bench
     // directory still being in place.
     let graded_suite_root = stage_manifest::suite_dir(&output_dir);
-    // - gtest: a gtest_suite/ in the suite is preferred when present (auto),
-    //   or forced via --test-harness gtest.
+    // Auto-mode library preference, from the detected C project kind:
     // - Library projects always use cando2 (runner + test_vectors via FFI).
-    // - Configurable projects can be tested either way; pick library validation only
-    //   when a `runner/` exists, otherwise fall back to running the driver
-    //   binary against test_vectors (executable-style tests).
-    // - Executable projects run the binary directly against test vectors.
-    // - Unknown project kinds fall back to the binary path if available.
-    let gtest_suite_dir = graded_suite_root.join(harness::gtest::GTEST_SUITE_DIR);
-    let gtest_available = gtest_suite_dir.is_dir();
-    if test_harness == TestHarness::Gtest && !gtest_available {
-        let error = format!(
-            "--test-harness gtest requested, but no gtest_suite/ was carried into {}",
-            graded_suite_root.display()
-        );
-        log::error!("{}", error);
-        result.error_message = Some(error);
-        return result;
-    }
-    let use_gtest_validation = match test_harness {
-        TestHarness::Gtest => true,
-        TestHarness::Auto => gtest_available,
-        TestHarness::Lib | TestHarness::Bin => false,
+    // - Configurable projects can be tested either way; pick library validation
+    //   only when a `runner/` exists, otherwise fall back to running the
+    //   driver binary against test_vectors (executable-style tests).
+    // - Executable and unknown project kinds run the binary directly.
+    let library_auto = match project_kind {
+        Some(ProjectKind::Library) => true,
+        Some(ProjectKind::Configurable) => runner_dir_exists(&graded_suite_root),
+        _ => false,
     };
-    let runner_exists = graded_suite_root.join("runner").is_dir();
-    let use_library_validation = match test_harness {
-        TestHarness::Lib => true,
-        TestHarness::Bin => false,
-        TestHarness::Auto | TestHarness::Gtest => match project_kind {
-            Some(ProjectKind::Library) => true,
-            Some(ProjectKind::Configurable) => runner_exists,
-            _ => false,
-        },
-    };
-    let (test_results, error_messages) = if use_gtest_validation {
-        match harness::gtest::run_gtest_validation(
-            &program_name,
-            &gtest_suite_dir,
-            &output_dir,
-            timeout,
-        ) {
-            Ok(r) => {
-                // gtest defines its own test set; the vector count no longer applies.
-                result.total_tests = r.0.len();
-                r
-            }
-            Err(e) => {
-                let error_msg = format!("GoogleTest validation failed: {}", e);
-                log::error!("{}", error_msg);
-                result.error_message = Some(error_msg);
-                return result;
-            }
+    let validation = match select_validation_harness(test_harness, &graded_suite_root, library_auto)
+    {
+        Ok(v) => v,
+        Err(error) => {
+            log::error!("{}", error);
+            result.error_message = Some(error);
+            return result;
         }
-    } else {
-        match (use_library_validation, translation_result.rust_binary_path) {
-            (true, _) => {
-                match harness::library::run_library_validation(
-                    &program_name,
-                    &graded_suite_root,
-                    &output_dir,
-                    &test_cases,
-                    timeout,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let error_msg = format!("Library validation failed: {}", e);
-                        log::error!("{}", error_msg);
-                        result.error_message = Some(error_msg);
-                        return result;
-                    }
+    };
+    let (test_results, error_messages) = match validation {
+        ValidationHarness::Gtest { suite_dir } => {
+            match harness::gtest::run_gtest_validation(&program_name, &suite_dir, &output_dir, timeout)
+            {
+                Ok(r) => {
+                    // gtest defines its own test set; the vector count no longer applies.
+                    result.total_tests = r.0.len();
+                    r
+                }
+                Err(e) => {
+                    let error_msg = format!("GoogleTest validation failed: {}", e);
+                    log::error!("{}", error_msg);
+                    result.error_message = Some(error_msg);
+                    return result;
                 }
             }
-            (false, Some(binary_path)) if binary_path.exists() => {
+        }
+        ValidationHarness::Library => {
+            match harness::library::run_library_validation(
+                &program_name,
+                &graded_suite_root,
+                &output_dir,
+                &test_cases,
+                timeout,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let error_msg = format!("Library validation failed: {}", e);
+                    log::error!("{}", error_msg);
+                    result.error_message = Some(error_msg);
+                    return result;
+                }
+            }
+        }
+        ValidationHarness::Binary => match translation_result.rust_binary_path {
+            Some(binary_path) if binary_path.exists() => {
                 run_test_validation(&binary_path, &test_cases, timeout, &output_dir)
             }
-            (_, binary_path) => {
+            binary_path => {
                 let error = format!(
                 "Rust build reported success, but expected output artifact was not found at {:?}",
                 binary_path
@@ -726,7 +773,7 @@ fn benchmark_single_program(
                 result.error_message = Some(error);
                 return result;
             }
-        }
+        },
     };
 
     result.passed_tests = test_results
@@ -861,8 +908,10 @@ fn test_existing_program(
 
     // Everything graded against comes from the snapshot's own suite.
     let suite_root = stage_manifest::suite_dir(program_dir);
-    let gtest_suite_dir = suite_root.join(harness::gtest::GTEST_SUITE_DIR);
-    let gtest_available = gtest_suite_dir.is_dir();
+    let gtest_available = matches!(
+        load_test_suite::detect_kind(&suite_root, None),
+        Ok(full_source::TestSuiteKind::Gtest)
+    );
 
     // gtest-only programs need no JSON vectors: the suite defines the test set.
     let test_vectors_dir = suite_root.join("test_vectors");
@@ -886,30 +935,23 @@ fn test_existing_program(
     };
     result.total_tests = test_cases.len();
 
-    if test_harness == TestHarness::Gtest && !gtest_available {
-        result.error_message = Some(format!(
-            "--test-harness gtest requested, but {} carries no gtest_suite/",
-            suite_root.display()
-        ));
-        return result;
-    }
-    let use_gtest_validation = match test_harness {
-        TestHarness::Gtest => true,
-        TestHarness::Auto => gtest_available,
-        TestHarness::Lib | TestHarness::Bin => false,
+    // Auto-mode library preference: a snapshot re-grade has no C project kind
+    // to consult, so the presence of the suite's runner/ decides.
+    let validation = match select_validation_harness(
+        test_harness,
+        &suite_root,
+        runner_dir_exists(&suite_root),
+    ) {
+        Ok(v) => v,
+        Err(error) => {
+            result.error_message = Some(error);
+            return result;
+        }
     };
-    let use_library_validation = match test_harness {
-        TestHarness::Lib => true,
-        TestHarness::Bin => false,
-        TestHarness::Auto | TestHarness::Gtest => suite_root.join("runner").is_dir(),
-    };
-    let (test_results, error_messages) = if use_gtest_validation {
-        match harness::gtest::run_gtest_validation(
-            &program_name,
-            &gtest_suite_dir,
-            program_dir,
-            timeout,
-        ) {
+    let (test_results, error_messages) = if let ValidationHarness::Gtest { suite_dir } = &validation
+    {
+        match harness::gtest::run_gtest_validation(&program_name, suite_dir, program_dir, timeout)
+        {
             Ok(r) => {
                 result.rust_build_success = true;
                 // gtest defines its own test set; the vector count no longer applies.
@@ -922,7 +964,7 @@ fn test_existing_program(
                 return result;
             }
         }
-    } else if use_library_validation {
+    } else if matches!(validation, ValidationHarness::Library) {
         match harness::library::run_library_validation(
             &program_name,
             &suite_root,
@@ -1181,8 +1223,12 @@ fn run(args: Args) -> HarvestResult<()> {
     let resume_from_snapshot = matches!(stages.first(), Some(Stage::Verify | Stage::Conform));
     let mut program_dirs = if resume_from_snapshot {
         translated_program_dirs(input_dir)?
-    } else if parse_benchmark_dir(input_dir).is_ok() {
-        // The input itself is a single test case root: run just that.
+    } else if input_dir.join("test_case").is_dir() {
+        // The input itself is a single test case root: run just that. The
+        // probe is structural on purpose — a full parse_benchmark_dir check
+        // here would silently reinterpret a malformed test case as a corpus
+        // root, and its subdirectories as programs. This way the real
+        // contract error surfaces from start_from_bench instead.
         vec![input_dir.clone()]
     } else {
         collect_program_dirs(input_dir)?
@@ -1256,5 +1302,70 @@ fn status_emoji(success: bool) -> &'static str {
     match success {
         true => "✅",
         false => "❌",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn suite(subdirs: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("create tempdir");
+        for sub in subdirs {
+            std::fs::create_dir_all(root.path().join(sub)).expect("create subdir");
+        }
+        root
+    }
+
+    #[test]
+    fn auto_prefers_gtest_when_present() {
+        let dir = suite(&["gtest_suite", "runner", "test_vectors"]);
+        let v = select_validation_harness(TestHarness::Auto, dir.path(), true).unwrap();
+        match v {
+            ValidationHarness::Gtest { suite_dir } => {
+                assert!(suite_dir.ends_with("gtest_suite"));
+            }
+            _ => panic!("expected gtest"),
+        }
+    }
+
+    #[test]
+    fn auto_uses_library_preference_without_gtest() {
+        let dir = suite(&["runner", "test_vectors"]);
+        assert!(matches!(
+            select_validation_harness(TestHarness::Auto, dir.path(), true).unwrap(),
+            ValidationHarness::Library
+        ));
+        assert!(matches!(
+            select_validation_harness(TestHarness::Auto, dir.path(), false).unwrap(),
+            ValidationHarness::Binary
+        ));
+    }
+
+    #[test]
+    fn forced_gtest_without_suite_is_an_error() {
+        let dir = suite(&["runner", "test_vectors"]);
+        let err = select_validation_harness(TestHarness::Gtest, dir.path(), true).unwrap_err();
+        assert!(err.contains("gtest_suite"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn explicit_lib_and_bin_override_gtest() {
+        let dir = suite(&["gtest_suite", "runner", "test_vectors"]);
+        assert!(matches!(
+            select_validation_harness(TestHarness::Lib, dir.path(), false).unwrap(),
+            ValidationHarness::Library
+        ));
+        assert!(matches!(
+            select_validation_harness(TestHarness::Bin, dir.path(), true).unwrap(),
+            ValidationHarness::Binary
+        ));
+    }
+
+    #[test]
+    fn runner_dir_probe_matches_lib_suite_layout() {
+        let dir = suite(&["runner"]);
+        assert!(runner_dir_exists(dir.path()));
+        assert!(!runner_dir_exists(&dir.path().join("nope")));
     }
 }

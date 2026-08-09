@@ -83,15 +83,25 @@ pub fn ensure_output_directory(output_dir: &PathBuf) -> HarvestResult<()> {
     Ok(())
 }
 
-/// Find all immediate child directories in the input directory
-/// TODO: should probably recursively search instead
+/// Find all immediate child directories of the input directory that look
+/// like test cases (contain a `test_case/` subdirectory). Other directories
+/// (documentation, build trees, stray checkouts) are skipped with a log line
+/// instead of aborting the whole run when their contract check fails.
 pub fn collect_program_dirs(input_dir: &PathBuf) -> HarvestResult<Vec<PathBuf>> {
     let mut program_dirs = Vec::new();
     for entry in std::fs::read_dir(input_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("test_case").is_dir() {
             program_dirs.push(path);
+        } else {
+            log::info!(
+                "Skipping {} (no test_case/ subdirectory)",
+                path.display()
+            );
         }
     }
     // Standardize order before returning
@@ -167,4 +177,25 @@ pub fn write_error_file(file_path: &PathBuf, error_messages: &[String]) -> Harve
         writeln!(file, "{}", error)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_program_dirs_keeps_only_test_case_children() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        std::fs::create_dir_all(root.path().join("prog_a/test_case")).unwrap();
+        std::fs::create_dir_all(root.path().join("prog_b/test_case")).unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("README.md"), "x").unwrap();
+
+        let dirs = collect_program_dirs(&root.path().to_path_buf()).unwrap();
+        let names: Vec<_> = dirs
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["prog_a", "prog_b"]);
+    }
 }
