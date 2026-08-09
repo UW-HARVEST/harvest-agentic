@@ -728,7 +728,7 @@ fn invoke_opencode(
     // directory in `run_bash_agent` — stronger than `--pure` (hides global
     // plugins AND global config/instructions), while project-local
     // `.opencode/` still loads.
-    run_bash_agent(
+    let mut status = run_bash_agent(
         invocation,
         log_path,
         format!(
@@ -744,8 +744,100 @@ fn invoke_opencode(
             invocation.phase.opencode_agent_name()
         ),
         None,
-    )
+    )?;
+
+    // OpenCode ends the process with success when a provider stream dies
+    // mid-response: it treats the truncated turn as a finished one. Half a
+    // translation is then graded as if the agent had chosen to stop.
+    // Resume the session so the run continues from the work it already did
+    // instead of being scored on it.
+    let mut resumes = 0;
+    loop {
+        match assess_opencode_run(log_path) {
+            OpenCodeOutcome::Healthy => break,
+            OpenCodeOutcome::Fatal(error) => {
+                // Retrying cannot fix this, and grading the partial output
+                // would put an environment failure into the results as if it
+                // were the model's score.
+                return Err(format!(
+                    "OpenCode {} agent hit an unrecoverable provider error: {error}",
+                    invocation.phase.label()
+                )
+                .into());
+            }
+            OpenCodeOutcome::Resumable { session_id, reason } => {
+                // Assessment runs after every resume, so a run that stays
+                // broken is reported rather than passed off as recovered.
+                if resumes >= OPENCODE_MAX_RESUMES {
+                    warn!(
+                        "OpenCode {} session {session_id} still ending abnormally (reason: \
+                         {reason}) after {OPENCODE_MAX_RESUMES} resumes; giving up. The output \
+                         is incomplete — grade it as such.",
+                        invocation.phase.label()
+                    );
+                    append_output_log_line(
+                        invocation.output_log_path,
+                        &format!(
+                            "WARNING: {} session {session_id} still abnormal (reason: {reason}) \
+                             after {OPENCODE_MAX_RESUMES} resumes; output is incomplete",
+                            invocation.phase.label()
+                        ),
+                    );
+                    break;
+                }
+                resumes += 1;
+                warn!(
+                    "OpenCode {} session {session_id} ended abnormally (last step reason: {reason}); \
+                     resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES})",
+                    invocation.phase.label()
+                );
+                append_output_log_line(
+                    invocation.output_log_path,
+                    &format!(
+                        "WARNING: {} session {session_id} ended abnormally (reason: {reason}); \
+                         resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES})",
+                        invocation.phase.label()
+                    ),
+                );
+                // `tee -a`: the resumed run must extend the log, not replace
+                // it — the first segment holds everything the agent did before
+                // the stream died, which trace analysis still needs.
+                status = run_bash_agent(
+                    invocation,
+                    log_path,
+                    format!(
+                        "set -o pipefail; timeout {} opencode run \
+                         --format json \
+                         --thinking \
+                         --dangerously-skip-permissions \
+                         --agent {} \
+                         --session {} \
+                         {model_flag}\
+                         \"$RESUME_PROMPT\" \
+                         < /dev/null 2>&1 | tee -a \"$LOG\"",
+                        invocation.timeout_secs,
+                        invocation.phase.opencode_agent_name(),
+                        session_id,
+                    ),
+                    None,
+                )?;
+            }
+        }
+    }
+
+    Ok(status)
 }
+
+/// Sent when resuming a session whose stream died. It names the failure so the
+/// model does not mistake the gap for a compaction, and points it at the plan
+/// file, which is the only state that survived intact.
+const OPENCODE_RESUME_PROMPT: &str = "\
+Your previous response was cut off by a provider failure, not by you finishing. \
+Nothing after that point ran. \
+Re-read your plan file to see where you were. \
+Check the filesystem to see which files actually exist before you trust any \
+earlier claim that one was written. \
+Then continue the work from the first unfinished step.";
 
 fn run_bash_agent(
     invocation: &AgentInvocation<'_>,
@@ -758,6 +850,7 @@ fn run_bash_agent(
     cmd.arg("-c")
         .arg(script)
         .env("PROMPT", invocation.prompt)
+        .env("RESUME_PROMPT", OPENCODE_RESUME_PROMPT)
         .env("LOG", log_path)
         .env("OPENSSL_DIR", openssl_dir)
         .current_dir(invocation.work_dir);
@@ -835,6 +928,127 @@ fn run_bash_agent(
 
 fn claude_uses_ccr(model: Option<&str>) -> bool {
     model.is_some_and(|m| m.contains(','))
+}
+
+/// How an OpenCode run ended, judged from its own JSONL log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenCodeOutcome {
+    /// The session reached a real end of turn.
+    Healthy,
+    /// The session stopped early in a way a `continue` can pick up.
+    Resumable { session_id: String, reason: String },
+    /// The provider refused in a way retrying cannot fix.
+    Fatal(String),
+}
+
+/// Maximum `--session … continue` attempts after one dead stream. A provider
+/// that keeps dropping the stream must not spin here.
+const OPENCODE_MAX_RESUMES: u32 = 3;
+
+/// Provider errors that no amount of retrying fixes. Matched case-insensitively
+/// against the API error text. Anything else (dropped stream, 5xx, timeout) is
+/// treated as transient and resumable.
+const OPENCODE_FATAL_ERROR_MARKERS: &[&str] = &[
+    "insufficient balance",
+    "insufficient_quota",
+    "exceeded your current quota",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "unauthorized",
+    "payment required",
+    "billing",
+];
+
+/// Judges how an OpenCode run ended by reading the run's own JSONL log.
+///
+/// Read the per-agent log, never a `&>` capture: the shared `output.log` is
+/// appended across stages, so a capture of it can carry sessions from earlier
+/// runs and mislead this check.
+///
+/// The health test is a WHITELIST: a turn is healthy only when the last
+/// `step_finish` says `stop`. OpenCode reports every abnormal ending as a
+/// normal one — it exits 0 after a stream dies mid-response — and it spells
+/// those endings differently each time. A blacklist of known-bad
+/// values misses the next spelling; requiring the one known-good value does
+/// not.
+fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
+    let Ok(file) = fs::File::open(log_path) else {
+        return OpenCodeOutcome::Healthy;
+    };
+
+    let mut last_finish_reason: Option<String> = None;
+    let mut last_session_id: Option<String> = None;
+    let mut fatal_error: Option<String> = None;
+    let mut saw_any_event = false;
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if let Some(sid) = event.get("sessionID").and_then(|v| v.as_str()) {
+            saw_any_event = true;
+            last_session_id = Some(sid.to_string());
+        }
+        match event_type {
+            "step_finish" => {
+                last_finish_reason = event
+                    .get("part")
+                    .and_then(|p| p.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+            "error" => {
+                let text = event.get("error").map(|e| e.to_string()).unwrap_or_default();
+                let lowered = text.to_lowercase();
+                if OPENCODE_FATAL_ERROR_MARKERS
+                    .iter()
+                    .any(|marker| lowered.contains(marker))
+                {
+                    fatal_error = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(error) = fatal_error {
+        return OpenCodeOutcome::Fatal(error);
+    }
+    // No parsable events at all: the run never produced a session (a launch
+    // failure, or a format this parser does not know). Leave it to the
+    // caller's exit-status handling rather than inventing a resume.
+    if !saw_any_event {
+        return OpenCodeOutcome::Healthy;
+    }
+    if last_finish_reason.as_deref() == Some("stop") {
+        return OpenCodeOutcome::Healthy;
+    }
+    match last_session_id {
+        // The id is interpolated into the resume shell command, so accept only
+        // the shape OpenCode actually emits (`ses_` + base62). A surprising id
+        // means the log is not what this parser thinks it is; skip the resume
+        // rather than build a command out of it.
+        Some(session_id)
+            if !session_id.is_empty()
+                && session_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
+            OpenCodeOutcome::Resumable {
+                session_id,
+                reason: last_finish_reason.unwrap_or_else(|| "missing".to_string()),
+            }
+        }
+        _ => OpenCodeOutcome::Healthy,
+    }
 }
 
 /// Extract all unique session IDs from an OpenCode JSONL log file.
@@ -1054,6 +1268,12 @@ struct OpenCodeAgentConfig<'a> {
 /// phase's recovery command before writing.
 const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("opencode_compaction_recovery.js");
 
+/// Project-local OpenCode plugin that rewrites an empty sub-agent `task`
+/// result into an explicit failure report. Written for every OpenCode run
+/// (unlike the compaction plugin, this needs no per-phase substitution). See
+/// the plugin source for the mechanism and the upstream issues.
+const OPENCODE_RESILIENCE_PLUGIN: &str = include_str!("opencode_resilience.js");
+
 const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[
     ("bash", "allow"),
     ("read", "allow"),
@@ -1196,9 +1416,14 @@ fn write_opencode_agent(
         ),
     )?;
 
+    let plugin_dir = work_dir.join(".opencode/plugin");
+    fs::create_dir_all(&plugin_dir)?;
+    fs::write(
+        plugin_dir.join("harvest-resilience.js"),
+        OPENCODE_RESILIENCE_PLUGIN,
+    )?;
+
     if let Some(recovery_command) = &config.recovery_command {
-        let plugin_dir = work_dir.join(".opencode/plugin");
-        fs::create_dir_all(&plugin_dir)?;
         fs::write(
             plugin_dir.join("compaction-recovery.js"),
             OPENCODE_COMPACTION_PLUGIN.replace("{RECOVERY_CMD}", recovery_command),
@@ -1225,6 +1450,92 @@ mod tests {
         let opencode = agent_bug_workarounds(AgentKind::OpenCode);
         assert!(opencode.contains("#29363"));
         assert!(opencode.contains("sub-agent prompt"));
+    }
+
+    /// Writes a JSONL log with the given events and assesses it.
+    fn assess_log(lines: &[&str]) -> OpenCodeOutcome {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.log");
+        fs::write(&path, lines.join("\n")).expect("write log");
+        assess_opencode_run(&path)
+    }
+
+    #[test]
+    fn healthy_run_needs_a_stop_finish() {
+        let outcome = assess_log(&[
+            r#"{"type":"step_start","sessionID":"ses_a","part":{}}"#,
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"stop"}}"#,
+        ]);
+        assert_eq!(outcome, OpenCodeOutcome::Healthy);
+    }
+
+    #[test]
+    fn dead_stream_is_resumable() {
+        // trace_pcre2_3 / trace_libpng_1: reasoning cut mid-sentence, the
+        // synthesized step_finish reports "unknown", and opencode exits 0.
+        let outcome = assess_log(&[
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
+            r#"{"type":"reasoning","sessionID":"ses_a","part":{"text":"cut off mid-thou"}}"#,
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"unknown"}}"#,
+        ]);
+        assert_eq!(
+            outcome,
+            OpenCodeOutcome::Resumable {
+                session_id: "ses_a".to_string(),
+                reason: "unknown".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn whitelist_catches_endings_no_blacklist_would_list() {
+        // A step_finish with no `reason` at all, and a truncated turn: both
+        // must be caught by requiring "stop" rather than listing bad values.
+        for part in [r#"{}"#, r#"{"reason":"length"}"#, r#"{"reason":"tool-calls"}"#] {
+            let line = format!(r#"{{"type":"step_finish","sessionID":"ses_a","part":{part}}}"#);
+            assert!(
+                matches!(
+                    assess_log(&[&line]),
+                    OpenCodeOutcome::Resumable { .. }
+                ),
+                "part {part} should be resumable"
+            );
+        }
+    }
+
+    #[test]
+    fn balance_error_is_fatal_not_resumable() {
+        // trace_mujs_6: the provider refused outright. Resuming would burn the
+        // timeout, and grading the partial run would record an environment
+        // failure as a score.
+        let outcome = assess_log(&[
+            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
+            r#"{"type":"error","sessionID":"ses_a","error":{"name":"APIError","data":{"message":"Upstream request failed: [invalid_request_error] Insufficient Balance"}}}"#,
+        ]);
+        match outcome {
+            OpenCodeOutcome::Fatal(msg) => assert!(msg.contains("Insufficient Balance")),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shell_unsafe_session_id_is_not_resumed() {
+        let outcome = assess_log(&[
+            r#"{"type":"step_finish","sessionID":"ses_a; rm -rf /","part":{"reason":"unknown"}}"#,
+        ]);
+        assert_eq!(outcome, OpenCodeOutcome::Healthy);
+    }
+
+    #[test]
+    fn a_log_without_events_is_left_alone() {
+        assert_eq!(assess_log(&["not json", ""]), OpenCodeOutcome::Healthy);
+    }
+
+    #[test]
+    fn resilience_plugin_rewrites_empty_task_results() {
+        assert!(OPENCODE_RESILIENCE_PLUGIN.contains("tool.execute.after"));
+        assert!(OPENCODE_RESILIENCE_PLUGIN.contains("task_result"));
     }
 
     #[test]
