@@ -272,9 +272,11 @@ fn write_snapshot_references(output_dir: &Path, ir: &HarvestIR) {
         Err(e) => log::warn!("Failed to retrieve C source from IR: {e}"),
     }
     if let Some(suite) = external_test_suite(ir) {
-        replace(stage_manifest::suite_dir(output_dir), "test suite", &|dest| {
-            suite.dir.materialize(dest)
-        });
+        replace(
+            stage_manifest::suite_dir(output_dir),
+            "test suite",
+            &|dest| suite.dir.materialize(dest),
+        );
     }
 }
 
@@ -291,21 +293,20 @@ fn write_stage_manifest(output_dir: &Path, run: &ProgramRun, opts: &RunOptions) 
 
     // Any reference directory an agent modified was quarantined here by the
     // stage that caught it.
-    let reference_modified = std::fs::read_dir(
-        stage_manifest::meta_dir(output_dir).join(stage_manifest::REJECTED_DIR),
-    )
-    .map(|entries| {
-        let mut names: Vec<String> = entries
-            .flatten()
-            .flat_map(|stage| std::fs::read_dir(stage.path()).ok())
-            .flat_map(|refs| refs.flatten())
-            .map(|r| r.file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
-    })
-    .unwrap_or_default();
+    let reference_modified =
+        std::fs::read_dir(stage_manifest::meta_dir(output_dir).join(stage_manifest::REJECTED_DIR))
+            .map(|entries| {
+                let mut names: Vec<String> = entries
+                    .flatten()
+                    .flat_map(|stage| std::fs::read_dir(stage.path()).ok())
+                    .flat_map(|refs| refs.flatten())
+                    .map(|r| r.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                names.dedup();
+                names
+            })
+            .unwrap_or_default();
     if !reference_modified.is_empty() {
         log::warn!(
             "An agent modified read-only reference input(s): {}. The change was discarded; \
@@ -619,7 +620,11 @@ fn benchmark_single_program(
         }
     };
     if opts.has(Stage::Translate) {
-        stage_overrides(&mut effective_overrides, "translate_agentic", Stage::Translate);
+        stage_overrides(
+            &mut effective_overrides,
+            "translate_agentic",
+            Stage::Translate,
+        );
         prompt_mode_overrides(&mut effective_overrides, "translate_agentic");
         effective_overrides.push(format!(
             "tools.translate_agentic.plan_output_path={}",
@@ -627,7 +632,11 @@ fn benchmark_single_program(
         ));
     }
     if opts.has(Stage::Verify) {
-        stage_overrides(&mut effective_overrides, "verify_fix_agentic", Stage::Verify);
+        stage_overrides(
+            &mut effective_overrides,
+            "verify_fix_agentic",
+            Stage::Verify,
+        );
         prompt_mode_overrides(&mut effective_overrides, "verify_fix_agentic");
         effective_overrides.push(format!(
             "tools.verify_fix_agentic.hypotheses_output_path={}",
@@ -728,8 +737,12 @@ fn benchmark_single_program(
     };
     let (test_results, error_messages) = match validation {
         ValidationHarness::Gtest { suite_dir } => {
-            match harness::gtest::run_gtest_validation(&program_name, &suite_dir, &output_dir, timeout)
-            {
+            match harness::gtest::run_gtest_validation(
+                &program_name,
+                &suite_dir,
+                &output_dir,
+                timeout,
+            ) {
                 Ok(r) => {
                     // gtest defines its own test set; the vector count no longer applies.
                     result.total_tests = r.0.len();
@@ -950,8 +963,7 @@ fn test_existing_program(
     };
     let (test_results, error_messages) = if let ValidationHarness::Gtest { suite_dir } = &validation
     {
-        match harness::gtest::run_gtest_validation(&program_name, suite_dir, program_dir, timeout)
-        {
+        match harness::gtest::run_gtest_validation(&program_name, suite_dir, program_dir, timeout) {
             Ok(r) => {
                 result.rust_build_success = true;
                 // gtest defines its own test set; the vector count no longer applies.

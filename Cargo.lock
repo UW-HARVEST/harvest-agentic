@@ -1386,6 +1386,7 @@ dependencies = [
 [[package]]
 name = "harvest-bench"
 version = "0.1.0"
+source = "git+https://github.com/UW-HARVEST/harvest-bench?rev=8aab38c5ff4d7bd1d510c9f83f54fb0a4f8cd3b9#8aab38c5ff4d7bd1d510c9f83f54fb0a4f8cd3b9"
 dependencies = [
  "clap",
  "libc",

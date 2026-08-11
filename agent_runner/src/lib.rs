@@ -349,13 +349,13 @@ fn check_version_match(
     found: Option<&str>,
     required: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(found) = found {
-        if found != required {
-            return Err(format!(
-                "Rust toolchain contract mismatch: {label} is {found}, required version is {required}"
-            )
-            .into());
-        }
+    if let Some(found) = found
+        && found != required
+    {
+        return Err(format!(
+            "Rust toolchain contract mismatch: {label} is {found}, required version is {required}"
+        )
+        .into());
     }
     Ok(())
 }
@@ -855,10 +855,10 @@ fn run_bash_agent(
         .env("OPENSSL_DIR", openssl_dir)
         .current_dir(invocation.work_dir);
 
-    if let Some(system_prompt) = append_system_prompt {
-        if invocation.plan_files_enabled() {
-            cmd.env("APPEND_SYS", system_prompt);
-        }
+    if let Some(system_prompt) = append_system_prompt
+        && invocation.plan_files_enabled()
+    {
+        cmd.env("APPEND_SYS", system_prompt);
     }
 
     if let Some(model) = invocation.model {
@@ -892,25 +892,25 @@ fn run_bash_agent(
     // Raise the cap to the registry output limit through the experimental
     // escape hatch. `extra_env` is applied after this, so a value from the
     // run config wins. Remove once the upstream cap respects `limit.output`.
-    if invocation.agent == AgentKind::OpenCode {
-        if let Some(model) = invocation.model {
-            match load_opencode_model_limits(model) {
-                Ok(OpenCodeModelLimits {
-                    output: Some(output),
-                    ..
-                }) => {
-                    info!(
-                        "Injecting OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX={output} (opencode#29363 32k output-cap workaround)"
-                    );
-                    cmd.env("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", output.to_string());
-                }
-                Ok(_) => warn!(
-                    "OpenCode model {model} has no registry output limit; the 32k output cap stays (opencode#29363)"
-                ),
-                Err(e) => warn!(
-                    "Could not resolve OpenCode model limits; the 32k output cap stays (opencode#29363): {e}"
-                ),
+    if invocation.agent == AgentKind::OpenCode
+        && let Some(model) = invocation.model
+    {
+        match load_opencode_model_limits(model) {
+            Ok(OpenCodeModelLimits {
+                output: Some(output),
+                ..
+            }) => {
+                info!(
+                    "Injecting OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX={output} (opencode#29363 32k output-cap workaround)"
+                );
+                cmd.env("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", output.to_string());
             }
+            Ok(_) => warn!(
+                "OpenCode model {model} has no registry output limit; the 32k output cap stays (opencode#29363)"
+            ),
+            Err(e) => warn!(
+                "Could not resolve OpenCode model limits; the 32k output cap stays (opencode#29363): {e}"
+            ),
         }
     }
 
@@ -1006,7 +1006,10 @@ fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
                     .map(str::to_string);
             }
             "error" => {
-                let text = event.get("error").map(|e| e.to_string()).unwrap_or_default();
+                let text = event
+                    .get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
                 let lowered = text.to_lowercase();
                 if OPENCODE_FATAL_ERROR_MARKERS
                     .iter()
@@ -1064,12 +1067,11 @@ fn extract_session_ids_from_log(log_path: &Path) -> Vec<String> {
         if !trimmed.starts_with('{') {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(sid) = val.get("sessionID").and_then(|v| v.as_str()) {
-                if seen.insert(sid.to_string()) {
-                    ids.push(sid.to_string());
-                }
-            }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(sid) = val.get("sessionID").and_then(|v| v.as_str())
+            && seen.insert(sid.to_string())
+        {
+            ids.push(sid.to_string());
         }
     }
     ids
@@ -1098,10 +1100,9 @@ fn extract_sub_session_ids_from_export(export_json: &serde_json::Value) -> Vec<S
                 .or_else(|| part.pointer("/state/metadata/sessionId"))
                 .or_else(|| part.pointer("/state/metadata/session_id"))
                 .and_then(|v| v.as_str())
+                && !sid.is_empty()
             {
-                if !sid.is_empty() {
-                    ids.push(sid.to_string());
-                }
+                ids.push(sid.to_string());
             }
         }
     }
@@ -1492,13 +1493,14 @@ mod tests {
     fn whitelist_catches_endings_no_blacklist_would_list() {
         // A step_finish with no `reason` at all, and a truncated turn: both
         // must be caught by requiring "stop" rather than listing bad values.
-        for part in [r#"{}"#, r#"{"reason":"length"}"#, r#"{"reason":"tool-calls"}"#] {
+        for part in [
+            r#"{}"#,
+            r#"{"reason":"length"}"#,
+            r#"{"reason":"tool-calls"}"#,
+        ] {
             let line = format!(r#"{{"type":"step_finish","sessionID":"ses_a","part":{part}}}"#);
             assert!(
-                matches!(
-                    assess_log(&[&line]),
-                    OpenCodeOutcome::Resumable { .. }
-                ),
+                matches!(assess_log(&[&line]), OpenCodeOutcome::Resumable { .. }),
                 "part {part} should be resumable"
             );
         }
@@ -1611,8 +1613,8 @@ mod tests {
         .unwrap();
         let config = fs::read_to_string(dir.path().join(".opencode/opencode.json")).unwrap();
         assert_eq!(config, opencode_project_config(dir.path(), None));
-        let agent_md = fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md"))
-            .unwrap();
+        let agent_md =
+            fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md")).unwrap();
         // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
         // official default provider system prompt applies; the compaction
         // hint lives in the plugin, not here.
@@ -1639,8 +1641,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let plugin = fs::read_to_string(dir.path().join(".opencode/plugin/compaction-recovery.js"))
-            .unwrap();
+        let plugin =
+            fs::read_to_string(dir.path().join(".opencode/plugin/compaction-recovery.js")).unwrap();
         assert!(plugin.contains("run `cat PLAN.md HYPOTHESES.md` to restore"));
         assert!(!plugin.contains("{RECOVERY_CMD}"));
         assert!(plugin.contains("experimental.chat.messages.transform"));

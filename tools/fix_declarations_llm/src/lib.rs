@@ -57,54 +57,6 @@ fn stub_declaration(source: &[u8]) -> Option<String> {
         .into()
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_stub_declaration() {
-        assert_eq!(
-            Some(
-                r"
-fn foo() { todo!() }
-"
-                .into()
-            ),
-            super::stub_declaration(
-                br"
-fn foo() { println!() }
-"
-            )
-        );
-
-        assert_eq!(
-            Some(
-                r"
-
-impl Foo {
-    fn foo() { todo!() }
-
-    fn bar() { todo!() }
-}
-
-"
-                .into()
-            ),
-            super::stub_declaration(
-                br"
-
-impl Foo {
-    fn foo() { println!() }
-
-    fn bar() {
-      scanf!()
-    }
-}
-
-"
-            )
-        );
-    }
-}
-
 /// Calls the LLM to fix each declaration that has compiler errors, and returns a new
 /// `SplitPackage` with updated declarations and a freshly computed line index.
 pub struct FixDeclarationsLlm;
@@ -258,5 +210,53 @@ impl Tool for FixDeclarationsLlm {
         );
 
         Ok(Box::new(cargo_package))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_stub_declaration() {
+        assert_eq!(
+            Some(
+                r"
+fn foo() { todo!() }
+"
+                .into()
+            ),
+            super::stub_declaration(
+                br"
+fn foo() { println!() }
+"
+            )
+        );
+
+        assert_eq!(
+            Some(
+                r"
+
+impl Foo {
+    fn foo() { todo!() }
+
+    fn bar() { todo!() }
+}
+
+"
+                .into()
+            ),
+            super::stub_declaration(
+                br"
+
+impl Foo {
+    fn foo() { println!() }
+
+    fn bar() {
+      scanf!()
+    }
+}
+
+"
+            )
+        );
     }
 }

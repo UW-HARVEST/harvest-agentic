@@ -158,11 +158,10 @@ impl Tool for ConformAgentic {
         );
 
         let agent = context.config.agentic_agent;
-        let rust_toolchain_context =
-            agent_runner::detect_rust_toolchain_context(
-                &context.config.input,
-                config.test_corpus_root.as_deref(),
-            )?;
+        let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
+            &context.config.input,
+            config.test_corpus_root.as_deref(),
+        )?;
         let model_limits = match (agent, &config.model) {
             (harvest_core::config::AgentKind::OpenCode, Some(model)) => {
                 let limits = agent_runner::load_opencode_model_limits(model)?;
@@ -209,7 +208,11 @@ impl Tool for ConformAgentic {
         })?;
         info!("Conformance refinement complete");
 
-        copy_out(&translated, CONFORM_NOTES, config.notes_output_path.as_deref());
+        copy_out(
+            &translated,
+            CONFORM_NOTES,
+            config.notes_output_path.as_deref(),
+        );
         copy_out(
             &translated,
             CONFORM_REPORT,
@@ -228,7 +231,10 @@ impl Tool for ConformAgentic {
         if target_out.exists()
             && let Err(e) = fs::remove_dir_all(&target_out)
         {
-            warn!("Failed to remove {} before freeze: {e}", target_out.display());
+            warn!(
+                "Failed to remove {} before freeze: {e}",
+                target_out.display()
+            );
         }
         for entry in collect_symlinks(&translated) {
             warn!("translated_rust contains symlink: {}", entry);
