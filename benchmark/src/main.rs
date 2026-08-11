@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod experiment;
 mod harness;
 mod io;
 mod ir_utils;
@@ -825,6 +826,42 @@ fn benchmark_single_program(
 fn main() -> HarvestResult<()> {
     set_user_only_umask();
     let args = Args::parse();
+    args.validate_sweep_flags()?;
+
+    // A declared experiment set has no single output_dir, and its two
+    // inspection modes must stay read-only: --status is meant to be run from a
+    // second shell while a sweep is in progress, so it may not create or
+    // truncate anything the live sweep is using.
+    if let Some(manifest) = args.experiments.clone() {
+        let (_set, runs) = experiment::load(&manifest)?;
+        if args.dry_run {
+            experiment::print_plan(&runs);
+            return Ok(());
+        }
+        if args.status {
+            let complete = experiment::print_status(&runs);
+            if !complete {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        // Executing: one appended sweep log for the whole set. TeeLogger wraps
+        // log::set_boxed_logger, which errors on a second call, so per-run logs
+        // are not possible here — the sweep log is the record.
+        let results_root = runs
+            .first()
+            .and_then(|r| r.output_root.parent().map(Path::to_path_buf))
+            .expect("load() rejects an empty run list");
+        ensure_output_directory(&results_root)?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(results_root.join("sweep.log"))?;
+        TeeLogger::init(log::LevelFilter::Info, log_file)?;
+        log::info!("Harvest version: {}", get_version());
+        log::info!("Experiment set: {}", manifest.display());
+        return experiment::execute(&runs, &args.only, args.force);
+    }
 
     let log_root = args
         .test

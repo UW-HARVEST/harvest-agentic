@@ -64,12 +64,40 @@ pub struct Args {
     /// for translate (and the non-agentic modes) it is a bench test-case root;
     /// for verify/conform it is a previous run's output root, whose program
     /// directories are self-contained snapshots (see .harvest/).
-    #[arg(required_unless_present = "test")]
+    #[arg(required_unless_present_any = ["test", "experiments"])]
     pub input_dir: Option<PathBuf>,
 
     /// Output directory where this run's products will be written.
-    #[arg(required_unless_present = "test")]
+    #[arg(required_unless_present_any = ["test", "experiments"])]
     pub output_dir: Option<PathBuf>,
+
+    /// Run a committed experiment set: a TOML file declaring the runs that
+    /// should exist (program set, stages, agent, model, prompt variant, and
+    /// `-c` overrides per run, plus `from` edges so one frozen translate
+    /// snapshot can feed several verify runs). Each run's output goes to
+    /// `<results_root>/<id>`, so no output path is chosen by hand, and
+    /// re-invoking the same command resumes without redoing finished programs.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["test", "input_dir", "output_dir"])]
+    pub experiments: Option<PathBuf>,
+
+    /// With --experiments: report which declared runs are complete and which
+    /// are outstanding, then exit. Read-only — it writes nothing, so it is safe
+    /// to run from a second shell while a sweep is in progress. Exits non-zero
+    /// while any declared work remains.
+    #[arg(long, requires = "experiments")]
+    pub status: bool,
+
+    /// With --experiments: print the resolved run list and the exact argv each
+    /// run lowers to, then exit without running anything. Worth doing before
+    /// committing hours of agent time.
+    #[arg(long, requires = "experiments", conflicts_with = "status")]
+    pub dry_run: bool,
+
+    /// With --experiments: restrict execution to these run ids. Also the only
+    /// way --force applies to a sweep, so a stray --force cannot erase every
+    /// run in the set.
+    #[arg(long, requires = "experiments", value_name = "ID")]
+    pub only: Vec<String>,
 
     /// Test an already-translated output directory without running any stage.
     /// Accepts either an output root containing program subdirectories, or one
@@ -210,6 +238,33 @@ impl Args {
         stages
     }
 
+    /// Rejects the sweep-only flags when no experiment set was given.
+    ///
+    /// `requires = "experiments"` is declared on each of them, but clap does not
+    /// reject the combination here (verified: `bench in out --status` parses),
+    /// so it is checked explicitly rather than left to silently do nothing.
+    pub fn validate_sweep_flags(&self) -> Result<(), String> {
+        if self.experiments.is_some() {
+            return Ok(());
+        }
+        let offenders: Vec<&str> = [
+            (self.status, "--status"),
+            (self.dry_run, "--dry-run"),
+            (!self.only.is_empty(), "--only"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect();
+        if offenders.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} only applies to a declared experiment set; pass --experiments <FILE>",
+                offenders.join(", ")
+            ))
+        }
+    }
+
     /// Validates flag/stage combinations that clap cannot express (they
     /// depend on the *value* of --agentic, not its presence).
     pub fn validate_stages(&self, stages: &[Stage]) -> Result<(), String> {
@@ -323,5 +378,58 @@ mod tests {
     fn test_mode_conflicts_with_agentic() {
         assert!(parse(&["bench", "--test", "out", "--agentic"]).is_err());
         assert!(parse(&["bench", "--test", "out"]).is_ok());
+    }
+
+    #[test]
+    fn experiments_replaces_the_positional_pair() {
+        // A declared set carries its own paths, so the positionals are neither
+        // required nor allowed alongside it.
+        let args = parse(&["bench", "--experiments", "e.toml"]).unwrap();
+        assert!(args.input_dir.is_none() && args.output_dir.is_none());
+        assert!(parse(&["bench", "--experiments", "e.toml", "in", "out"]).is_err());
+        assert!(parse(&["bench", "--experiments", "e.toml", "--test", "out"]).is_err());
+    }
+
+    #[test]
+    fn the_positional_form_still_works_unchanged() {
+        // This PR is additive: widening `required_unless_present` must not make
+        // the existing invocation optional or ambiguous.
+        let args = parse(&["bench", "in", "out"]).unwrap();
+        assert_eq!(args.input_dir.as_deref().unwrap().to_str(), Some("in"));
+        assert_eq!(args.output_dir.as_deref().unwrap().to_str(), Some("out"));
+        assert!(args.experiments.is_none());
+        // Still an error to give neither a set nor the positionals.
+        assert!(parse(&["bench"]).is_err());
+        assert!(parse(&["bench", "in"]).is_err());
+    }
+
+    #[test]
+    fn sweep_only_flags_require_a_declared_set() {
+        // clap's `requires` does not reject these on its own, so the guard is
+        // explicit; a flag that silently does nothing is the failure to avoid.
+        for argv in [
+            vec!["bench", "in", "out", "--status"],
+            vec!["bench", "in", "out", "--dry-run"],
+            vec!["bench", "in", "out", "--only", "x"],
+        ] {
+            let args = parse(&argv).unwrap();
+            let err = args
+                .validate_sweep_flags()
+                .expect_err(&format!("{argv:?} should be rejected"));
+            assert!(err.contains("--experiments"), "{err}");
+        }
+        // With a set, they are all fine.
+        for flag in ["--status", "--dry-run"] {
+            let args = parse(&["bench", "--experiments", "e.toml", flag]).unwrap();
+            args.validate_sweep_flags().unwrap();
+        }
+        // The plain positional form is unaffected.
+        parse(&["bench", "in", "out"])
+            .unwrap()
+            .validate_sweep_flags()
+            .unwrap();
+        // --status is the read-only inspection mode; --dry-run is the other, and
+        // asking for both at once is a contradiction clap *does* catch.
+        assert!(parse(&["bench", "--experiments", "e.toml", "--status", "--dry-run"]).is_err());
     }
 }
