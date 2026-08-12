@@ -33,6 +33,27 @@ impl AgentPhase {
         }
     }
 
+    /// File the rendered prompt is recorded to, next to this phase's log.
+    ///
+    /// Per phase, because a single run's stages each send their own prompt and
+    /// a resumed run's earlier phase happened in a previous process.
+    fn prompt_file_name(self) -> &'static str {
+        match self {
+            AgentPhase::Translate => "translation-prompt.md",
+            AgentPhase::Verify => "verify-prompt.md",
+            AgentPhase::Conform => "conform-prompt.md",
+        }
+    }
+
+    /// File the `--append-system-prompt` text is recorded to, when one is used.
+    fn append_system_prompt_file_name(self) -> &'static str {
+        match self {
+            AgentPhase::Translate => "translation-append-system-prompt.md",
+            AgentPhase::Verify => "verify-append-system-prompt.md",
+            AgentPhase::Conform => "conform-append-system-prompt.md",
+        }
+    }
+
     fn opencode_agent_name(self) -> &'static str {
         match self {
             AgentPhase::Translate => "harvest-translate",
@@ -492,6 +513,39 @@ fn extract_model_limits_from_output(
     None
 }
 
+/// Writes the rendered prompt(s) for this phase next to its log.
+///
+/// Each file is the text AS SENT and nothing else, so it can be diffed directly
+/// against a prompt template or against another run's. Claude additionally
+/// receives `--append-system-prompt` when plan files are enabled, which is part
+/// of what it was told and so is recorded too — in its own file, rather than
+/// appended to the main one, so neither stops being verbatim. The other agents
+/// pass no such prompt (see `invoke_kiro` / `invoke_opencode`), and its file is
+/// then simply absent.
+///
+/// Best-effort: a run that has already cost hours of agent time must not be
+/// killed by a failure to write provenance. A missing file is itself detectable,
+/// and the warning says why.
+fn record_prompt(invocation: &AgentInvocation<'_>, logs_dir: &Path) {
+    let phase = invocation.phase;
+    let main = logs_dir.join(phase.prompt_file_name());
+    if let Err(e) = fs::write(&main, invocation.prompt) {
+        warn!("Failed to record prompt at {}: {e}", main.display());
+    }
+
+    // Mirrors the condition in `invoke_claude` / `run_bash_agent`: the appended
+    // system prompt is only in effect for Claude, and only with plan files on.
+    if invocation.agent == AgentKind::Claude && invocation.plan_files_enabled() {
+        let extra = logs_dir.join(phase.append_system_prompt_file_name());
+        if let Err(e) = fs::write(&extra, phase.append_system_prompt()) {
+            warn!(
+                "Failed to record appended system prompt at {}: {e}",
+                extra.display()
+            );
+        }
+    }
+}
+
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     prepare_agent_files(&invocation)?;
 
@@ -502,6 +556,15 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
         .join("logs");
     fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join(invocation.phase.log_file_name());
+
+    // Record the prompt the agent is about to receive, before it runs, so the
+    // record exists even if the agent dies. Prompts are compiled into the
+    // binary with include_str!, so without this the only way to recover what a
+    // result was produced from is to identify the commit the binary was built
+    // at — impractical after the fact, and impossible if the build is not
+    // identifiable. A prompt ablation is uninterpretable if its treatment
+    // cannot be retrieved.
+    record_prompt(&invocation, &logs_dir);
 
     let agent_display = match invocation.agent {
         AgentKind::Kiro => "Kiro",
@@ -1451,6 +1514,120 @@ mod tests {
         let opencode = agent_bug_workarounds(AgentKind::OpenCode);
         assert!(opencode.contains("#29363"));
         assert!(opencode.contains("sub-agent prompt"));
+    }
+
+    /// An invocation whose only purpose is to exercise prompt recording.
+    fn prompt_invocation<'a>(
+        agent: AgentKind,
+        phase: AgentPhase,
+        prompt: &'a str,
+        work_dir: &'a Path,
+        no_plan: bool,
+        env: &'a HashMap<String, String>,
+    ) -> AgentInvocation<'a> {
+        AgentInvocation {
+            phase,
+            agent,
+            work_dir,
+            prompt,
+            timeout_secs: 1,
+            model: None,
+            no_plan,
+            no_plan_file: false,
+            extra_env: env,
+            output_log_path: None,
+            rust_toolchain: None,
+        }
+    }
+
+    #[test]
+    fn prompt_is_recorded_verbatim_per_phase() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let env = HashMap::new();
+        // Content that would be mangled by any templating or trimming.
+        let prompt = "  line one\n\nline two with `backticks` and {BRACES}\n\ttab\n";
+
+        for (phase, expected) in [
+            (AgentPhase::Translate, "translation-prompt.md"),
+            (AgentPhase::Verify, "verify-prompt.md"),
+            (AgentPhase::Conform, "conform-prompt.md"),
+        ] {
+            let inv = prompt_invocation(AgentKind::Kiro, phase, prompt, dir.path(), false, &env);
+            record_prompt(&inv, &logs);
+            let got = fs::read_to_string(logs.join(expected)).expect(expected);
+            // Byte-identical: the file must be diffable against a template.
+            assert_eq!(got, prompt, "{expected}");
+        }
+    }
+
+    #[test]
+    fn appended_system_prompt_is_recorded_only_when_it_is_actually_used() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let env = HashMap::new();
+        let extra = logs.join(AgentPhase::Translate.append_system_prompt_file_name());
+
+        // Claude with plan files on: the appended prompt is in effect, so it is
+        // part of what the agent was told and must be recoverable.
+        let inv = prompt_invocation(
+            AgentKind::Claude,
+            AgentPhase::Translate,
+            "p",
+            dir.path(),
+            false,
+            &env,
+        );
+        record_prompt(&inv, &logs);
+        let got = fs::read_to_string(&extra).expect("claude + plan files records it");
+        assert_eq!(got, AgentPhase::Translate.append_system_prompt());
+        fs::remove_file(&extra).unwrap();
+
+        // --no-plan: `invoke_claude` omits the flag, so recording it would claim
+        // the agent was told something it never saw.
+        let no_plan = prompt_invocation(
+            AgentKind::Claude,
+            AgentPhase::Translate,
+            "p",
+            dir.path(),
+            true,
+            &env,
+        );
+        record_prompt(&no_plan, &logs);
+        assert!(
+            !extra.exists(),
+            "--no-plan must not record an appended prompt"
+        );
+
+        // Kiro and OpenCode are passed None for it (see invoke_kiro/invoke_opencode).
+        for agent in [AgentKind::Kiro, AgentKind::OpenCode] {
+            let inv = prompt_invocation(agent, AgentPhase::Translate, "p", dir.path(), false, &env);
+            record_prompt(&inv, &logs);
+            assert!(
+                !extra.exists(),
+                "{agent:?} receives no appended system prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_a_prompt_never_fails_a_run() {
+        // Provenance is best-effort on purpose: a run that has already cost
+        // hours must not die because a file could not be written. The missing
+        // file is itself the signal.
+        let env = HashMap::new();
+        let missing = Path::new("/nonexistent-dir-for-harvest-test/logs");
+        let inv = prompt_invocation(
+            AgentKind::Claude,
+            AgentPhase::Verify,
+            "p",
+            Path::new("/tmp"),
+            false,
+            &env,
+        );
+        record_prompt(&inv, missing); // must not panic
     }
 
     /// Writes a JSONL log with the given events and assesses it.
