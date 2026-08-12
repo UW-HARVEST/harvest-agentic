@@ -828,10 +828,9 @@ fn main() -> HarvestResult<()> {
     let args = Args::parse();
     args.validate_sweep_flags()?;
 
-    // A declared experiment set has no single output_dir, and its two
-    // inspection modes must stay read-only: --status is meant to be run from a
-    // second shell while a sweep is in progress, so it may not create or
-    // truncate anything the live sweep is using.
+    // A declared experiment set has no single output_dir. Both inspection modes
+    // return before any file or directory is created, so checking on a sweep
+    // cannot disturb it.
     if let Some(manifest) = args.experiments.clone() {
         let (_set, runs) = experiment::load(&manifest)?;
         if args.dry_run {
@@ -845,9 +844,9 @@ fn main() -> HarvestResult<()> {
             }
             return Ok(());
         }
-        // Executing: one appended sweep log for the whole set. TeeLogger wraps
-        // log::set_boxed_logger, which errors on a second call, so per-run logs
-        // are not possible here — the sweep log is the record.
+        // Executing: one appended sweep log for the whole set. A logger can only
+        // be installed once per process, so per-run log files are not available
+        // here — the sweep log is the record.
         let results_root = runs
             .first()
             .and_then(|r| r.output_root.parent().map(Path::to_path_buf))

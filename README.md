@@ -171,12 +171,10 @@ executed, resumed, and reported against. See `experiments/hb.toml`.
 # What would run, and the exact argv each run becomes. Do this first.
 cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --dry-run
 
-# Execute. Re-invoking the same command resumes: programs that already finished
-# are skipped, so an interrupted sweep costs only the work that was lost.
+# Execute. Re-invoking the same command resumes what an interrupted sweep lost.
 cargo run --bin=benchmark --release -- --experiments experiments/hb.toml
 
-# Which runs are complete, and what is outstanding. Read-only, so it is safe
-# from a second shell while a sweep is running. Exits non-zero while work remains.
+# What is done and what is outstanding. Safe while a sweep is running.
 cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --status
 
 # One run at a time, and the only way --force reaches a sweep.
@@ -185,9 +183,7 @@ cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --only 
 
 Each `[[run]]` names its `programs`, `stages`, `agent`, `model`, prompt-mode
 knobs and `-c` overrides — the same knobs as the flags above, carried rather
-than reinvented. Every declared run is lowered back into a command line and
-re-parsed by the real argument parser, so a set can never express a combination
-the CLI would reject.
+than reinvented, so a set cannot express a combination the CLI would reject.
 
 `from = "<run id>"` consumes another declared run's output, which is how one
 frozen translate snapshot feeds several verify experiments (the workflow under
@@ -201,13 +197,10 @@ so results are discoverable without knowing any hand-chosen path.
 | `--status` | Report per-run progress and exit; writes nothing |
 | `--only <ID>` | Restrict execution to these run ids (repeatable) |
 
-Progress is tracked per *program*, in `<run_root>/.harvest-sweep/programs/`, and
-written as each program finishes rather than at the end of a run — so an
-interrupted sweep leaves an accurate record of what completed. A program that
-was invoked but has no terminal record is reported `interrupted` and retried;
-one whose parent produced no snapshot is `blocked`. Each run also carries a
-`receipt.json` recording its labels, program set, `-c` overrides, exact argv and
-harvest version, so downstream reporting never has to parse a directory name.
+Resuming is per program, not per run: each program's outcome is recorded as it
+finishes, so an interrupted sweep redoes only what it lost. Each run also carries
+a `receipt.json` — labels, program set, `-c` overrides, exact argv and harvest
+version — so downstream reporting never has to parse a directory name.
 
 ## Examples
 

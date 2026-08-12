@@ -12,11 +12,11 @@
 //!
 //! * **Every knob is lowered back into argv and re-parsed by clap.** A declared
 //!   run becomes a `Vec<String>` handed to [`Args::try_parse_from`], then to
-//!   [`Args::validate_stages`]. That is deliberate: clap and `validate_stages`
-//!   already encode every `requires` / `conflicts_with` / stage-dependent rule,
-//!   so re-parsing inherits all of them for free and a declared run can never
-//!   express a combination the command line would reject. Do not reimplement
-//!   those rules here.
+//!   [`Args::validate_stages`]. That is deliberate: those two already encode
+//!   every `requires` / `conflicts_with` / stage-dependent rule, so re-parsing
+//!   inherits all of them for free and a declared run can never express a
+//!   combination the command line would reject. Do not reimplement those rules
+//!   here.
 //!
 //! * **Enum-valued knobs are typed `String`, not the enum.** `Stage` and
 //!   `AgentKind` only `Deserialize` from their full lowercase names, while the
@@ -26,11 +26,10 @@
 //!   Values pass through verbatim and clap owns the vocabulary.
 //!
 //! * **Completion is decided by this module's own per-program records, never by
-//!   the presence of a stage manifest.** `write_stage_manifest` is called after
-//!   translation succeeds but *before* build and grading (deliberately, so a
-//!   snapshot with a broken build can still be resumed from). Treating a
-//!   manifest as "done" would permanently skip any program that crashed during
-//!   build, verify, or grading.
+//!   the presence of a snapshot.** A snapshot becomes resumable as soon as
+//!   translation succeeds, which is before the program is built and graded, so
+//!   treating it as "done" would permanently skip any program that crashed
+//!   later.
 
 use crate::cli::Args;
 use crate::error::HarvestResult;
@@ -100,8 +99,8 @@ pub struct Knobs {
     pub agent_tools: Option<bool>,
     pub verify_harness: Option<String>,
     pub fuzz: Option<bool>,
-    /// Grade against this bench checkout's *current* suite instead of the one
-    /// the snapshot carries. Resolved against the manifest file.
+    /// Bench test-case override (`--test-case`), resolved against the manifest
+    /// file.
     pub test_case: Option<PathBuf>,
     pub test_harness: Option<String>,
     pub timeout: Option<u64>,
@@ -131,13 +130,11 @@ pub struct RunSpec {
     pub labels: BTreeMap<String, String>,
 
     /// Programs this run covers. Required for a root run. For a `from` run it
-    /// is optional and narrows the parent's set (a subset), which is what makes
-    /// "verify only one program of the parent's seven" expressible.
+    /// is optional and narrows the parent's set to a subset.
     #[serde(default)]
     pub programs: Vec<String>,
 
     /// Consume another declared run's output instead of the bench directory.
-    /// This is how one frozen translate snapshot feeds several verify runs.
     pub from: Option<String>,
 
     #[serde(flatten)]
@@ -626,10 +623,7 @@ pub fn load(manifest_path: &Path) -> HarvestResult<(ExperimentSet, Vec<ResolvedR
         let output_root = results_root.join(&spec.id);
         let argv = lower_to_argv(&knobs, &input_root, &output_root, &stages, &manifest_dir);
 
-        // The decisive check: hand the lowered argv to clap and to
-        // validate_stages, so a declared run is exactly as constrained as the
-        // equivalent command line. Any `requires`/`conflicts_with`/stage rule
-        // is enforced here without being restated.
+        // The decisive check; see the module docs.
         let parsed = Args::try_parse_from(&argv).map_err(|e| {
             format!(
                 "run {:?} does not lower to a valid invocation:\n  {}\n{e}",
@@ -651,7 +645,7 @@ pub fn load(manifest_path: &Path) -> HarvestResult<(ExperimentSet, Vec<ResolvedR
                 "run {:?}: no_plan/no_plan_file cannot be combined with fuzz or \
                  verify_harness. The gtest verify harness is only active when plan files \
                  are enabled, so the run would record gtest/fuzz in its identity while \
-                 actually verifying via libloading (see verify_fix_agentic gtest_harness_active).",
+                 actually verifying via libloading.",
                 spec.id
             )
             .into());
@@ -925,8 +919,8 @@ pub fn print_plan(runs: &[ResolvedRun]) {
 
 /// Build the `ProgramRun` for one program of one run.
 ///
-/// Mirrors what the positional path does, but for a single named program, so
-/// the sweep never has to discover directories by globbing.
+/// Always for one named program, so a sweep never has to discover its work by
+/// listing directories.
 fn program_run_for(run: &ResolvedRun, program: &str) -> HarvestResult<Option<ProgramRun>> {
     let dir = run.input_root.join(program);
     if run.resumes {
@@ -946,11 +940,10 @@ fn program_run_for(run: &ResolvedRun, program: &str) -> HarvestResult<Option<Pro
 /// Execute a declared set, skipping programs that already finished.
 ///
 /// One program at a time, with its record written immediately after it
-/// returns. That granularity is the whole point: the aggregate CSV is only
-/// written after a whole run finishes, so a sweep interrupted midway would
-/// otherwise leave no trace of the programs that did complete, and re-running
-/// would redo them — or worse, hit the populated-directory guard and record
-/// completed work as failures.
+/// returns. That granularity is the whole point: a run's aggregate results are
+/// not durable until the run ends, so a sweep interrupted midway would
+/// otherwise leave no evidence of the programs that did complete, and
+/// re-running would redo them.
 pub fn execute(runs: &[ResolvedRun], only: &[String], force: bool) -> HarvestResult<()> {
     let selected: Vec<&ResolvedRun> = runs
         .iter()

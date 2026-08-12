@@ -1,27 +1,5 @@
-# The experiment set for harvest-bench.
-#
-# This file IS the list of runs that should exist. Run it with:
-#
-#   cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --dry-run
-#   cargo run --bin=benchmark --release -- --experiments experiments/hb.toml
-#   cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --status
-#
-# --dry-run prints the resolved runs and the exact argv each becomes, without
-# running anything: worth doing first, since a committed set is one paste away
-# from declaring days of agent time. --status is read-only and safe to run from
-# a second shell while a sweep is in progress.
-#
-# Conventions:
-#   * bench_root / results_root / test_case resolve against THIS FILE, never the
-#     process CWD.
-#   * a run's output root is always <results_root>/<id>; no path is hand-typed.
-#   * stages are listed in pipeline order.
-#   * `from` consumes another declared run's output, so one frozen translate
-#     snapshot can feed several verify experiments. The parent must be declared
-#     earlier in the file.
-#   * `labels` are free-form coordinates for table generation (issue #6). They
-#     are recorded in each run's receipt, so a table's rows and columns come
-#     from data rather than from parsing an id.
+# The experiment set for harvest-bench: the list of runs that should exist.
+# How to run it, and what each key means: README, "Declared experiment sets".
 #
 # bench_root assumes harvest-bench is cloned to ./harvest-bench, as the README
 # describes. Adjust if yours lives elsewhere.
@@ -80,8 +58,8 @@ from = "t_sonnet"
 stages = ["verify"]
 model = "opus"
 
-# A verify experiment may narrow the parent's program set — useful for an
-# expensive configuration you only want to try on one program.
+# Narrowed to one program: fuzzing every program of the parent is not worth its
+# cost here.
 [[run]]
 id = "t_sonnet.v_sonnet_gtest_fuzz"
 labels = { pipeline = "agentic", tmodel = "sonnet", vmodel = "sonnet", harness = "gtest+fuzz" }
@@ -95,11 +73,6 @@ fuzz = true
 # ---------------------------------------------------------------------------
 # Prompt ablation: same model, same programs, plan files disabled. Isolating
 # the anti-compaction mechanism is the point, so nothing else varies.
-#
-# Note this run cannot also set verify_harness/fuzz: the gtest verify harness
-# is only active when plan files are enabled, so the combination would record
-# gtest in its identity while actually verifying via libloading. The loader
-# rejects it rather than let a mislabelled row into the table.
 # ---------------------------------------------------------------------------
 
 [[run]]
@@ -119,8 +92,8 @@ model = "sonnet"
 no_plan = true
 
 # ---------------------------------------------------------------------------
-# A non-Anthropic model through OpenCode, to show that the agent/model axis is
-# just another knob. Uses the CLI's own `oc` alias.
+# A model served through OpenCode rather than the Claude CLI: the agent/model
+# axis is just another knob.
 # ---------------------------------------------------------------------------
 
 [[run]]

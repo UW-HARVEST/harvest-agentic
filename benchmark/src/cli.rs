@@ -72,24 +72,19 @@ pub struct Args {
     pub output_dir: Option<PathBuf>,
 
     /// Run a committed experiment set: a TOML file declaring the runs that
-    /// should exist (program set, stages, agent, model, prompt variant, and
-    /// `-c` overrides per run, plus `from` edges so one frozen translate
-    /// snapshot can feed several verify runs). Each run's output goes to
-    /// `<results_root>/<id>`, so no output path is chosen by hand, and
-    /// re-invoking the same command resumes without redoing finished programs.
+    /// should exist, executed in place of one hand-named run. Re-invoking
+    /// resumes. Format and workflow: README, "Declared experiment sets".
     #[arg(long, value_name = "FILE", conflicts_with_all = ["test", "input_dir", "output_dir"])]
     pub experiments: Option<PathBuf>,
 
     /// With --experiments: report which declared runs are complete and which
-    /// are outstanding, then exit. Read-only — it writes nothing, so it is safe
-    /// to run from a second shell while a sweep is in progress. Exits non-zero
-    /// while any declared work remains.
+    /// are outstanding, then exit. Writes nothing. Exits non-zero while any
+    /// declared work remains.
     #[arg(long, requires = "experiments")]
     pub status: bool,
 
     /// With --experiments: print the resolved run list and the exact argv each
-    /// run lowers to, then exit without running anything. Worth doing before
-    /// committing hours of agent time.
+    /// run lowers to, then exit without running anything.
     #[arg(long, requires = "experiments", conflicts_with = "status")]
     pub dry_run: bool,
 
@@ -240,9 +235,8 @@ impl Args {
 
     /// Rejects the sweep-only flags when no experiment set was given.
     ///
-    /// `requires = "experiments"` is declared on each of them, but clap does not
-    /// reject the combination here (verified: `bench in out --status` parses),
-    /// so it is checked explicitly rather than left to silently do nothing.
+    /// Their `requires = "experiments"` does not cover this case, so it is
+    /// checked explicitly rather than left to silently do nothing.
     pub fn validate_sweep_flags(&self) -> Result<(), String> {
         if self.experiments.is_some() {
             return Ok(());
@@ -392,8 +386,8 @@ mod tests {
 
     #[test]
     fn the_positional_form_still_works_unchanged() {
-        // This PR is additive: widening `required_unless_present` must not make
-        // the existing invocation optional or ambiguous.
+        // Widening `required_unless_present` must not make the existing
+        // invocation optional or ambiguous.
         let args = parse(&["bench", "in", "out"]).unwrap();
         assert_eq!(args.input_dir.as_deref().unwrap().to_str(), Some("in"));
         assert_eq!(args.output_dir.as_deref().unwrap().to_str(), Some("out"));
@@ -405,8 +399,6 @@ mod tests {
 
     #[test]
     fn sweep_only_flags_require_a_declared_set() {
-        // clap's `requires` does not reject these on its own, so the guard is
-        // explicit; a flag that silently does nothing is the failure to avoid.
         for argv in [
             vec!["bench", "in", "out", "--status"],
             vec!["bench", "in", "out", "--dry-run"],
@@ -428,8 +420,7 @@ mod tests {
             .unwrap()
             .validate_sweep_flags()
             .unwrap();
-        // --status is the read-only inspection mode; --dry-run is the other, and
-        // asking for both at once is a contradiction clap *does* catch.
+        // Asking for both inspection modes at once is a contradiction.
         assert!(parse(&["bench", "--experiments", "e.toml", "--status", "--dry-run"]).is_err());
     }
 }
