@@ -5,6 +5,7 @@ mod io;
 mod ir_utils;
 mod logger;
 mod runner;
+mod safety;
 mod stats;
 use crate::cli::{Args, TestHarness};
 use crate::error::HarvestResult;
@@ -698,6 +699,18 @@ fn benchmark_single_program(
     // is exactly the kind a verify run should be able to pick up.
     write_stage_manifest(&output_dir, program_run, opts);
 
+    // Measure how safe the translation actually is, while the crate is on disk.
+    // Deliberately before the build gate: a crate that compiles is not required
+    // for the source to be measurable, and a build failure is exactly a case
+    // where knowing what the model wrote is useful. Never fails the run — a
+    // translation that cost hours must not be lost to a metrics pass.
+    let safety = safety::measure(&output_dir, &test_case_dir);
+    safety::log_summary(&program_name, &safety);
+    match safety::write_metrics(&output_dir, &safety) {
+        Ok(path) => log::info!("  Safety metrics: {}", path.display()),
+        Err(e) => log::warn!("  Failed to write safety metrics: {e}"),
+    }
+
     if translation_result.build_success {
         log::info!("✅ Rust build completed successfully!");
     } else {
@@ -918,6 +931,16 @@ fn test_existing_program(
 
     log::info!("Testing translated program: {}", program_name);
     log::info!("Program directory: {}", program_dir.display());
+
+    // Re-grading an existing snapshot measures its safety too, so the metrics
+    // can be (re)generated for output translated before this existed — which is
+    // what makes the whole back catalogue comparable. The snapshot carries its
+    // own C source, so the comparison base travels with it.
+    let safety = safety::measure(program_dir, &stage_manifest::c_source_dir(program_dir));
+    safety::log_summary(&program_name, &safety);
+    if let Err(e) = safety::write_metrics(program_dir, &safety) {
+        log::warn!("  Failed to write safety metrics: {e}");
+    }
 
     // Everything graded against comes from the snapshot's own suite.
     let suite_root = stage_manifest::suite_dir(program_dir);

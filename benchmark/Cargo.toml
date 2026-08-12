@@ -27,6 +27,12 @@ log = { workspace = true }
 regex = "1.12.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `span-locations` is what makes `Span::start()/end()` return line numbers,
+# which the safety metrics need. Declared HERE rather than relied upon: another
+# workspace crate already enables it, so Cargo feature unification would make a
+# missing declaration pass `make test` and then fail `cargo build -p harvest-benchmark`.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
 toml_edit = { workspace = true }
 try_cargo_build = { version = "0.1.0", path = "../tools/try_cargo_build" }
 wait-timeout = "0.2"
