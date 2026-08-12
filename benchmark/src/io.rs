@@ -126,15 +126,35 @@ pub fn log_summary_stats(summary: &SummaryStats) {
         summary.rust_build_success_rate()
     );
 
+    // Headline first, and it is the granularity-invariant one. Suites in this
+    // benchmark differ in granularity by orders of magnitude (libpng exposes
+    // four coarse entry points; pcre2 hundreds of fine tests), so a pooled
+    // per-test average is not a meaningful quantity to lead with.
     log::info!("\nTest Results:");
-    log::info!("  Total test cases: {}", summary.total_tests);
-    log::info!("  Skipped: {} ⏭️", summary.total_skipped_tests);
-    log::info!("  Passed: {} ✅", summary.total_passed_tests);
-    log::info!("  Failed: {} ❌", summary.failed_tests());
     log::info!(
-        "  Overall success rate: {:.1}%",
+        "  Programs passing their whole suite: {}/{} ({:.1}%)",
+        summary.programs_all_tests_passed,
+        summary.num_programs,
+        summary.project_pass_rate()
+    );
+
+    log::info!("\n  Per-test totals (context only — see below):");
+    log::info!("    Total test cases: {}", summary.total_tests);
+    log::info!("    Skipped: {} ⏭️", summary.total_skipped_tests);
+    log::info!("    Passed: {} ✅", summary.total_passed_tests);
+    log::info!("    Failed: {} ❌", summary.failed_tests());
+    log::info!(
+        "    Pooled per-test rate: {:.1}% (granularity-sensitive)",
         summary.overall_success_rate()
     );
+    if summary.max_evaluated_tests > 0 {
+        log::info!(
+            "    Evaluated tests per program ranged {}..{} — the pooled rate weights \
+             each program by its suite's granularity, so quote the program figure above",
+            summary.min_evaluated_tests,
+            summary.max_evaluated_tests
+        );
+    }
 }
 
 /// Log programs that have issues (translation failures, build failures, or test failures)
