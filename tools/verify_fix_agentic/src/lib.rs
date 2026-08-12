@@ -151,11 +151,10 @@ impl Tool for VerifyFixAgentic {
         // The wishlist file lives inside translated_rust/ so the agent can write to it
         // without any special permissions. The absolute path is injected into the prompt.
         let local_wishlist = translated.join("tool_wishlist.json");
-        let rust_toolchain_context =
-            agent_runner::detect_rust_toolchain_context(
-                &context.config.input,
-                config.test_corpus_root.as_deref(),
-            )?;
+        let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
+            &context.config.input,
+            config.test_corpus_root.as_deref(),
+        )?;
 
         // Look near the original input dir; the case_dir tempdir does not contain
         // CMakePresets.json because raw_source only mirrors `test_case/` content.
@@ -236,46 +235,46 @@ impl Tool for VerifyFixAgentic {
 
         // Append verify-phase wishlist entries to the translate-phase file (if any),
         // so the final output contains wishes from both phases in chronological order.
-        if local_wishlist.exists() {
-            if let Some(out_path) = &config.wishlist_output_path {
-                match (
-                    fs::read_to_string(&local_wishlist),
-                    fs::read_to_string(out_path),
-                ) {
-                    (Ok(new_entries), Ok(existing)) => {
-                        let merged = format!("{}{}", existing, new_entries);
-                        if let Err(e) = fs::write(out_path, merged) {
-                            warn!(
-                                "Failed to append verify wishlist to {}: {}",
-                                out_path.display(),
-                                e
-                            );
-                        } else {
-                            info!(
-                                "Tool wishlist (verify phase) appended to {}",
-                                out_path.display()
-                            );
-                        }
-                    }
-                    (Ok(new_entries), Err(_)) => {
-                        // No translate-phase file yet — write fresh.
-                        if let Err(e) = fs::write(out_path, new_entries) {
-                            warn!(
-                                "Failed to write verify wishlist to {}: {}",
-                                out_path.display(),
-                                e
-                            );
-                        } else {
-                            info!("Tool wishlist written to {}", out_path.display());
-                        }
-                    }
-                    (Err(e), _) => {
+        if local_wishlist.exists()
+            && let Some(out_path) = &config.wishlist_output_path
+        {
+            match (
+                fs::read_to_string(&local_wishlist),
+                fs::read_to_string(out_path),
+            ) {
+                (Ok(new_entries), Ok(existing)) => {
+                    let merged = format!("{}{}", existing, new_entries);
+                    if let Err(e) = fs::write(out_path, merged) {
                         warn!(
-                            "Failed to read local wishlist {}: {}",
-                            local_wishlist.display(),
+                            "Failed to append verify wishlist to {}: {}",
+                            out_path.display(),
                             e
                         );
+                    } else {
+                        info!(
+                            "Tool wishlist (verify phase) appended to {}",
+                            out_path.display()
+                        );
                     }
+                }
+                (Ok(new_entries), Err(_)) => {
+                    // No translate-phase file yet — write fresh.
+                    if let Err(e) = fs::write(out_path, new_entries) {
+                        warn!(
+                            "Failed to write verify wishlist to {}: {}",
+                            out_path.display(),
+                            e
+                        );
+                    } else {
+                        info!("Tool wishlist written to {}", out_path.display());
+                    }
+                }
+                (Err(e), _) => {
+                    warn!(
+                        "Failed to read local wishlist {}: {}",
+                        local_wishlist.display(),
+                        e
+                    );
                 }
             }
         }
@@ -313,14 +312,14 @@ impl Tool for VerifyFixAgentic {
         reference_guard.strip(&translated, config.rejected_output_dir.as_deref())?;
 
         let target_out = translated.join("target");
-        if target_out.exists() {
-            if let Err(e) = fs::remove_dir_all(&target_out) {
-                warn!(
-                    "Failed to remove target output dir {}: {}",
-                    target_out.display(),
-                    e
-                );
-            }
+        if target_out.exists()
+            && let Err(e) = fs::remove_dir_all(&target_out)
+        {
+            warn!(
+                "Failed to remove target output dir {}: {}",
+                target_out.display(),
+                e
+            );
         }
 
         // Keep the gtest/fuzztest verification environment in the frozen output
@@ -360,8 +359,8 @@ fn build_method_section(config: &Config) -> String {
         VerifyHarness::Gtest => {
             let section = if config.fuzz { FUZZTEST_SECTION } else { "" };
             METHOD_GTEST.replace("{FUZZTEST_SECTION}", section)
-        },
-        VerifyHarness::Libloading => METHOD_LIBLOADING.to_owned()
+        }
+        VerifyHarness::Libloading => METHOD_LIBLOADING.to_owned(),
     }
 }
 
@@ -672,7 +671,15 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert_eq!(parse_c_compile_defs(cmake), "");
     }
 
+    // The two tests below call `materialize_verify_env`, which marks build.sh
+    // executable. Miri has no shim for `chmod` — an unsupported foreign call, not
+    // an isolation error, so `-Zmiri-disable-isolation` does not help. Skipped
+    // under Miri only; the normal `cargo test` run still covers them.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "materialize_verify_env chmods build.sh; Miri has no chmod shim"
+    )]
     fn gtest_only_cmake_has_no_fuzztest() {
         let tmp = tempfile::tempdir().unwrap();
         let translated = tmp.path();
@@ -722,6 +729,10 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "materialize_verify_env chmods build.sh; Miri has no chmod shim"
+    )]
     fn fuzz_cmake_wires_fuzztest() {
         let tmp = tempfile::tempdir().unwrap();
         let translated = tmp.path();

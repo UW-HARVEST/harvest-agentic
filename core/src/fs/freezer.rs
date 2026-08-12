@@ -358,7 +358,7 @@ mod tests {
         let absolute_link_symlink = entry("absolute_link").symlink().unwrap();
         assert_eq!(absolute_link_symlink.contents(), "/absolute");
         assert_eq!(entry("c").dir().unwrap().entries().count(), 0);
-        assert_eq!(entry("inner_file").file().is_some(), true);
+        assert!(entry("inner_file").file().is_some());
         let a_b_dir_link_symlink_2 = entry("dir_link").symlink().unwrap();
         assert_eq!(a_b_dir_link_symlink_2.contents(), "../..");
         let file_link_symlink = entry("file_link").symlink().unwrap();

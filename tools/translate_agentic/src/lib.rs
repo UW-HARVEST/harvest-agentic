@@ -150,11 +150,10 @@ impl Tool for TranslateAgentic {
         // can write to it without any special permissions. We inject the absolute
         // path into the prompt so the agent knows exactly where to append entries.
         let local_wishlist = translated.join("tool_wishlist.json");
-        let rust_toolchain_context =
-            agent_runner::detect_rust_toolchain_context(
-                &context.config.input,
-                config.test_corpus_root.as_deref(),
-            )?;
+        let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
+            &context.config.input,
+            config.test_corpus_root.as_deref(),
+        )?;
         let workflow_hint = if config.workflow && agent == AgentKind::Claude {
             "You must use a workflow.\n\n".to_owned()
         } else {
@@ -202,17 +201,17 @@ impl Tool for TranslateAgentic {
         })?;
 
         // Copy the wishlist out before the tempdir is dropped.
-        if local_wishlist.exists() {
-            if let Some(out_path) = &config.wishlist_output_path {
-                if let Err(e) = fs::copy(&local_wishlist, out_path) {
-                    warn!(
-                        "Failed to copy tool wishlist to {}: {}",
-                        out_path.display(),
-                        e
-                    );
-                } else {
-                    info!("Tool wishlist written to {}", out_path.display());
-                }
+        if local_wishlist.exists()
+            && let Some(out_path) = &config.wishlist_output_path
+        {
+            if let Err(e) = fs::copy(&local_wishlist, out_path) {
+                warn!(
+                    "Failed to copy tool wishlist to {}: {}",
+                    out_path.display(),
+                    e
+                );
+            } else {
+                info!("Tool wishlist written to {}", out_path.display());
             }
         }
 
@@ -249,14 +248,14 @@ impl Tool for TranslateAgentic {
         reference_guard.strip(&translated, config.rejected_output_dir.as_deref())?;
 
         let target_out = translated.join("target");
-        if target_out.exists() {
-            if let Err(e) = fs::remove_dir_all(&target_out) {
-                warn!(
-                    "Failed to remove target output dir {}: {}",
-                    target_out.display(),
-                    e
-                );
-            }
+        if target_out.exists()
+            && let Err(e) = fs::remove_dir_all(&target_out)
+        {
+            warn!(
+                "Failed to remove target output dir {}: {}",
+                target_out.display(),
+                e
+            );
         }
 
         for entry in collect_symlinks(&translated) {
@@ -300,7 +299,6 @@ fn post_process(
     }
     Ok(())
 }
-
 
 /// Loads the translate prompt, selecting between Kiro (per-kind) and Claude (unified) variants.
 fn load_prompt(

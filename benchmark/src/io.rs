@@ -98,10 +98,7 @@ pub fn collect_program_dirs(input_dir: &PathBuf) -> HarvestResult<Vec<PathBuf>> 
         if path.join("test_case").is_dir() {
             program_dirs.push(path);
         } else {
-            log::info!(
-                "Skipping {} (no test_case/ subdirectory)",
-                path.display()
-            );
+            log::info!("Skipping {} (no test_case/ subdirectory)", path.display());
         }
     }
     // Standardize order before returning

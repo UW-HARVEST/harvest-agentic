@@ -214,14 +214,23 @@ mod tests {
 
     #[test]
     fn reserved_toplevel_entries() {
-        for reserved in [".harvest", "target", "gtest_suite", "runner", "test_vectors"] {
+        for reserved in [
+            ".harvest",
+            "target",
+            "gtest_suite",
+            "runner",
+            "test_vectors",
+        ] {
             assert!(
                 is_reserved_toplevel(std::ffi::OsStr::new(reserved)),
                 "{reserved}"
             );
         }
         for owned in ["src", "Cargo.lock", "Cargo.toml", "build.rs", "benches"] {
-            assert!(!is_reserved_toplevel(std::ffi::OsStr::new(owned)), "{owned}");
+            assert!(
+                !is_reserved_toplevel(std::ffi::OsStr::new(owned)),
+                "{owned}"
+            );
         }
     }
 }

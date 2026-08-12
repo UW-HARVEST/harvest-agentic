@@ -105,8 +105,7 @@ pub fn read_test_config(presets_path: &Path) -> TestConfig {
     let target = by_name.get("test").copied().or_else(|| {
         presets
             .iter()
-            .filter(|p| !p.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false))
-            .last()
+            .rfind(|p| !p.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false))
     });
     let Some(target) = target else {
         return TestConfig::default();

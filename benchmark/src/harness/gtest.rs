@@ -136,7 +136,10 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
             emit("Configuring and building GoogleTest suite...".to_string());
         }
         Event::SuiteBuilt { gtest_bin } => {
-            emit(format!("GoogleTest suite built at: {}", gtest_bin.display()));
+            emit(format!(
+                "GoogleTest suite built at: {}",
+                gtest_bin.display()
+            ));
         }
         Event::TestsDiscovered { count } => {
             emit(format!("Discovered {} GoogleTest test(s)", count));
@@ -210,12 +213,8 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
                     TestStatus::Skipped => {
                         emit(format!("Skipping gtest {} (GTEST_SKIP)", verdict.name))
                     }
-                    TestStatus::Passed => {
-                        emit(format!("\u{2705} Test {} passed", verdict.name))
-                    }
-                    TestStatus::Failed(_) => {
-                        emit(format!("\u{274c} Test {} failed", verdict.name))
-                    }
+                    TestStatus::Passed => emit(format!("\u{2705} Test {} passed", verdict.name)),
+                    TestStatus::Failed(_) => emit(format!("\u{274c} Test {} failed", verdict.name)),
                 }
             }
         }
@@ -229,7 +228,10 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
                     emit(line);
                 }
                 if outcome.passed > 0 && outcome.passed < outcome.total {
-                    emit(format!("  \u{2705} {} other test(s) passed", outcome.passed));
+                    emit(format!(
+                        "  \u{2705} {} other test(s) passed",
+                        outcome.passed
+                    ));
                 }
                 // Historically "passed" here included skips (they count as
                 // non-failures for the batch verdict line).
@@ -293,7 +295,11 @@ mod tests {
     }
 
     /// Drives the renderer over one invocation's events and returns its lines.
-    fn render(inv: &PlannedInvocation, verdicts: &[TestVerdict], out: &InvocationOutcome) -> Vec<String> {
+    fn render(
+        inv: &PlannedInvocation,
+        verdicts: &[TestVerdict],
+        out: &InvocationOutcome,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
         {
             let mut render = harvest_event_renderer_to(|line| lines.push(line));
@@ -325,7 +331,11 @@ mod tests {
         // Header plus one summary line: no per-test lines at all.
         assert_eq!(lines.len(), 2, "{:?}", lines);
         assert!(lines[0].starts_with("Running gtest batch"), "{:?}", lines);
-        assert!(lines[1].contains("Batch 'Suite.*': 3/3 passed"), "{:?}", lines);
+        assert!(
+            lines[1].contains("Batch 'Suite.*': 3/3 passed"),
+            "{:?}",
+            lines
+        );
     }
 
     #[test]
@@ -333,7 +343,10 @@ mod tests {
         let inv = invocation(InvocationMode::Suite, "Suite.*", 4);
         let verdicts = vec![
             verdict("Suite.T0", TestStatus::Passed),
-            verdict("Suite.T1", TestStatus::Failed(harvest_bench::FailureCause::Assertion)),
+            verdict(
+                "Suite.T1",
+                TestStatus::Failed(harvest_bench::FailureCause::Assertion),
+            ),
             verdict("Suite.T2", TestStatus::Passed),
             verdict("Suite.T3", TestStatus::Skipped),
         ];
@@ -365,19 +378,44 @@ mod tests {
         let clean = invocation(InvocationMode::Suite, "B.*", 1);
         {
             let mut render = harvest_event_renderer_to(|line| lines.push(line));
-            let bad = verdict("A.T0", TestStatus::Failed(harvest_bench::FailureCause::Assertion));
+            let bad = verdict(
+                "A.T0",
+                TestStatus::Failed(harvest_bench::FailureCause::Assertion),
+            );
             let good = verdict("B.T0", TestStatus::Passed);
             let bad_out = outcome(0, 0, 1);
             let good_out = outcome(1, 0, 1);
-            render(&Event::InvocationStarted { index: 0, total: 2, invocation: &failing });
+            render(&Event::InvocationStarted {
+                index: 0,
+                total: 2,
+                invocation: &failing,
+            });
             render(&Event::TestFinished { verdict: &bad });
-            render(&Event::InvocationFinished { index: 0, total: 2, invocation: &failing, outcome: &bad_out });
-            render(&Event::InvocationStarted { index: 1, total: 2, invocation: &clean });
+            render(&Event::InvocationFinished {
+                index: 0,
+                total: 2,
+                invocation: &failing,
+                outcome: &bad_out,
+            });
+            render(&Event::InvocationStarted {
+                index: 1,
+                total: 2,
+                invocation: &clean,
+            });
             render(&Event::TestFinished { verdict: &good });
-            render(&Event::InvocationFinished { index: 1, total: 2, invocation: &clean, outcome: &good_out });
+            render(&Event::InvocationFinished {
+                index: 1,
+                total: 2,
+                invocation: &clean,
+                outcome: &good_out,
+            });
         }
         // The failure belongs to the first batch only.
         let second = lines.iter().position(|l| l.contains("'B.*'")).unwrap();
-        assert!(!lines[second..].iter().any(|l| l.contains("A.T0")), "{:?}", lines);
+        assert!(
+            !lines[second..].iter().any(|l| l.contains("A.T0")),
+            "{:?}",
+            lines
+        );
     }
 }
