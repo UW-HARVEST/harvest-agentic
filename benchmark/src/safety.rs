@@ -7,46 +7,35 @@
 //!
 //! ## The four rules that decide whether the numbers mean anything
 //!
-//! Each of these was wrong in an earlier draft and produced a plausible but
-//! badly incorrect answer, so none of them is incidental:
-//!
 //! 1. **Type aliases are resolved.** A `*mut T` reached through
-//!    `pub type png_bytep = *mut png_byte;` is a [`syn::Type::Path`], not a
-//!    [`syn::Type::Ptr`], so a naive visitor never sees it. Measured on real
-//!    output, resolving aliases moves libpng's pointer-exposing exports from
-//!    47 to 375 of 381 — i.e. from "13% of the API exposes raw pointers" to
-//!    96%. Without it, two models producing semantically identical ports differ
-//!    8x purely on typedef style.
+//!    `pub type BytePtr = *mut u8;` is a [`syn::Type::Path`], not a
+//!    [`syn::Type::Ptr`], so a naive visitor never sees it. Without resolution,
+//!    two models producing semantically identical ports differ by an order of
+//!    magnitude purely on typedef style.
 //!
 //! 2. **Both export spellings are matched.** `#[no_mangle]` and
-//!    `#[unsafe(no_mangle)]` are both in use, and not mixed: on real output
-//!    mujs uses the plain form 226 times and the wrapped form 0, while jansson,
-//!    lz4, zstd, libpng and libsodium use the wrapped form 128/143/613/381/817
-//!    times and the plain form 0. A matcher that knows only one spelling
-//!    reports zero exported functions for six of seven crates.
+//!    `#[unsafe(no_mangle)]` are both in use, and a crate normally uses one of
+//!    them exclusively, so a matcher that knows only one spelling reports zero
+//!    exported functions for every crate that uses the other.
 //!
 //! 3. **Never `Spanned::span()` on an item.** It joins the item's outer
-//!    attributes, so a function preceded by doc comments and `#[unsafe(no_mangle)]`
-//!    reports its unsafe region as starting several lines early. That biases
-//!    the metric toward whichever model documents its unsafe functions less —
-//!    penalising the better-commented translation. Unsafe regions are taken
-//!    from the `unsafe` token and the closing brace specifically.
+//!    attributes, so a function preceded by doc comments and an export
+//!    attribute reports its unsafe region as starting several lines early. That
+//!    biases the metric toward whichever model documents its unsafe functions
+//!    less — penalising the better-commented translation. Unsafe regions are
+//!    taken from the `unsafe` token and the closing brace specifically.
 //!
 //! 4. **Agent-written tests are counted separately from the library.** The C
 //!    input carries no test harness (the external suite is held out), so
 //!    folding agent-written Rust tests into the library figures compares unlike
-//!    things and lets a model improve its ratio by writing tests. It is
-//!    load-bearing: on real output jansson's `tests/` holds 87 `unsafe {}`
-//!    blocks against 1 in `src/`, and libpng's `tests/` is 34% unsafe lines
-//!    against 89% in `src/`.
+//!    things and lets a model improve its ratio by writing tests.
 //!
 //! ## Integrity
 //!
 //! An unparseable file is recorded, counted, and excluded from BOTH the
-//! numerator and the denominator — never silently treated as safe. This is not
-//! hypothetical: a real truncated `pcre2_substitute.rs` in an existing results
-//! tree is rejected by the parser, and counting it as zero unsafe while still
-//! counting its 2285 lines would make that crate look safer than it is.
+//! numerator and the denominator — never silently treated as safe. Counting a
+//! file the parser rejected as zero unsafe while still counting its lines would
+//! make a crate look safer than it is.
 
 use harvest_core::stage_manifest;
 use serde::{Deserialize, Serialize};
@@ -159,9 +148,8 @@ pub struct ScopeMetrics {
     // ── raw pointers by type position, never by text ─────────────────────
     /// Declarations: parameters, returns, fields, statics, consts, locals.
     pub ptr_decl: PtrCounts,
-    /// `expr as *mut T`. Kept separate because casts would otherwise swallow
-    /// the declaration metric (on real output zstd has 2992 casts to 4138
-    /// declarations).
+    /// `expr as *mut T`. Kept separate because casts are numerous enough to
+    /// swallow the declaration metric if merged into it.
     pub ptr_cast: PtrCounts,
     /// Inside `extern "C" { … }`: C's own declarations, not the model's
     /// choices, so not evidence about the translation.
@@ -172,8 +160,8 @@ pub struct ScopeMetrics {
     // ── other places unsoundness hides ───────────────────────────────────
     pub transmutes: usize,
     pub static_mut_items: usize,
-    /// From `extern` blocks. Without this libpng reports zero mutable statics
-    /// while declaring `static mut STDERR: *mut FILE;`.
+    /// From `extern` blocks. Counted separately because a crate can declare
+    /// every one of its mutable statics there and otherwise report none.
     pub extern_static_mut_items: usize,
     pub extern_blocks: usize,
     pub extern_fn_decls: usize,
@@ -260,8 +248,8 @@ pub struct LineCounts {
 pub struct CSourceMetrics {
     pub c: LineCounts,
     pub h: LineCounts,
-    /// Source in other languages, seen and reported but not counted (libsodium
-    /// ships `.S` assembly). Reported so its volume is not silently invisible.
+    /// Source in other languages (assembly), seen and reported but not
+    /// counted. Reported so its volume is not silently invisible.
     pub other_source: LineCounts,
 }
 
@@ -284,10 +272,11 @@ const SCHEMA_VERSION: u32 = 1;
 impl SafetyMetrics {
     /// Rust library code lines per C `.c` code line.
     ///
-    /// `.h` is deliberately excluded: headers are 10% of one project's C side
-    /// and 38% of another's, so including them deflates projects by different
-    /// amounts and breaks the cross-project comparison this ratio exists for.
-    /// Every component is stored, so any other rule is recomputable offline.
+    /// `.h` is deliberately excluded: headers are a wildly different share of
+    /// the C side from project to project, so including them deflates projects
+    /// by different amounts and breaks the cross-project comparison this ratio
+    /// exists for. Every component is stored, so any other rule is recomputable
+    /// offline.
     pub fn rust_c_ratio(&self) -> Option<f64> {
         if self.c_source.c.code_lines == 0 {
             None
@@ -374,7 +363,7 @@ fn export_attrs(attrs: &[syn::Attribute]) -> (bool, usize, usize) {
 /// Counts every raw pointer reachable in `ty`, including through crate-local
 /// aliases. Returns `(direct_const, direct_mut, alias_const, alias_mut)`.
 ///
-/// Recursion covers the nesting the issue requires: `Option<*mut T>`,
+/// Recursion covers every nesting a translated signature uses: `Option<*mut T>`,
 /// `[*const u8; 4]`, `*mut *mut c_char`, `fn(*mut c_void) -> *const c_char`,
 /// tuples, and references to any of those.
 fn count_ptrs_in_type(ty: &syn::Type, aliases: &AliasMap) -> (usize, usize, usize, usize) {
@@ -1257,10 +1246,8 @@ mod tests {
 
     #[test]
     fn both_export_spellings_are_recognised() {
-        // Not academic: on real output mujs uses the plain form 226 times and
-        // the wrapped form 0, while five other crates use the wrapped form
-        // hundreds of times and the plain form 0. Knowing only one spelling
-        // reports zero exported functions for six of seven crates.
+        // A crate normally uses one spelling exclusively, so knowing only one
+        // of them reports zero exported functions for the crates using the other.
         let plain = m("#[no_mangle]\npub extern \"C\" fn a() {}\n");
         assert_eq!(plain.m.ffi_exported_fns, 1);
         assert_eq!(plain.m.export_attr_plain, 1);
@@ -1280,8 +1267,8 @@ mod tests {
 
     #[test]
     fn raw_pointers_are_found_through_type_aliases() {
-        // THE most important rule. On real output this moves libpng's
-        // pointer-exposing exports from 47 to 375 of 381.
+        // The rule the exported-surface numbers depend on most: a pointer
+        // reached through an alias is a Type::Path, which a naive visitor misses.
         let src = "\
 pub type png_byte = u8;
 pub type png_bytep = *mut png_byte;
@@ -1345,9 +1332,9 @@ pub fn f(pp: *mut *mut u8) -> (*const u8, u32) { (core::ptr::null(), 0) }
 
     #[test]
     fn casts_and_extern_declarations_are_separate_buckets() {
-        // Casts would otherwise swallow the declaration metric (real output:
-        // zstd has 2992 casts against 4138 declarations), and an `extern` block
-        // is C's own declaration, not a choice the model made.
+        // Casts are numerous enough to swallow the declaration metric if merged
+        // into it, and an `extern` block is C's own declaration, not a choice
+        // the model made.
         let src = "\
 unsafe extern \"C\" { pub static mut STDERR: *mut u8; pub fn c_fn(p: *const u8); }
 pub fn f(x: usize) -> *mut u8 { x as *mut u8 }
@@ -1454,9 +1441,9 @@ pub fn f(x: u32) -> i32 { unsafe { core::mem::transmute(x) } }
 
     #[test]
     fn an_unparseable_file_is_excluded_from_both_sides_not_treated_as_safe() {
-        // A real truncated pcre2_substitute.rs exists in an actual results
-        // tree. Counting it as zero unsafe while still counting its lines would
-        // make the crate look safer than it is.
+        // A truncated file is a real outcome of an interrupted agent run.
+        // Counting it as zero unsafe while still counting its lines would make
+        // the crate look safer than it is.
         let files = vec![
             (
                 "src/good.rs".to_owned(),
@@ -1481,8 +1468,8 @@ pub fn f(x: u32) -> i32 { unsafe { core::mem::transmute(x) } }
 
     #[test]
     fn scope_classification_keeps_agent_tests_out_of_the_library() {
-        // Load-bearing: on real output jansson's tests/ holds 87 unsafe blocks
-        // against 1 in src/, so folding them together would swamp the figure.
+        // An agent's tests can hold far more unsafe than the library it tests,
+        // so folding them together would swamp the figure.
         assert_eq!(classify(Path::new("src/lib.rs")), Some(Scope::Library));
         assert_eq!(classify(Path::new("src/a/b.rs")), Some(Scope::Library));
         assert_eq!(classify(Path::new("build.rs")), Some(Scope::Library));

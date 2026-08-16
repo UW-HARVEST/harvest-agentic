@@ -932,10 +932,9 @@ fn test_existing_program(
     log::info!("Testing translated program: {}", program_name);
     log::info!("Program directory: {}", program_dir.display());
 
-    // Re-grading an existing snapshot measures its safety too, so the metrics
-    // can be (re)generated for output translated before this existed — which is
-    // what makes the whole back catalogue comparable. The snapshot carries its
-    // own C source, so the comparison base travels with it.
+    // Re-grading an existing snapshot measures its safety too, so metrics can be
+    // regenerated without re-translating. The snapshot carries its own C source,
+    // so the comparison base travels with it.
     let safety = safety::measure(program_dir, &stage_manifest::c_source_dir(program_dir));
     safety::log_summary(&program_name, &safety);
     if let Err(e) = safety::write_metrics(program_dir, &safety) {
