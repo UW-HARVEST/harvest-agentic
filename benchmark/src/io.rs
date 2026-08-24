@@ -127,12 +127,27 @@ pub fn log_summary_stats(summary: &SummaryStats) {
     );
 
     log::info!("\nTest Results:");
-    log::info!("  Total test cases: {}", summary.total_tests);
-    log::info!("  Skipped: {} ⏭️", summary.total_skipped_tests);
-    log::info!("  Passed: {} ✅", summary.total_passed_tests);
-    log::info!("  Failed: {} ❌", summary.failed_tests());
     log::info!(
-        "  Overall success rate: {:.1}%",
+        "  Programs passing their whole suite: {}/{} ({:.1}%)",
+        summary.programs_all_tests_passed,
+        summary.num_programs,
+        summary.project_pass_rate()
+    );
+    if summary.max_evaluated_tests > 0 {
+        log::info!(
+            "  Evaluated tests per program: {}..{}",
+            summary.min_evaluated_tests,
+            summary.max_evaluated_tests
+        );
+    }
+
+    log::info!("\n  Per-test totals:");
+    log::info!("    Total test cases: {}", summary.total_tests);
+    log::info!("    Skipped: {} ⏭️", summary.total_skipped_tests);
+    log::info!("    Passed: {} ✅", summary.total_passed_tests);
+    log::info!("    Failed: {} ❌", summary.failed_tests());
+    log::info!(
+        "    Pooled per-test rate: {:.1}%",
         summary.overall_success_rate()
     );
 }
