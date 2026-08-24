@@ -56,13 +56,8 @@ impl ProgramEvalStats {
         (self.passed_tests as f64 / evaluated_tests as f64) * 100.0
     }
 
-    /// Whether this program passed its whole suite.
-    ///
-    /// This is the one test outcome that is comparable ACROSS programs,
-    /// because it does not depend on how a suite happens to be divided into
-    /// tests. A program that produced no evaluated test did not pass: a
-    /// translation that fails to build reports zero tests, and calling that a
-    /// pass would invert the result.
+    /// Whether this program passed its whole suite. A program that
+    /// evaluated no tests (e.g. a build failure) does not count.
     pub fn all_tests_passed(&self) -> bool {
         let evaluated = self.evaluated_tests();
         evaluated > 0 && self.passed_tests == evaluated
@@ -71,25 +66,11 @@ impl ProgramEvalStats {
 
 /// Summary statistics across all program runs.
 ///
-/// ## Why there are two test outcomes here, and which one to quote
-///
-/// Test suites in this benchmark differ in granularity by orders of magnitude.
-/// libpng's suite is exposed as four coarse entry points, each running a whole
-/// flag group of the library's own `pngvalid` driver and aborting on the first
-/// error; pcre2 and others expose hundreds of fine-grained tests. So one
-/// libpng "test" can stand for hundreds of upstream assertions while one pcre2
-/// test stands for one.
-///
-/// Summing passed tests across programs therefore adds quantities that are not
-/// the same kind of thing, and the resulting percentage moves for reasons
-/// unrelated to translation quality — splitting a suite into finer tests
-/// changes it with no change to the Rust at all.
-///
-/// [`Self::project_pass_rate`] is the headline: it counts programs that passed
-/// their whole suite, which is unaffected by how any suite is divided.
-/// [`Self::overall_success_rate`] is retained because per-program test counts
-/// are still worth seeing, but it is a granularity-sensitive micro-average and
-/// must not be quoted as "the" success rate.
+/// Test outcomes exist at two levels because suites differ widely in how
+/// many tests they expose: [`Self::project_pass_rate`] counts programs
+/// that passed their whole suite, while [`Self::overall_success_rate`]
+/// pools per-test counts and therefore weights each program by its suite
+/// size.
 #[derive(Debug, Serialize)]
 pub struct SummaryStats {
     pub num_programs: usize,
@@ -98,12 +79,7 @@ pub struct SummaryStats {
     pub total_tests: usize,
     pub total_skipped_tests: usize,
     pub total_passed_tests: usize,
-    /// Programs that passed their entire suite. The granularity-invariant
-    /// outcome, and the one comparable across programs and corpora.
     pub programs_all_tests_passed: usize,
-    /// Fewest and most evaluated tests any single program reported. Recorded so
-    /// the spread is visible next to the totals: when it is 4 vs 800, the
-    /// micro-average below is self-evidently not a meaningful average.
     pub min_evaluated_tests: usize,
     pub max_evaluated_tests: usize,
 }
@@ -121,10 +97,6 @@ impl SummaryStats {
     }
 
     /// Fraction of programs that passed their whole suite, as a percentage.
-    ///
-    /// The headline test outcome. Unlike [`Self::overall_success_rate`] this is
-    /// invariant to how each suite is divided into tests, so it is comparable
-    /// across programs, across corpora, and across runs whose suites changed.
     pub fn project_pass_rate(&self) -> f64 {
         if self.num_programs == 0 {
             0.0
@@ -133,13 +105,8 @@ impl SummaryStats {
         }
     }
 
-    /// Micro-average of test outcomes pooled across every program.
-    ///
-    /// GRANULARITY-SENSITIVE: this weights each program by how many tests its
-    /// suite happens to expose, so a program with four coarse tests counts a
-    /// fraction of one with eight hundred fine ones. See the type-level docs.
-    /// Use [`Self::project_pass_rate`] as the headline; this is for context
-    /// alongside the per-program counts.
+    /// Pooled per-test success rate across all programs; weights each
+    /// program by its suite size.
     pub fn overall_success_rate(&self) -> f64 {
         let evaluated_tests = self.evaluated_tests();
         if evaluated_tests == 0 {
@@ -170,8 +137,7 @@ impl SummaryStats {
     /// Create SummaryStats from a slice of ProgramEvalStats
     pub fn from_results(results: &[ProgramEvalStats]) -> Self {
         // Spread is taken over programs that actually evaluated something;
-        // programs that never got to run would otherwise pin the minimum at 0
-        // and hide the real disparity between suites.
+        // programs that never got to run would otherwise pin the minimum at 0.
         let evaluated: Vec<usize> = results
             .iter()
             .map(|r| r.evaluated_tests())
@@ -213,67 +179,49 @@ mod tests {
         assert!(!program("a", 10, 9, 0).all_tests_passed());
         // Skipped tests are not failures: 8 of 10 evaluated, all 8 passed.
         assert!(program("a", 10, 8, 2).all_tests_passed());
-        // A translation that failed to build reports zero tests. Treating that
-        // as a pass would invert the result.
+        // A translation that fails to build reports zero tests.
         assert!(!program("a", 0, 0, 0).all_tests_passed());
         assert!(!program("a", 5, 0, 5).all_tests_passed());
     }
 
     #[test]
     fn the_headline_metric_is_unaffected_by_suite_granularity() {
-        // The real shape of this benchmark: libpng exposes 4 coarse entry
-        // points, pcre2 hundreds of fine tests. Both programs fail one test.
-        let coarse = vec![program("libpng", 4, 3, 0), program("pcre2", 800, 799, 0)];
-
-        // Now the same logical outcome with libpng's suite divided into 800 fine
-        // tests instead. The Rust, and the fact that libpng fails, are unchanged.
-        let fine = vec![
-            program("libpng", 800, 799, 0),
-            program("pcre2", 800, 799, 0),
-        ];
+        // Both programs fail exactly one test; only the suite granularity
+        // differs between the two runs.
+        let coarse = vec![program("a", 4, 3, 0), program("b", 800, 799, 0)];
+        let fine = vec![program("a", 800, 799, 0), program("b", 800, 799, 0)];
 
         let a = SummaryStats::from_results(&coarse);
         let b = SummaryStats::from_results(&fine);
 
-        // The headline is identical: neither program passed its whole suite in
-        // either case. That invariance is what makes it quotable across corpora
-        // and across runs whose suites were re-divided.
         assert_eq!(a.programs_all_tests_passed, b.programs_all_tests_passed);
         assert_eq!(a.project_pass_rate(), b.project_pass_rate());
-
-        // The pooled per-test rate moves on identical Rust, purely because the
-        // suite was chunked differently. The shift is small here; the test below
-        // shows the case where it is large and actively misleading.
         assert_ne!(
             a.overall_success_rate(),
             b.overall_success_rate(),
-            "pooled rate should be sensitive to chunking, which is the problem"
+            "pooled rate should change when only the suite granularity changes"
         );
     }
 
     #[test]
     fn a_pooled_average_hides_a_completely_broken_coarse_suite() {
-        // The failure mode that matters in practice. libpng's four coarse tests
-        // are drowned out by pcre2's eight hundred fine ones, so a project that
-        // fails EVERY test barely dents the pooled figure.
-        let results = vec![program("libpng", 4, 0, 0), program("pcre2", 800, 800, 0)];
+        // One project fails every test, but its four tests are drowned out
+        // by the other project's eight hundred.
+        let results = vec![program("coarse", 4, 0, 0), program("fine", 800, 800, 0)];
         let s = SummaryStats::from_results(&results);
 
-        // Pooled: looks like near-perfect success.
         assert!(
             s.overall_success_rate() > 99.0,
             "pooled = {:.2}%",
             s.overall_success_rate()
         );
-        // Honest: one of two projects is broken.
         assert_eq!(s.programs_all_tests_passed, 1);
         assert_eq!(s.project_pass_rate(), 50.0);
     }
 
     #[test]
     fn project_pass_rate_counts_programs_not_tests() {
-        // One tiny suite passes, one huge suite fails a single test. Pooling
-        // tests says ~99.9% success; counting programs says 50%.
+        // One tiny suite passes entirely, one huge suite fails a single test.
         let results = vec![program("small", 4, 4, 0), program("big", 1000, 999, 0)];
         let s = SummaryStats::from_results(&results);
         assert_eq!(s.programs_all_tests_passed, 1);
@@ -283,16 +231,13 @@ mod tests {
 
     #[test]
     fn the_spread_of_suite_sizes_is_recorded() {
-        // Recorded so the disparity is visible next to the totals: when it is
-        // 4..800, the pooled average is self-evidently not an average.
         let results = vec![
-            program("libpng", 4, 4, 0),
-            program("pcre2", 800, 800, 0),
+            program("small", 4, 4, 0),
+            program("big", 800, 800, 0),
             program("failed_to_build", 0, 0, 0),
         ];
         let s = SummaryStats::from_results(&results);
-        // A program that never evaluated a test must not pin the minimum to 0
-        // and hide the real disparity.
+        // The program that evaluated nothing must not pin the minimum at 0.
         assert_eq!(s.min_evaluated_tests, 4);
         assert_eq!(s.max_evaluated_tests, 800);
     }
