@@ -970,7 +970,7 @@ const OPENCODE_FATAL_ERROR_MARKERS: &[&str] = &[
 /// `step_finish` says `stop`. OpenCode reports every abnormal ending as a
 /// normal one — it exits 0 after a stream dies mid-response — and it spells
 /// those endings differently each time. A blacklist of known-bad
-/// values misses the next spelling; requiring the one known-good value does
+/// values misses the next spelling. Requiring the one known-good value does
 /// not.
 fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
     let Ok(file) = fs::File::open(log_path) else {
@@ -1037,7 +1037,7 @@ fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
     match last_session_id {
         // The id is interpolated into the resume shell command, so accept only
         // the shape OpenCode actually emits (`ses_` + base62). A surprising id
-        // means the log is not what this parser thinks it is; skip the resume
+        // means the log is not what this parser thinks it is. Skip the resume
         // rather than build a command out of it.
         Some(session_id)
             if !session_id.is_empty()
@@ -1254,7 +1254,7 @@ fn write_claude_sandbox(case_dir: &Path) -> Result<(), Box<dyn std::error::Error
 struct OpenCodeAgentConfig<'a> {
     name: &'a str,
     description: &'a str,
-    /// `cat <files>` command for post-compaction memory recovery; None when
+    /// `cat <files>` command for post-compaction memory recovery. None when
     /// plan files are disabled (nothing to recover). Some → the
     /// compaction-recovery plugin is written next to the agent definition.
     recovery_command: Option<String>,
@@ -1265,7 +1265,7 @@ struct OpenCodeAgentConfig<'a> {
 /// hint ("after any compaction, read PLAN.md first") is both wasteful and
 /// weakly followed (observed in trace_zstd_44: the instruction was present in
 /// the system prompt AND in the summary text, and was still skipped). See the
-/// plugin source for the mechanism; `{RECOVERY_CMD}` is substituted with the
+/// plugin source for the mechanism. `{RECOVERY_CMD}` is substituted with the
 /// phase's recovery command before writing.
 const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("opencode_compaction_recovery.js");
 
@@ -1300,19 +1300,28 @@ fn run_tempdir(work_dir: &Path) -> &Path {
 /// `external_directory` defaults to "ask", and task sub-agent sessions do not
 /// inherit `--dangerously-skip-permissions`, so in a headless run any
 /// sub-agent tool call that touches a path outside the project directory
-/// blocks forever on the unanswerable permission prompt, freezing the whole
-/// session until the harness timeout kills it. Scoping external access to
-/// this run's temp directory and denying everything else makes "ask"
-/// unreachable: a mistyped or out-of-run path fails fast with an error the
-/// agent can see and correct, and concurrent runs cannot touch each other's
-/// tempdirs. OpenCode resolves permission rules last-match-wins, so the
-/// catch-all deny must come before the tempdir allow.
-fn opencode_project_config(work_dir: &Path, model: Option<&str>) -> String {
+/// blocks forever on the unanswerable permission prompt. Scoping external
+/// access to this run's temp directory and denying everything else makes "ask"
+/// unreachable.
+fn opencode_project_config(
+    work_dir: &Path,
+    model: Option<&str>,
+    staged_provider: Option<&(String, serde_json::Value)>,
+) -> String {
     let tempdir_pattern = format!("{}/**", run_tempdir(work_dir).display());
-    let provider_block = match openrouter_provider_pin(model) {
-        Some(pin) => format!(
+    // The pin wins over a staged entry: a user shadowing a built-in provider
+    // (e.g. openrouter) keeps today's routing behavior.
+    let provider_value = openrouter_provider_pin(model).or_else(|| {
+        staged_provider.map(|(id, definition)| {
+            let mut providers = serde_json::Map::new();
+            providers.insert(id.clone(), definition.clone());
+            serde_json::Value::Object(providers)
+        })
+    });
+    let provider_block = match provider_value {
+        Some(value) => format!(
             ",\n  \"provider\": {}",
-            serde_json::to_string(&pin).expect("provider pin serializes to JSON"),
+            serde_json::to_string(&value).expect("provider block serializes to JSON"),
         ),
         None => String::new(),
     };
@@ -1340,7 +1349,7 @@ fn opencode_project_config(work_dir: &Path, model: Option<&str>) -> String {
 /// that then dropped the stream). Pin the request to the author's first-party
 /// endpoint and disable fallbacks: for a first-party author OpenRouter's
 /// provider slug equals the author segment of the model id (verified for
-/// `xiaomi`; holds for `deepseek`, `minimax`, etc.), so a run never silently
+/// `xiaomi` and holds for `deepseek`, `minimax`, etc.), so a run never silently
 /// lands on an inferior host. Returns None for non-OpenRouter models (direct
 /// providers route to a single upstream and need no hint).
 fn openrouter_provider_pin(model: Option<&str>) -> Option<serde_json::Value> {
@@ -1362,6 +1371,54 @@ fn openrouter_provider_pin(model: Option<&str>) -> Option<serde_json::Value> {
     }))
 }
 
+/// The selected model's custom-provider definition, for staging into the
+/// run's project config.
+///
+/// `run_bash_agent` points XDG_CONFIG_HOME at an empty directory, which hides
+/// the user's global opencode.json{,c} and every custom provider in it.
+/// auth.json keys survive (XDG data dir), so without staging the run holds a
+/// key to an endpoint it cannot name and fails with opaque provider errors.
+/// `opencode debug config` resolves the user's real config in the harness
+/// environment. Staging that one entry gives the run its endpoint while
+/// global plugins, AGENTS.md instructions, and unrelated config stay hidden.
+/// Built-in providers are absent from the user config and stage nothing. A
+/// provider defined nowhere fails the run before spawn: after spawn the same
+/// mistake surfaces as generic provider stream errors with nothing
+/// actionable in them.
+fn custom_provider_stage(
+    model: Option<&str>,
+) -> Result<Option<(String, serde_json::Value)>, String> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let Ok((provider_id, _)) = parse_opencode_model(model) else {
+        return Ok(None);
+    };
+    let resolved = match command_stdout("opencode", &["debug", "config"]).and_then(|output| {
+        serde_json::from_str::<serde_json::Value>(&output)
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    }) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!("opencode debug config unreadable, staging nothing: {error}");
+            return Ok(None);
+        }
+    };
+    if let Some(definition) = resolved.get("provider").and_then(|p| p.get(&provider_id)) {
+        return Ok(Some((provider_id, definition.clone())));
+    }
+    match run_opencode_models(Some(&provider_id)) {
+        // A built-in provider resolves without user config.
+        Ok(_) => Ok(None),
+        Err(_) => Err(format!(
+            "OpenCode provider `{provider_id}` is defined nowhere: `opencode models {provider_id}` \
+             fails and `opencode debug config` has no entry for it. Define it in \
+             ~/.config/opencode/opencode.jsonc, or export OPENCODE_CONFIG to a config file \
+             that defines it, and rerun."
+        )),
+    }
+}
+
 const WORKDIR_BOUNDARY_TEMPLATE: &str = r#"### Filesystem boundary
 - `{TEMPDIR}` is the ONLY directory you may read or write.
 - Keep all scratch files inside the project directory.
@@ -1373,7 +1430,7 @@ const WORKDIR_BOUNDARY_TEMPLATE: &str = r#"### Filesystem boundary
 
 /// Prompt block telling the agent it may only touch files under this run's
 /// temp directory, mirroring the `external_directory` policy that
-/// `opencode_project_config` enforces. Rendered for OpenCode only; other
+/// `opencode_project_config` enforces. Rendered for OpenCode only. Other
 /// agents get an empty string (substituted for `{WORKDIR_BOUNDARY}`).
 pub fn render_workdir_boundary(agent: AgentKind, work_dir: &Path) -> String {
     if agent != AgentKind::OpenCode {
@@ -1390,9 +1447,11 @@ fn write_opencode_agent(
     let agents_dir = work_dir.join(".opencode/agents");
     fs::create_dir_all(&agents_dir)?;
 
+    let staged = custom_provider_stage(model)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     fs::write(
         work_dir.join(".opencode/opencode.json"),
-        opencode_project_config(work_dir, model),
+        opencode_project_config(work_dir, model, staged.as_ref()),
     )?;
 
     let mut permissions = String::new();
@@ -1402,7 +1461,7 @@ fn write_opencode_agent(
 
     // The agent .md body becomes `agent.prompt` and would REPLACE OpenCode's
     // default provider system prompt (request assembly is
-    // `agent.prompt ? [agent.prompt] : SystemPrompt.provider(model)`; the md
+    // `agent.prompt ? [agent.prompt] : SystemPrompt.provider(model)`, the md
     // body is trimmed, and an empty string is falsy). Historically we put the
     // compaction-recovery hint here, which silently dropped the entire
     // default coding prompt (~2k tokens of tool-use/communication guidance).
@@ -1551,7 +1610,7 @@ mod tests {
     #[test]
     fn opencode_project_config_scopes_external_directory_to_run_tempdir() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, None);
+        let raw = opencode_project_config(work_dir, None, None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         let rules = config
@@ -1573,7 +1632,7 @@ mod tests {
     #[test]
     fn opencode_project_config_pins_openrouter_to_author_endpoint() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, Some("openrouter/xiaomi/mimo-v2.5-pro"));
+        let raw = opencode_project_config(work_dir, Some("openrouter/xiaomi/mimo-v2.5-pro"), None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         let opts = config
@@ -1592,10 +1651,54 @@ mod tests {
     #[test]
     fn opencode_project_config_no_pin_for_non_openrouter() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, Some("opencode-go/mimo-v2.5"));
+        let raw = opencode_project_config(work_dir, Some("opencode-go/mimo-v2.5"), None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         assert!(config.get("provider").is_none());
+    }
+
+    #[test]
+    fn opencode_project_config_stages_custom_provider() {
+        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let definition = serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "options": { "baseURL": "https://endpoint.example/v1" }
+        });
+        let raw = opencode_project_config(
+            work_dir,
+            Some("harvest-hyak/qwen3.8-27b"),
+            Some(&("harvest-hyak".to_string(), definition)),
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&raw).expect("project config must be valid JSON");
+        assert_eq!(
+            config.pointer("/provider/harvest-hyak/options/baseURL"),
+            Some(&serde_json::json!("https://endpoint.example/v1"))
+        );
+        // Staging must not disturb the permission boundary.
+        assert!(config.pointer("/permission/external_directory/*").is_some());
+    }
+
+    #[test]
+    fn opencode_project_config_prefers_openrouter_pin_over_staged_entry() {
+        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let raw = opencode_project_config(
+            work_dir,
+            Some("openrouter/xiaomi/mimo-v2.5-pro"),
+            Some(&(
+                "openrouter".to_string(),
+                serde_json::json!({"npm": "shadowed"}),
+            )),
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&raw).expect("project config must be valid JSON");
+        assert!(config.pointer("/provider/openrouter/models").is_some());
+        assert!(config.pointer("/provider/openrouter/npm").is_none());
+    }
+
+    #[test]
+    fn custom_provider_stage_skips_shellout_without_model() {
+        assert!(custom_provider_stage(None).unwrap().is_none());
     }
 
     #[test]
@@ -1612,11 +1715,11 @@ mod tests {
         )
         .unwrap();
         let config = fs::read_to_string(dir.path().join(".opencode/opencode.json")).unwrap();
-        assert_eq!(config, opencode_project_config(dir.path(), None));
+        assert_eq!(config, opencode_project_config(dir.path(), None, None));
         let agent_md =
             fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md")).unwrap();
         // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
-        // official default provider system prompt applies; the compaction
+        // official default provider system prompt applies. The compaction
         // hint lives in the plugin, not here.
         assert!(agent_md.ends_with("---\n"));
         assert!(!agent_md.contains("compaction"));
