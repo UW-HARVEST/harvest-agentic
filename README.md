@@ -161,6 +161,47 @@ harness build would otherwise report every test as a failure.
 non-agentic benchmark runs. Flags scoped to a stage (e.g. `--fuzz` to verify)
 are rejected when that stage is not part of the run.
 
+## Declared experiment sets
+
+Everything above describes one run, named by hand. An **experiment set** instead
+records in the repository the runs that *should* exist, so the set can be
+executed, resumed, and reported against. See `experiments/hb.toml`.
+
+```bash
+# What would run, and the exact argv each run becomes. Do this first.
+cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --dry-run
+
+# Execute. Re-invoking the same command resumes what an interrupted sweep lost.
+cargo run --bin=benchmark --release -- --experiments experiments/hb.toml
+
+# What is done and what is outstanding. Safe while a sweep is running.
+cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --status
+
+# One run at a time, and the only way --force reaches a sweep.
+cargo run --bin=benchmark --release -- --experiments experiments/hb.toml --only t_sonnet
+```
+
+Each `[[run]]` names its `programs`, `stages`, `agent`, `model`, prompt-mode
+knobs and `-c` overrides — the same knobs as the flags above, carried rather
+than reinvented, so a set cannot express a combination the CLI would reject.
+
+`from = "<run id>"` consumes another declared run's output, which is how one
+frozen translate snapshot feeds several verify experiments (the workflow under
+"Snapshots and resuming"). A run's output root is always `<results_root>/<id>`,
+so results are discoverable without knowing any hand-chosen path.
+
+| Flag | Meaning |
+|------|---------|
+| `--experiments <FILE>` | Run a declared experiment set. Replaces the positional `INPUT_DIR OUTPUT_DIR` pair. |
+| `--dry-run` | Print the resolved runs and their argv; run nothing |
+| `--status` | Report per-run progress and exit; writes nothing |
+| `--only <ID>` | Restrict execution to these run ids (repeatable) |
+
+Resuming is per program, not per run: each program's outcome is recorded as it
+finishes, so an interrupted sweep redoes only what it lost. Each run also carries
+a `receipt.json` — labels, program set, `-c` overrides, exact argv and harvest
+version — so downstream reporting never has to parse a directory name.
+
 ## Examples
 
 A real-world library (lz4), Claude Sonnet, full translate + verify (the

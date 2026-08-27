@@ -27,6 +27,7 @@ log = { workspace = true }
 regex = "1.12.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 toml_edit = { workspace = true }
 try_cargo_build = { version = "0.1.0", path = "../tools/try_cargo_build" }
 wait-timeout = "0.2"

@@ -1,0 +1,105 @@
+# The experiment set for harvest-bench: the list of runs that should exist.
+# How to run it, and what each key means: README, "Declared experiment sets".
+#
+# bench_root assumes harvest-bench is cloned to ./harvest-bench, as the README
+# describes. Adjust if yours lives elsewhere.
+
+schema_version = 1
+bench_root = "../harvest-bench/tests"
+results_root = "../results/hb"
+
+[defaults]
+agent = "claude"
+timeout = 60
+config = ["tools.translate_agentic.timeout_secs=36000"]
+
+# ---------------------------------------------------------------------------
+# Non-agentic baselines. These are the control rows of any ablation table: the
+# comparison is meaningless without them, so they belong in the declared set
+# rather than being run by hand.
+# ---------------------------------------------------------------------------
+
+[[run]]
+id = "one_shot"
+labels = { pipeline = "one_shot" }
+programs = ["lz4", "jansson"]
+
+[[run]]
+id = "modular"
+labels = { pipeline = "modular" }
+programs = ["lz4", "jansson"]
+modular = true
+
+# ---------------------------------------------------------------------------
+# Translate once, then verify repeatedly against that frozen snapshot. This is
+# the workflow the README describes, and the reason `from` exists: the verify
+# experiments below all grade the SAME translation, so differences between them
+# are attributable to the verify stage rather than to translation variance.
+# ---------------------------------------------------------------------------
+
+[[run]]
+id = "t_sonnet"
+labels = { pipeline = "agentic", tmodel = "sonnet" }
+programs = ["lz4", "jansson"]
+stages = ["translate"]
+model = "sonnet"
+
+[[run]]
+id = "t_sonnet.v_sonnet"
+labels = { pipeline = "agentic", tmodel = "sonnet", vmodel = "sonnet" }
+from = "t_sonnet"
+stages = ["verify"]
+model = "sonnet"
+
+[[run]]
+id = "t_sonnet.v_opus"
+labels = { pipeline = "agentic", tmodel = "sonnet", vmodel = "opus" }
+from = "t_sonnet"
+stages = ["verify"]
+model = "opus"
+
+# Narrowed to one program: fuzzing every program of the parent is not worth its
+# cost here.
+[[run]]
+id = "t_sonnet.v_sonnet_gtest_fuzz"
+labels = { pipeline = "agentic", tmodel = "sonnet", vmodel = "sonnet", harness = "gtest+fuzz" }
+from = "t_sonnet"
+programs = ["lz4"]
+stages = ["verify"]
+model = "sonnet"
+verify_harness = "gtest"
+fuzz = true
+
+# ---------------------------------------------------------------------------
+# Prompt ablation: same model, same programs, plan files disabled. Isolating
+# the anti-compaction mechanism is the point, so nothing else varies.
+# ---------------------------------------------------------------------------
+
+[[run]]
+id = "t_sonnet_no_plan"
+labels = { pipeline = "agentic", tmodel = "sonnet", prompt = "no_plan" }
+programs = ["lz4", "jansson"]
+stages = ["translate"]
+model = "sonnet"
+no_plan = true
+
+[[run]]
+id = "t_sonnet_no_plan.v_sonnet"
+labels = { pipeline = "agentic", tmodel = "sonnet", vmodel = "sonnet", prompt = "no_plan" }
+from = "t_sonnet_no_plan"
+stages = ["verify"]
+model = "sonnet"
+no_plan = true
+
+# ---------------------------------------------------------------------------
+# A model served through OpenCode rather than the Claude CLI: the agent/model
+# axis is just another knob.
+# ---------------------------------------------------------------------------
+
+[[run]]
+id = "t_oc_sonnet5_bedrock"
+labels = { pipeline = "agentic", tmodel = "bedrock-sonnet-5", harness = "opencode" }
+programs = ["lz4"]
+stages = ["translate"]
+agent = "oc"
+model = "amazon-bedrock/us.anthropic.claude-sonnet-5"
