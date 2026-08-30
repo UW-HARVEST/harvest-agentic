@@ -180,7 +180,7 @@ pub fn remove_hidden_entries(dir: &Path) -> io::Result<()> {
 }
 
 /// Collects symlink paths under `dir`, for diagnostics before a freeze
-/// ([RawDir] does not support symlinks).
+/// ([RawDir] has no symlink representation; freezes skip them with a warning).
 pub fn collect_symlinks(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(entries) = read_dir(dir) else {
@@ -393,11 +393,11 @@ impl RawDir {
 
     /// Like [`RawDir::populate_from`], but skips any directory entry (at any
     /// depth) whose file name satisfies `skip_dir`. Used for source ingestion
-    /// to keep build-artifact directories (`build/`, `target/`, ...) out of the
-    /// IR: they bloat the representation, can go stale (a pre-cleanup `build/`
+    /// to keep build-artifact directories (`build/`, `target/`, ...) out of
+    /// the IR: they bloat the representation, can go stale (a pre-cleanup `build/`
     /// carries object files and a shared library that no longer match the
-    /// source), and frequently contain symlinks that plain `populate_from`
-    /// rejects with `unimplemented!`.
+    /// source), and frequently contain symlinks (plain `populate_from` skips
+    /// symlinks anywhere, with a warning).
     pub fn populate_from_filtered(
         read_dir: ReadDir,
         skip_dir: &dyn Fn(&std::ffi::OsStr) -> bool,
@@ -422,7 +422,12 @@ impl RawDir {
                 result.insert(entry.file_name(), RawEntry::File(contents));
                 files += 1;
             } else {
-                unimplemented!("No support yet for symlinks in source project.");
+                // Symlinks (and other special files) have no RawDir
+                // representation, warn and skip them.
+                tracing::warn!(
+                    "skipping symlink/special entry: {}",
+                    entry.path().display()
+                );
             }
         }
         Ok((RawDir(result), directories, files))
@@ -909,6 +914,30 @@ mod tests {
             result.unwrap(),
             PathBuf::from_iter([diagnostics_dir.path(), "relative/path".as_ref()])
         );
+    }
+
+    #[test]
+    fn populate_from_skips_symlinks() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root.join("file.txt"), "contents").unwrap();
+        create_dir(root.join("sub")).unwrap();
+        write(root.join("sub/inner.txt"), "inner").unwrap();
+        symlink("file.txt", root.join("link_to_file")).unwrap();
+        symlink("sub", root.join("link_to_dir")).unwrap();
+        symlink("/nonexistent/target", root.join("broken_link")).unwrap();
+
+        let (raw_dir, directories, files) =
+            RawDir::populate_from(read_dir(root).unwrap()).unwrap();
+
+        assert_eq!(directories, 1);
+        assert_eq!(files, 2);
+        let mut names: Vec<String> = raw_dir
+            .toplevel_entries()
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["file.txt".to_owned(), "sub".to_owned()]);
     }
 }
 
