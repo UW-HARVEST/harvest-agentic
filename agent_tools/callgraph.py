@@ -17,8 +17,18 @@ Limitations:
   - Every source file must compile (all headers reachable, all -D flags
     present in compile_commands.json).  Files that fail are skipped with a
     warning; the graph covers only what compiled successfully.
-  - Function pointers are NOT resolved.  A function called only via a
-    pointer appears as a leaf with no outgoing edges.
+  - Function pointers are NOT resolved (this is the points-to / alias
+    problem and is undecidable in general).  However, functions that
+    CONTAIN an unresolved indirect (function-pointer) call are detected by
+    scanning the linked IR and flagged with the marker
+
+        [indirect call site — callees unresolved]
+
+    in every output mode.  These functions are NOT leaves in the usual
+    sense: they have at least one call whose target the static graph cannot
+    name.  A downstream consumer (e.g. an LLM planning a translation) should
+    treat such a function as having unknown additional callees and recover
+    the likely targets from surrounding context.
 """
 
 import sys
@@ -35,6 +45,72 @@ from pathlib import Path
 LLVM_INTRINSIC_PREFIX = "llvm."
 # Compiler builtins and libc wrappers that clutter the graph
 _SKIP_PREFIXES = ("llvm.", "__builtin_", "__bswap_", "__uint", "__int")
+
+# Marker appended to any function that contains an unresolved indirect
+# (function-pointer) call site.  Surfaced in every output mode so the
+# downstream plan generator can see exactly where the static graph is
+# imprecise and reason about the missing callees.
+INDIRECT_MARKER = "[indirect call site — callees unresolved]"
+
+
+# ---------------------------------------------------------------------------
+# Indirect-call (function-pointer) detection
+# ---------------------------------------------------------------------------
+#
+# The DOT produced by `opt -passes=dot-callgraph` only contains RESOLVED
+# edges.  An indirect call through a function pointer produces no edge at
+# all, so the calling function silently looks like a leaf (or looks like it
+# has fewer callees than it really does).  That imprecision is invisible in
+# the DOT but plainly visible in the IR: an indirect call's callee operand
+# is an SSA register (%...) instead of a named global (@...).  We scan the
+# linked textual IR and record which functions contain at least one such
+# site so the graph can flag them instead of passing them off as leaves.
+
+_DEFINE_RE = re.compile(r'^\s*define\b.*?@"?([A-Za-z0-9_.$]+)"?\s*\(')
+
+
+def _is_indirect_call(line: str) -> bool:
+    """True if this IR line is a call/invoke whose callee is a pointer."""
+    s = line.strip()
+    m = re.search(r'\b(call|invoke)\b', s)
+    if not m:
+        return False
+    rest = s[m.end():]
+    if 'asm ' in rest:            # inline asm — not a function pointer
+        return False
+    paren = rest.find('(')
+    if paren == -1:
+        return False
+    toks = rest[:paren].split()
+    if not toks:
+        return False
+    callee = toks[-1]             # operand immediately before the arg list
+    if callee.startswith('@'):
+        return False              # direct call to a named function
+    if callee.startswith('%'):
+        return True               # indirect call through a register/pointer
+    return False
+
+
+def _scan_indirect(ir_text: str) -> set[str]:
+    """
+    Return the set of function names containing >= 1 indirect call site.
+    `ir_text` is the textual IR of the linked whole-program module, whose
+    function names line up with the DOT node labels.
+    """
+    indirect: set[str] = set()
+    current: str | None = None
+    for line in ir_text.splitlines():
+        mdef = _DEFINE_RE.match(line)
+        if mdef:
+            current = mdef.group(1)
+            continue
+        if line.strip() == "}":
+            current = None
+            continue
+        if current is not None and _is_indirect_call(line):
+            indirect.add(current)
+    return indirect
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +167,16 @@ def _compile_to_ir(entry: dict, out_dir: str) -> str | None:
     return out_ll
 
 
-def _build_graph(compile_commands_path: str) -> dict[str, set[str]]:
+def _build_graph(compile_commands_path: str) -> tuple[dict[str, set[str]], set[str]]:
     """
-    Full pipeline: compile → link → dot-callgraph → parse.
-    Returns a dict mapping each function name to the set of functions it calls.
+    Full pipeline: compile → link → dot-callgraph → parse, plus an IR scan
+    for unresolved indirect (function-pointer) call sites.
+
+    Returns a pair (graph, indirect):
+      graph    — dict mapping each function name to the set of functions it
+                 directly (resolvably) calls.
+      indirect — set of function names that contain at least one indirect
+                 call site whose target the static graph cannot name.
     """
     entries = json.loads(Path(compile_commands_path).read_text())
 
@@ -151,10 +233,34 @@ def _build_graph(compile_commands_path: str) -> dict[str, set[str]]:
             _die("opt did not produce merged.bc.callgraph.dot")
 
         dot_content = dot_path.read_text()
+
+        # Step 4: disassemble the linked module and scan for indirect
+        # (function-pointer) call sites.  These are invisible in the DOT
+        # but are exactly the points where the static graph is unsound, so
+        # we surface them to the caller.
+        indirect: set[str] = set()
+        merged_ll = os.path.join(tmp, "merged.ll")
+        r = subprocess.run(
+            ["llvm-dis", bc, "-o", merged_ll],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and os.path.exists(merged_ll):
+            indirect = _scan_indirect(Path(merged_ll).read_text())
+        else:
+            print("  WARN: llvm-dis failed; indirect call sites will not be "
+                  "flagged", file=sys.stderr)
+            for line in r.stderr.splitlines()[:3]:
+                print(f"    {line}", file=sys.stderr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    return _parse_dot(dot_content)
+    graph = _parse_dot(dot_content)
+
+    # Keep only flags for functions that survive the skip-prefix filter and
+    # actually appear as nodes, so the marker never dangles on a name the
+    # graph doesn't contain.
+    indirect = {f for f in indirect if f in graph}
+    return graph, indirect
 
 
 # ---------------------------------------------------------------------------
@@ -200,19 +306,25 @@ def _parse_dot(dot: str) -> dict[str, set[str]]:
 # Output formatters
 # ---------------------------------------------------------------------------
 
-def cmd_list(graph: dict[str, set[str]]) -> int:
+def cmd_list(graph: dict[str, set[str]], indirect: set[str]) -> int:
     for func in sorted(graph):
         callees = sorted(graph[func])
+        flag = f"  {INDIRECT_MARKER}" if func in indirect else ""
         if callees:
-            print(func)
+            print(f"{func}{flag}")
             for c in callees:
                 print(f"  → {c}")
+        elif func in indirect:
+            # Not a real leaf: it calls through a function pointer whose
+            # target the static graph cannot name.
+            print(f"{func}{flag}")
         else:
             print(f"{func}  [leaf]")
     return 0
 
 
-def cmd_from(graph: dict[str, set[str]], root: str, depth: int | None) -> int:
+def cmd_from(graph: dict[str, set[str]], indirect: set[str],
+             root: str, depth: int | None) -> int:
     if root not in graph:
         matches = [f for f in graph if root in f]
         if not matches:
@@ -232,11 +344,12 @@ def cmd_from(graph: dict[str, set[str]], root: str, depth: int | None) -> int:
 
     def _tree(func: str, indent: int, remaining) -> None:
         pad = "  " * indent
+        flag = f"  {INDIRECT_MARKER}" if func in indirect else ""
         if func in seen:
             print(f"{pad}{func}  [↑ see above]")
             return
         seen.add(func)
-        print(f"{pad}{func}")
+        print(f"{pad}{func}{flag}")
         if remaining == 0:
             if graph.get(func):
                 print(f"{pad}  … (depth limit reached)")
@@ -248,8 +361,16 @@ def cmd_from(graph: dict[str, set[str]], root: str, depth: int | None) -> int:
     return 0
 
 
-def cmd_dot(graph: dict[str, set[str]]) -> int:
+def cmd_dot(graph: dict[str, set[str]], indirect: set[str]) -> int:
     print('digraph callgraph {')
+    # Give functions with unresolved indirect call sites a distinct node
+    # style so they stand out when rendered, and emit a grep-friendly
+    # comment line for machine consumers (e.g. the plan generator).
+    for func in sorted(indirect):
+        f = func.replace('"', '\\"')
+        print(f'  // indirect-call-site: {func}')
+        print(f'  "{f}" [style=filled, fillcolor="#ffd6d6", '
+              f'tooltip="{INDIRECT_MARKER}"];')
     for func, callees in sorted(graph.items()):
         for callee in sorted(callees):
             f = func.replace('"', '\\"')
@@ -291,8 +412,8 @@ def main() -> None:
     if cmd == "list":
         if len(rest) != 1:
             _die("list requires exactly one argument: <compile_commands.json>")
-        graph = _build_graph(rest[0])
-        sys.exit(cmd_list(graph))
+        graph, indirect = _build_graph(rest[0])
+        sys.exit(cmd_list(graph, indirect))
 
     elif cmd == "from":
         if len(rest) < 2:
@@ -309,14 +430,14 @@ def main() -> None:
                 i += 2
             else:
                 _die(f"unknown argument '{rest[i]}'")
-        graph = _build_graph(cc)
-        sys.exit(cmd_from(graph, func, depth))
+        graph, indirect = _build_graph(cc)
+        sys.exit(cmd_from(graph, indirect, func, depth))
 
     elif cmd == "dot":
         if len(rest) != 1:
             _die("dot requires exactly one argument: <compile_commands.json>")
-        graph = _build_graph(rest[0])
-        sys.exit(cmd_dot(graph))
+        graph, indirect = _build_graph(rest[0])
+        sys.exit(cmd_dot(graph, indirect))
 
     else:
         _die(f"unknown subcommand '{cmd}'. Run with --help for usage.")
