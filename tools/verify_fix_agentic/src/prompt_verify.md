@@ -6,19 +6,16 @@ ground truth — the Rust code must produce byte-identical results.
 - `src/` contains the Rust translation
 
 The concrete mechanism you use to compare C against Rust — how you build each
-side and where you write the comparison — is described in **Step 2** below.
-Everything before it (PLAN.md, the HYPOTHESES.md discipline, the invariants)
-applies regardless of which comparison mechanism you use.
+side and where you write the comparison — is described in **Step 3** below.
+Everything before it (PLAN.md, the HYPOTHESES.md discipline, the surface
+files, the invariants) applies regardless of which comparison mechanism you
+use.
 
 ## Step 0: Read PLAN.md FIRST
 
 A previous translation agent left a file `PLAN.md` in this directory containing
 its design notes, parameter tables, decisions, and pitfalls it noticed during
-translation. **Before doing anything else**, run:
-
-```
-cat PLAN.md
-```
+translation. **Before doing anything else**, read `PLAN.md`.
 
 If `PLAN.md` exists, treat it as authoritative background. Do NOT re-derive
 project structure, module layout, Cargo features, parameter values, or
@@ -46,7 +43,7 @@ start of your work (right after reading `PLAN.md`) with this template:
 # Verification Hypotheses Log
 
 This is an append-only log of bug hypotheses I form while verifying the
-Rust translation. After every compaction I will `cat HYPOTHESES.md` first
+Rust translation. After every compaction I will read `HYPOTHESES.md` first
 thing to recover state.
 
 ## Invariants (do not drift across compactions)
@@ -59,7 +56,7 @@ These rules govern verification. They must survive every compaction unchanged.
 
 {WORKDIR_BOUNDARY}
 
-### AFTER ANY COMPACTION: `cat PLAN.md HYPOTHESES.md` is your FIRST action before anything.
+### AFTER ANY COMPACTION: read `PLAN.md` and `HYPOTHESES.md` is your first action before anything.
 
 ### Ground truth
 - The C code is the authoritative reference. Rust outputs must match C
@@ -90,6 +87,17 @@ These rules govern verification. They must survive every compaction unchanged.
 
 {ALL_CONFIGURATIONS}
 
+### Surface coverage and completion
+- `SYMBOLS.md`, `ERRORS.md`, and `CONFIGS.md` are the test plan. Every
+  `CONFIGS.md` row gets a differential test. Every `ERRORS.md` row gets a
+  rejection test that asserts both sides return the same error code or
+  sentinel value.
+- Verification is complete only when the `nm -D` symbol diff is empty, every
+  row of both tables has a passing test under every listed configuration, and
+  the final cross-review of `HYPOTHESES.md`, the test files, and the three
+  surface files finds no gap. Green tests on inputs you picked yourself are
+  not completion.
+
 ### Operational
 - Wrap every `cargo build`, `cargo test`, `cmake`, or other long-running
   command in `timeout 600` (or shorter). No single command should run > 600s.
@@ -102,6 +110,7 @@ Format per entry:
 ### H<N>: <one-line hypothesis>
 - Status: open | confirmed | refuted | fixed
 - Evidence: <how I think I know>
+- Coverage: <ERRORS.md #N / CONFIGS.md #M / test name; omit when not tied to a row or a test>
 - Files/lines suspected: <file path:line>
 - Action taken: <Edit/test/none yet>
 - Outcome: <what happened after the action>
@@ -155,6 +164,10 @@ Format per entry:
    Rule of thumb: if investigating or fixing a hypothesis would require
    reading more than ~200 lines of C or Rust into your own context,
    delegate the fix to a sub-agent and let it report back what it changed.
+9. **When a hypothesis is tied to a table row or a test, name both in its
+   Coverage field.** Example: `Coverage: ERRORS.md #7; Test Init.RejectNull`.
+   This is what the final cross-review (see the completion gate) checks, so an
+   entry without coverage data cannot be audited later.
 
 ### Recovery protocol (if you suspect you were just compacted)
 
@@ -162,9 +175,59 @@ Symptoms: you cannot recall what hypothesis you were testing, or your last
 turn looks like a summary rather than concrete work. In that case:
 
 1. `cat PLAN.md HYPOTHESES.md` first thing.
-2. Find the first hypothesis with status `open` or `confirmed` (but not
-   yet `fixed`). That is your current work item.
+2. Find the first hypothesis with status `open` or `confirmed` (but not yet
+   `fixed`). That is your current work item.
 3. Resume from its `Action taken` field. Do not redo work already logged.
+
+## Step 2: Map the verification surfaces
+
+Before you write any test, produce three files in the working directory.
+Together they are the test plan: tests cover their rows, and the completion
+gate checks them. Generate each file with a separate sub-agent. Build the C
+reference and the Rust `.so` first, then dispatch the three sub-agents in
+parallel. Each sub-agent reads `c_src/` and the built artifacts, and writes
+exactly one of the three files. Give each sub-agent the working-directory
+boundary rules from the Invariants section.
+
+1. `SYMBOLS.md`: the symbol surface. Run `nm -D` on both `.so` files. List
+   every public symbol of the C `.so`, and mark every symbol the Rust `.so`
+   does not export. For each missing symbol, record which case holds: the
+   implementation exists in Rust but is not exported, or the C source was
+   never translated. This sub-agent reports the diff. It does not change any
+   code. When the diff is not empty, dispatch a separate sub-agent to resolve
+   it (add the export, or translate the missing C source). Do not stub a
+   missing symbol to empty the diff. A stub that claims behavior is worse
+   than a missing symbol.
+2. `ERRORS.md`: the rejection surface of the C code. Grep the C source for
+   every distinct way a function rejects an input: error-return macros,
+   `return NULL`, negative sentinels, error enums, `assert`, range checks,
+   null checks, and size limits. Write one row per distinct rejection:
+
+   | # | function | trigger (the exact invalid input) | expected C result |
+   |---|----------|------------------------------------|-------------------|
+
+   Derive each row from what the C code checks. Do not invent rows and do not
+   copy them from documentation alone. Three error branches in one function
+   are three rows. Example row for a function that returns NULL on a null
+   argument: `| 7 | cfg_parse | s == NULL | NULL |`.
+3. `CONFIGS.md`: the configuration surface. It is the mirror of `ERRORS.md`
+   for valid inputs. Enumerate the axes the C code branches on. Cover every
+   option, mode, or flag the public API can set. Cover every input shape the
+   code special-cases: size classes, empty, one, many, boundary values,
+   element types. Cover every public entry point, including the lowest-level
+   ones and not only the convenience wrappers. Write one row per combination
+   the code treats differently:
+
+   | # | entry point(s) | configuration (options and input shape) | [ ] |
+   |---|----------------|------------------------------------------|-----|
+
+Step 3 tells you how to test. Every `CONFIGS.md` row gets a differential test
+on valid inputs, and every `ERRORS.md` row gets a rejection test. Also test
+the generic boundaries even when no row lists them: null pointers, zero and
+oversized lengths, values one step past a valid range, and enum arguments
+with no valid variant. The C code takes any int where an API declares an
+enum, and answers such calls through its default or error branch. Rust must
+answer the same way.
 
 {VERIFICATION_METHOD}
 
@@ -173,6 +236,19 @@ the 600-second timeout cap) live in the `## Invariants` section of your
 `HYPOTHESES.md` template above. Re-read them from `HYPOTHESES.md` whenever you
 are unsure — do not work from memory of this prompt.
 
+## Completion gate
+
+Work through this checklist before you declare verification complete. Passing
+tests on the inputs you happened to pick are not completion. Re-read this
+list after your last fix.
+
+- [ ] The `nm -D` symbol diff between the C `.so` and the Rust `.so` is empty.
+      `SYMBOLS.md` has no open missing-symbol rows.
+- [ ] A review sub-agent compared `HYPOTHESES.md`, the test files, and the
+      three surface files. It checked that every row has a test, that every
+      test maps back to a row or a logged hypothesis, and that every
+      `confirmed` or `fixed` hypothesis has a passing test. You resolved what
+      it reported before finishing.
 
 {AGENT_TOOLS_SECTION}
 

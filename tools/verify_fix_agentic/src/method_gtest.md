@@ -1,4 +1,4 @@
-## Step 2: Verification workflow (GoogleTest)
+## Step 3: Verification workflow (GoogleTest)
 
 You compare C against Rust from **inside a C++ GoogleTest binary**. A ready-to-use
 test environment has been placed in `verify_env/`. The C reference is compiled
@@ -61,19 +61,24 @@ Then do the actual verification:
    match byte-for-byte. A fixture (`TEST_F`) is the natural place to hold a
    library context across an `init -> configure -> call -> observe -> destroy`
    sequence, with a fresh context per test.
-3. Start with the lowest-level functions and work upward. Look at the C headers to
+3. Cover every row of the surface files from Step 2. Each `CONFIGS.md` row
+   gets a differential test, and each `ERRORS.md` row gets a rejection test.
+   The rejection test asserts that both sides return the same error code or
+   sentinel value, not only that both sides fail. Also test the generic
+   boundaries from Step 2: null pointers, zero and oversized lengths, values
+   one step past a valid range, and enum arguments with no valid variant.
+4. Start with the lowest-level functions and work upward. Look at the C headers to
    identify the public API and call hierarchy.
-4. Run the test binary. Every time a test exposes a divergence, append a
+5. Run the test binary. Every time a test exposes a divergence, append a
    hypothesis to `HYPOTHESES.md`.
-5. When a Rust function differs from C, fix the Rust code in `src/`, rebuild the
+6. When a Rust function differs from C, fix the Rust code in `src/`, rebuild the
    `.so`, and re-run until the test passes. Update the matching hypothesis to
    `fixed` after the Edit.
-6. Keep going until all public functions match.
-7. Compare `nm -D` on the C `.so` and the Rust `.so`. Every symbol the C `.so`
-   exports, the Rust `.so` must also export with the exact same name — including
-   symbols created by preprocessor macros. No exceptions. Add missing exports.
-   (The test binary links against the Rust exports by name, so a missing symbol
-   shows up immediately as an unresolved `dlsym`.)
+7. Keep going until all public functions match.
+8. Re-run the symbol comparison from `SYMBOLS.md` after your last change. The
+   diff must be empty before you finish. When you resolve a missing symbol,
+   follow the Step 2 rule: add the export if the implementation exists, or
+   translate the missing C source. Never add a stub.
 
 Normalize before comparing: pointer/allocator addresses, struct padding,
 uninitialized bytes, timestamps, and other nondeterministic fields are not

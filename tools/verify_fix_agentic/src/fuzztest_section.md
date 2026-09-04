@@ -22,6 +22,16 @@ under test has them:
   different code paths. Give the parameter a domain (below) so the fuzzer varies it and
   the coverage guidance can drive each branch.
 
+Pick the mechanism per area of the API. Broad valid-path areas belong in
+`FUZZ_TEST` properties, because the fuzzer explores them far beyond what
+hand-picked inputs reach. An error path also belongs in a property when its
+triggers are cheap to express as a domain: derive invalid sizes, buffer
+offsets, or enum values from fuzz input bytes and let the fuzzer sweep them
+against the rejection contract. When a trigger is too specific for a domain,
+write a fixed single-point `TEST` for that `ERRORS.md` row instead. Both
+mechanisms count as coverage of the row; pick whichever expresses the row
+with less harness code.
+
 Choose a domain that covers the legal range (see the domain
 guide below and, for anything not covered here, `verify_env/docs/`). Refer to the C documentation and implementation to determine the legal range of each parameter.
 
@@ -107,7 +117,7 @@ Because the campaign steers by the C reference and treats it as ground truth, a
 misbuilt C reference is especially damaging here: it will happily "find" a flood
 of failing inputs that are really the oracle's fault, not the translation's.
 Before starting a campaign, make sure the C side is compiled correctly (see the
-compile-definitions check in Step 2) — the instrumented, statically linked C in
+compile-definitions check in Step 3) — the instrumented, statically linked C in
 `c_under_test` must match how `c_src` is actually built.
 
 Crash handling: fuzzing runs in-process, so a segfault or abort on either side
