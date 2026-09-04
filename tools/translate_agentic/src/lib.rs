@@ -10,7 +10,7 @@ use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
 use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries};
+use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
@@ -164,6 +164,7 @@ impl Tool for TranslateAgentic {
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
             )
+            .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
             .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
             .replace("{AGENT_TOOLS_SECTION}", &agent_tools_section)
             .replace(
@@ -258,6 +259,9 @@ impl Tool for TranslateAgentic {
             );
         }
 
+        if let Err(e) = remove_worktree_dir(&translated) {
+            warn!("Failed to remove leftover worktree dir: {e}");
+        }
         for entry in collect_symlinks(&translated) {
             warn!("translated_rust contains symlink: {}", entry);
         }

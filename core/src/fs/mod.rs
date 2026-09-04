@@ -155,8 +155,9 @@ impl ReferenceGuard {
 }
 
 /// Removes hidden entries (names starting with `.`) under `dir`, including
-/// nested ones. Agentic tools call this before freezing an agent's working
-/// directory into the IR, so runtime artifacts like `.opencode/` or `.git/`
+/// nested ones, except the git work record: `.git` itself and the
+/// framework-written `.gitignore` stay. Agentic tools call this before freezing an agent's
+/// working directory into the IR, so runtime artifacts like `.opencode/`
 /// never enter a [RawDir].
 pub fn remove_hidden_entries(dir: &Path) -> io::Result<()> {
     let Ok(entries) = read_dir(dir) else {
@@ -164,7 +165,11 @@ pub fn remove_hidden_entries(dir: &Path) -> io::Result<()> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name();
+        if name == ".git" || name == ".gitignore" {
+            continue;
+        }
+        if name.to_string_lossy().starts_with('.') {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 if path.is_dir() {
                     tracing::warn!("Failed to remove hidden directory {}: {e}", path.display());
@@ -175,6 +180,17 @@ pub fn remove_hidden_entries(dir: &Path) -> io::Result<()> {
         } else if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
             remove_hidden_entries(&path)?;
         }
+    }
+    Ok(())
+}
+
+pub const WORKTREE_DIR: &str = "wt";
+
+/// Removes the leftover worktree-checkout directory.
+pub fn remove_worktree_dir(dir: &Path) -> io::Result<()> {
+    let worktrees = dir.join(WORKTREE_DIR);
+    if worktrees.exists() {
+        std::fs::remove_dir_all(&worktrees)?;
     }
     Ok(())
 }

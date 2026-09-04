@@ -493,6 +493,8 @@ fn extract_model_limits_from_output(
 }
 
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_workdir_git(invocation.work_dir);
+
     prepare_agent_files(&invocation)?;
 
     let logs_dir = invocation
@@ -1492,9 +1494,107 @@ fn write_opencode_agent(
     Ok(())
 }
 
+const GIT_DISCIPLINE_BODY: &str = include_str!("git_discipline.md");
+
+pub fn git_discipline() -> &'static str {
+    GIT_DISCIPLINE_BODY.trim_end()
+}
+
+/// Prepare the agent working directory as a git repository. A fresh
+/// directory gets `git init`, a local identity (agents run without a global
+/// git config), a `.gitignore` that keeps build outputs and worktrees
+/// untracked, and a baseline commit. An existing repository only has stale
+/// worktree metadata pruned, so a resumed stage keeps its history.
+pub fn ensure_workdir_git(work_dir: &Path) {
+    let git = |args: &[&str]| -> Result<ExitStatus, std::io::Error> {
+        Command::new("git")
+            .args(args)
+            .current_dir(work_dir)
+            .status()
+    };
+    let ok = |args: &[&str], what: &str| {
+        if let Err(e) = git(args) {
+            warn!("git {what} failed in {}: {e}", work_dir.display());
+        }
+    };
+
+    if work_dir.join(".git").exists() {
+        ok(&["worktree", "prune"], "worktree prune");
+        return;
+    }
+    match git(&["init", "-b", "main"]) {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            warn!(
+                "git init exited with {status} in {}: continuing without git",
+                work_dir.display()
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "git unavailable in {}: {e}; continuing without the git work record",
+                work_dir.display()
+            );
+            return;
+        }
+    }
+    ok(&["config", "user.name", "harvest-agent"], "config user.name");
+    ok(
+        &["config", "user.email", "harvest-agent@invalid"],
+        "config user.email",
+    );
+    if let Err(e) = fs::write(
+        work_dir.join(".gitignore"),
+        "# Framework-written: build outputs and worktrees stay untracked.\ntarget/\nbuild*/\ncbuild/\nwt/\n.opencode/\n",
+    ) {
+        warn!(
+            "failed to write .gitignore in {}: {e}",
+            work_dir.display()
+        );
+    }
+    ok(&["add", "-A"], "add");
+    ok(
+        &["commit", "-m", "framework: baseline before agent run"],
+        "baseline commit",
+    );
+    info!("initialized git work record in {}", work_dir.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_workdir_git_creates_repo_and_stays_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("src.txt"), "content").expect("write file");
+        ensure_workdir_git(dir.path());
+        assert!(dir.path().join(".git").is_dir(), "repository initialized");
+        assert!(dir.path().join(".gitignore").is_file(), "gitignore written");
+        let log = String::from_utf8(
+            Command::new("git")
+                .args(["log", "--oneline"])
+                .current_dir(dir.path())
+                .output()
+                .expect("git log")
+                .stdout,
+        )
+        .expect("utf8");
+        assert!(log.contains("baseline"), "baseline commit present: {log}");
+        // Second call must not re-init or add a second commit.
+        ensure_workdir_git(dir.path());
+        let count = String::from_utf8(
+            Command::new("git")
+                .args(["rev-list", "--count", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .expect("rev-list")
+                .stdout,
+        )
+        .expect("utf8");
+        assert_eq!(count.trim(), "1", "no extra commit on re-ensure");
+    }
 
     #[test]
     fn claude_ccr_detection_requires_comma_model() {

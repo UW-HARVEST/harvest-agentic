@@ -185,6 +185,9 @@ When in doubt, re-read this section.
   function's return value is defined by the API contract as a compile-time
   constant.
 
+### Git discipline
+{GIT_DISCIPLINE}
+
 {AGENT_TOOLS_SECTION}
 
 ## Codebase summary

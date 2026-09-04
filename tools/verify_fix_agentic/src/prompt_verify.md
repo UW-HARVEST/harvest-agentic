@@ -102,6 +102,9 @@ These rules govern verification. They must survive every compaction unchanged.
   `CONDITIONALS.md` region is settled, and the final cross-review finds no
   gap. Green tests on inputs you picked yourself are not completion.
 
+### Git discipline
+{GIT_DISCIPLINE}
+
 ### Operational
 - Wrap every `cargo build`, `cargo test`, `cmake`, or other long-running
   command in `timeout 600` (or shorter). No single command should run > 600s.
@@ -194,9 +197,7 @@ boundary rules from the Invariants section.
 
 Dispatch in two waves. Dispatch `SYMBOLS.md` and `CONDITIONALS.md` in
 parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
-`CONFIGS.md`, and the cfg completeness check in parallel. The check may fix
-`src/`. The two generators only read `c_src/`. The three do not write to the
-same files.
+`CONFIGS.md`, and the cfg completeness check in parallel.
 
 1. `SYMBOLS.md`: the symbol surface. Run `nm -D` on both `.so` files. List
    every public symbol of the C `.so`, and mark every symbol the Rust `.so`
@@ -263,8 +264,7 @@ same files.
    to one branch with the resolution recorded in `CONDITIONALS.md`. A region
    that is reachable under some legal build configuration must not be
    dropped. When the check finds a dropped or mistranslated region, it fixes
-   `src/` and rebuilds. It is the only sub-agent writing to `src/` at that
-   moment.
+   `src/` and rebuilds.
 
 Step 3 tells you how to test. Every `CONFIGS.md` row gets a differential test
 on valid inputs, and every `ERRORS.md` row gets a rejection test. Also test

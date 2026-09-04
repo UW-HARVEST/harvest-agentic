@@ -10,7 +10,7 @@ use agent_runner::{AgentInvocation, AgentPhase};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cmake_presets::{TestConfig, find_test_config};
 use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries};
+use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
@@ -169,6 +169,7 @@ impl Tool for VerifyFixAgentic {
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
             )
+            .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
             .replace("{CMAKE_BUILD_FLAGS}", &test_config.cmake_flags)
             .replace("{ALL_CONFIGURATIONS}", &render_configurations(&test_config))
             .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
@@ -322,6 +323,9 @@ impl Tool for VerifyFixAgentic {
             );
         }
 
+        if let Err(e) = remove_worktree_dir(&translated) {
+            warn!("Failed to remove leftover worktree dir: {e}");
+        }
         // Keep the gtest/fuzztest verification environment in the frozen output
         // (like the libloading tests/ dir) so it is available for inspection,
         // but strip its build directories (build-*), which hold the fetched

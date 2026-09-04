@@ -26,7 +26,7 @@
 use agent_runner::{AgentInvocation, AgentPhase};
 use full_source::{CargoPackage, ExternalTestSuite, RawSource, TestSuiteKind};
 use harvest_core::config::unknown_field_warning;
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries};
+use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
@@ -178,6 +178,7 @@ impl Tool for ConformAgentic {
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
             )
+            .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
             .replace(
                 "{CONFORM_TEST_INSTRUCTIONS}",
                 &test_instructions(suite.kind, &rust_toolchain_context.required_version),
@@ -235,6 +236,9 @@ impl Tool for ConformAgentic {
                 "Failed to remove {} before freeze: {e}",
                 target_out.display()
             );
+        }
+        if let Err(e) = remove_worktree_dir(&translated) {
+            warn!("Failed to remove leftover worktree dir: {e}");
         }
         for entry in collect_symlinks(&translated) {
             warn!("translated_rust contains symlink: {}", entry);
