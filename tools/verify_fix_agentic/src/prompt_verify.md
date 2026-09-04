@@ -88,15 +88,19 @@ These rules govern verification. They must survive every compaction unchanged.
 {ALL_CONFIGURATIONS}
 
 ### Surface coverage and completion
-- `SYMBOLS.md`, `ERRORS.md`, and `CONFIGS.md` are the test plan. Every
-  `CONFIGS.md` row gets a differential test. Every `ERRORS.md` row gets a
-  rejection test that asserts both sides return the same error code or
-  sentinel value.
+- `SYMBOLS.md`, `CONDITIONALS.md`, `ERRORS.md`, and `CONFIGS.md` are the test
+  plan. Every `CONFIGS.md` row gets a differential test. Every `ERRORS.md`
+  row gets a rejection test that asserts both sides return the same error
+  code or sentinel value.
+- Every region in `CONDITIONALS.md` is settled: conditional compilation in
+  Rust, or a resolution to one branch with recorded evidence.
+- An untested row or an inactive-branch judgment carries evidence: an
+  experiment, a definition-site grep, or a premise in `CONDITIONALS.md`.
+  Reading alone is not evidence.
 - Verification is complete only when the `nm -D` symbol diff is empty, every
-  row of both tables has a passing test under every listed configuration, and
-  the final cross-review of `HYPOTHESES.md`, the test files, and the three
-  surface files finds no gap. Green tests on inputs you picked yourself are
-  not completion.
+  row has a passing test under every listed configuration, every
+  `CONDITIONALS.md` region is settled, and the final cross-review finds no
+  gap. Green tests on inputs you picked yourself are not completion.
 
 ### Operational
 - Wrap every `cargo build`, `cargo test`, `cmake`, or other long-running
@@ -110,7 +114,7 @@ Format per entry:
 ### H<N>: <one-line hypothesis>
 - Status: open | confirmed | refuted | fixed
 - Evidence: <how I think I know>
-- Coverage: <ERRORS.md #N / CONFIGS.md #M / test name; omit when not tied to a row or a test>
+- Coverage: <ERRORS.md #N / CONFIGS.md #M / CONDITIONALS.md #K / test name; omit when not tied to a row or a test>
 - Files/lines suspected: <file path:line>
 - Action taken: <Edit/test/none yet>
 - Outcome: <what happened after the action>
@@ -181,13 +185,18 @@ turn looks like a summary rather than concrete work. In that case:
 
 ## Step 2: Map the verification surfaces
 
-Before you write any test, produce three files in the working directory.
+Before you write any test, produce four files in the working directory.
 Together they are the test plan: tests cover their rows, and the completion
-gate checks them. Generate each file with a separate sub-agent. Build the C
-reference and the Rust `.so` first, then dispatch the three sub-agents in
-parallel. Each sub-agent reads `c_src/` and the built artifacts, and writes
-exactly one of the three files. Give each sub-agent the working-directory
+gate checks them. Build the C reference and the Rust `.so` first. Generate
+each file with a separate sub-agent. Each sub-agent reads `c_src/` and the
+built artifacts, writes exactly one file, and gets the working-directory
 boundary rules from the Invariants section.
+
+Dispatch in two waves. Dispatch `SYMBOLS.md` and `CONDITIONALS.md` in
+parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
+`CONFIGS.md`, and the cfg completeness check in parallel. The check may fix
+`src/`. The two generators only read `c_src/`. The three do not write to the
+same files.
 
 1. `SYMBOLS.md`: the symbol surface. Run `nm -D` on both `.so` files. List
    every public symbol of the C `.so`, and mark every symbol the Rust `.so`
@@ -198,7 +207,32 @@ boundary rules from the Invariants section.
    it (add the export, or translate the missing C source). Do not stub a
    missing symbol to empty the diff. A stub that claims behavior is worse
    than a missing symbol.
-2. `ERRORS.md`: the rejection surface of the C code. Grep the C source for
+2. `CONDITIONALS.md`: the conditional-compilation surface. Collect every
+   macro that `#if`, `#else` and other variants reference in `c_src/`, deduplicated. Skip
+   macros used only in system headers. Classify each macro:
+   - feature: the user sets it at build time, with `-D` or a CMake option.
+   - sys: the environment fixes it. A direct flag comes from the toolchain
+     or the operating system. An indirect flag comes from a measurement,
+     such as pointer width or byte order.
+   - constant: an in-source unconditional `#define` fixes it.
+
+   | macro | class (feature / sys / constant) | evidence |
+   |-------|----------------------------------|----------|
+
+   List every conditional region with its nesting and its activation premise,
+   written as an expression over the macros:
+
+   | # | location | activation premise |
+   |---|----------|---------------------|
+
+   Every class and every premise names its evidence in the row: a
+   definition-site grep hit, or a compile probe that prints the macro value
+   under the project build flags. Example: a source has `#ifndef FOO_ALIGN`
+   and then `#define FOO_ALIGN 1`. The macro is defined with value 1 by
+   default, so an `#if FOO_ALIGN` region is active unless the user overrides
+   the macro at build time. Do not decide that a branch is inactive from
+   reading alone.
+3. `ERRORS.md`: the rejection surface of the C code. Grep the C source for
    every distinct way a function rejects an input: error-return macros,
    `return NULL`, negative sentinels, error enums, `assert`, range checks,
    null checks, and size limits. Write one row per distinct rejection:
@@ -208,18 +242,29 @@ boundary rules from the Invariants section.
 
    Derive each row from what the C code checks. Do not invent rows and do not
    copy them from documentation alone. Three error branches in one function
-   are three rows. Example row for a function that returns NULL on a null
-   argument: `| 7 | cfg_parse | s == NULL | NULL |`.
-3. `CONFIGS.md`: the configuration surface. It is the mirror of `ERRORS.md`
-   for valid inputs. Enumerate the axes the C code branches on. Cover every
-   option, mode, or flag the public API can set. Cover every input shape the
-   code special-cases: size classes, empty, one, many, boundary values,
-   element types. Cover every public entry point, including the lowest-level
-   ones and not only the convenience wrappers. Write one row per combination
-   the code treats differently:
+   are three rows. When a rejection sits behind a conditional, write its
+   premise from `CONDITIONALS.md` in the trigger column. Example row for a
+   function that returns NULL on a null argument:
+   `| 7 | cfg_parse | s == NULL | NULL |`.
+4. `CONFIGS.md`: the configuration surface. It is the mirror of `ERRORS.md`
+   for valid inputs. Enumerate the axes the C code branches on. Use the
+   feature-class macros from `CONDITIONALS.md` as configuration axes. Cover
+   every option, mode, or flag the public API can set. Cover every input
+   shape the code special-cases: size classes, empty, one, many, boundary
+   values, element types. Cover every public entry point, including the
+   lowest-level ones and not only the convenience wrappers. Write one row per
+   combination the code treats differently:
 
    | # | entry point(s) | configuration (options and input shape) | [ ] |
    |---|----------------|------------------------------------------|-----|
+5. The cfg completeness check runs as its own sub-agent after
+   `CONDITIONALS.md` is complete. For each region, it confirms one of two
+   cases in `src/`: a matching conditional exists, or the region is resolved
+   to one branch with the resolution recorded in `CONDITIONALS.md`. A region
+   that is reachable under some legal build configuration must not be
+   dropped. When the check finds a dropped or mistranslated region, it fixes
+   `src/` and rebuilds. It is the only sub-agent writing to `src/` at that
+   moment.
 
 Step 3 tells you how to test. Every `CONFIGS.md` row gets a differential test
 on valid inputs, and every `ERRORS.md` row gets a rejection test. Also test
@@ -228,6 +273,11 @@ oversized lengths, values one step past a valid range, and enum arguments
 with no valid variant. The C code takes any int where an API declares an
 enum, and answers such calls through its default or error branch. Rust must
 answer the same way.
+
+A row you cannot test stays in the table, unchecked, with a note. The note
+carries evidence: an experiment that did not trigger the row, or a premise
+from `CONDITIONALS.md` that shows the branch is inactive. A judgment made
+from reading alone is not evidence.
 
 {VERIFICATION_METHOD}
 
@@ -245,10 +295,11 @@ list after your last fix.
 - [ ] The `nm -D` symbol diff between the C `.so` and the Rust `.so` is empty.
       `SYMBOLS.md` has no open missing-symbol rows.
 - [ ] A review sub-agent compared `HYPOTHESES.md`, the test files, and the
-      three surface files. It checked that every row has a test, that every
-      test maps back to a row or a logged hypothesis, and that every
-      `confirmed` or `fixed` hypothesis has a passing test. You resolved what
-      it reported before finishing.
+      four surface files. It checked that every row has a test, that every
+      test maps back to a row or a logged hypothesis, that every
+      `confirmed` or `fixed` hypothesis has a passing test, and that every
+      unchecked-row note carries evidence. You resolved what it reported
+      before finishing.
 
 {AGENT_TOOLS_SECTION}
 
