@@ -1510,7 +1510,8 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         Command::new("git")
             .args(args)
             .current_dir(work_dir)
-            .status()
+            .output()
+            .map(|out| out.status)
     };
     let ok = |args: &[&str], what: &str| {
         if let Err(e) = git(args) {
@@ -1522,7 +1523,7 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         ok(&["worktree", "prune"], "worktree prune");
         return;
     }
-    match git(&["init", "-b", "main"]) {
+    match git(&["init", "-q", "-b", "main"]) {
         Ok(status) if status.success() => {}
         Ok(status) => {
             warn!(
@@ -1555,7 +1556,7 @@ pub fn ensure_workdir_git(work_dir: &Path) {
     }
     ok(&["add", "-A"], "add");
     ok(
-        &["commit", "-m", "framework: baseline before agent run"],
+        &["commit", "-q", "-m", "framework: baseline before agent run"],
         "baseline commit",
     );
     info!("initialized git work record in {}", work_dir.display());
