@@ -10,7 +10,9 @@ use agent_runner::{AgentInvocation, AgentPhase};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cmake_presets::{TestConfig, find_test_config};
 use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
+use harvest_core::fs::{
+    RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
+};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
@@ -28,8 +30,8 @@ const PROMPT_VERIFY_NO_PLAN_FILE: &str = include_str!("prompt_verify_no_plan_fil
 /// `{VERIFICATION_METHOD}` slot (see `load_verify_prompt`).
 const METHOD_LIBLOADING: &str = include_str!("method_libloading.md");
 const METHOD_GTEST: &str = include_str!("method_gtest.md");
-/// FuzzTest guidance spliced into the gtest method's `{FUZZTEST_SECTION}` slot
-/// when fuzzing is enabled; replaced with empty string otherwise.
+/// FuzzTest instructions inserted into the gtest method only when
+/// fuzzing is enabled.
 const FUZZTEST_SECTION: &str = include_str!("fuzztest_section.md");
 
 /// Directory (inside translated_rust/) holding the gtest/fuzztest verification
@@ -47,7 +49,9 @@ const VE_DIFF_H: &str = include_str!("verify_env_template/harvest_diff.h");
 const VE_RUST_LIB_H: &str = include_str!("verify_env_template/rust_lib.h");
 const VE_BUILD_SH: &str = include_str!("verify_env_template/build.sh");
 const VE_BUILD_FUZZ_SH: &str = include_str!("verify_env_template/build_fuzz.sh");
+const VE_RUN_FUZZ_SH: &str = include_str!("verify_env_template/run_fuzz.sh");
 const VE_README: &str = include_str!("verify_env_template/README.md");
+const VE_README_FUZZ: &str = include_str!("verify_env_template/README_fuzz.md");
 
 // Vendored FuzzTest reference docs (Apache-2.0), materialized under
 // verify_env/docs/ only in fuzz mode for the agent to read on demand.
@@ -355,9 +359,7 @@ impl Tool for VerifyFixAgentic {
     }
 }
 
-/// Builds the verification-method section (`{VERIFICATION_METHOD}` slot of the
-/// standard prompt) for the selected harness, splicing in the FuzzTest guidance
-/// when fuzzing is enabled.
+/// Builds the verification method, including FuzzTest guidance when enabled.
 fn build_method_section(config: &Config) -> String {
     match config.verify_harness {
         VerifyHarness::Gtest => {
@@ -453,10 +455,14 @@ fn materialize_verify_env(
     fs::write(env_dir.join("verification_tests.cc"), VE_TESTS_CC)?;
     fs::write(env_dir.join("harvest_diff.h"), VE_DIFF_H)?;
     fs::write(env_dir.join("rust_lib.h"), VE_RUST_LIB_H)?;
-    fs::write(env_dir.join("README.md"), VE_README)?;
+    fs::write(
+        env_dir.join("README.md"),
+        VE_README.replace("{FUZZTEST_README}", if fuzz { VE_README_FUZZ } else { "" }),
+    )?;
     write_script(&env_dir.join("build.sh"), VE_BUILD_SH)?;
     if fuzz {
         write_script(&env_dir.join("build_fuzz.sh"), VE_BUILD_FUZZ_SH)?;
+        write_script(&env_dir.join("run_fuzz.sh"), VE_RUN_FUZZ_SH)?;
         // Vendored FuzzTest reference docs for on-demand reading (fuzz only).
         let docs_dir = env_dir.join("docs");
         fs::create_dir_all(&docs_dir)?;
@@ -655,6 +661,166 @@ impl Config {
 mod tests {
     use super::*;
 
+    // Exercise the Linux runner with small shell stand-ins, without FuzzTest,
+    // Python, a systemd user manager, or large allocations. Miri cannot spawn.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    mod fuzz_runner {
+        use super::*;
+        use std::process::Command;
+
+        fn fixture() -> tempfile::TempDir {
+            let tmp = tempfile::Builder::new()
+                .prefix("fuzz runner ")
+                .tempdir()
+                .unwrap();
+            let root = tmp.path();
+            fs::create_dir(root.join("build-fuzz")).unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            fs::write(root.join("fake rust.so"), "").unwrap();
+            write_script(&root.join("run_fuzz.sh"), VE_RUN_FUZZ_SH).unwrap();
+            write_script(
+                &root.join("build-fuzz/verification_tests"),
+                r#"#!/bin/sh
+printf '%s\n' "$@" > "$OBSERVED"
+exit "$FAKE_EXIT"
+"#,
+            )
+            .unwrap();
+            write_script(
+                &root.join("bin/systemd-run"),
+                r#"#!/bin/sh
+printf '%s\n' "$@" > "$SCOPE_ARGS"
+exit 86
+"#,
+            )
+            .unwrap();
+            tmp
+        }
+
+        fn command(root: &Path) -> Command {
+            let mut cmd = Command::new("timeout");
+            cmd.args(["--kill-after=1s", "10s", "bash"])
+                .arg(root.join("run_fuzz.sh"))
+                .arg("Suite.Property")
+                .current_dir(root);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("FUZZ_") {
+                    cmd.env_remove(key);
+                }
+            }
+            let mut paths = vec![root.join("bin")];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            cmd.env("PATH", std::env::join_paths(paths).unwrap())
+                .env("RUST_LIB_PATH", root.join("fake rust.so"))
+                .env("OBSERVED", root.join("observed"))
+                .env("SCOPE_ARGS", root.join("scope_args"))
+                .env("FAKE_EXIT", "0")
+                .env("FUZZ_HARD_LIMIT_MB", "0");
+            cmd
+        }
+
+        #[test]
+        fn budgets_use_runner_defaults_and_environment_overrides() {
+            let tmp = fixture();
+            let root = tmp.path();
+            let output = command(root).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                fs::read_to_string(root.join("observed")).unwrap(),
+                "--fuzz=Suite.Property\n--fuzz_for=300s\n--rss_limit_mb=2048\n--time_limit_per_input=10s\n"
+            );
+
+            fs::write(
+                root.join("run_fuzz.sh"),
+                VE_RUN_FUZZ_SH.replace(":-2048", ":-1024"),
+            )
+            .unwrap();
+            assert!(command(root).output().unwrap().status.success());
+            assert!(
+                fs::read_to_string(root.join("observed"))
+                    .unwrap()
+                    .contains("--rss_limit_mb=1024\n")
+            );
+
+            let output = command(root)
+                .env("FUZZ_RSS_LIMIT_MB", "512")
+                .env("FUZZ_DURATION_SECONDS", "30")
+                .env("FUZZ_INPUT_TIMEOUT_SECONDS", "2")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                fs::read_to_string(root.join("observed")).unwrap(),
+                "--fuzz=Suite.Property\n--fuzz_for=30s\n--rss_limit_mb=512\n--time_limit_per_input=2s\n"
+            );
+        }
+
+        #[test]
+        fn failure_exit_code_survives_logging() {
+            let tmp = fixture();
+            let output = command(tmp.path()).env("FAKE_EXIT", "42").output().unwrap();
+            assert_eq!(output.status.code(), Some(42), "{output:?}");
+            let artifacts = fs::read_dir(tmp.path().join("fuzz-artifacts"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert_eq!(
+                fs::read_to_string(artifacts.join("exit_status")).unwrap(),
+                "42\n"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("incomplete"));
+        }
+
+        #[test]
+        fn invalid_configuration_never_starts_binary() {
+            let tmp = fixture();
+            for (name, value) in [
+                ("FUZZ_RSS_LIMIT_MB", "0"),
+                ("FUZZ_RSS_LIMIT_MB", "-1"),
+                ("FUZZ_RSS_LIMIT_MB", "99999999999999999"),
+                ("FUZZ_DURATION_SECONDS", "inf"),
+                ("FUZZ_INPUT_TIMEOUT_SECONDS", "0"),
+                ("FUZZ_HARD_LIMIT_MB", "2048"),
+                ("RUST_LIB_PATH", "relative.so"),
+            ] {
+                let output = command(tmp.path()).env(name, value).output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{name}={value}: {output:?}");
+                assert!(!tmp.path().join("observed").exists());
+            }
+            let output = command(tmp.path())
+                .arg("--rss_limit_mb=0")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(!tmp.path().join("observed").exists());
+        }
+
+        #[test]
+        fn cgroup_failure_never_falls_back() {
+            let tmp = fixture();
+            let output = command(tmp.path())
+                .env_remove("FUZZ_HARD_LIMIT_MB")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(86), "{output:?}");
+            assert!(!tmp.path().join("observed").exists());
+            let args = fs::read_to_string(tmp.path().join("scope_args")).unwrap();
+            for expected in [
+                "MemoryMax=3072M",
+                "MemorySwapMax=0",
+                "--kill-after=5s",
+                "330s",
+            ] {
+                assert!(
+                    args.lines().any(|arg| arg == expected),
+                    "missing {expected}: {args}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn parses_lz4_style_compile_defs() {
         let cmake = "\
@@ -699,8 +865,20 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         let cml = fs::read_to_string(translated.join("verify_env/CMakeLists.txt")).unwrap();
         assert!(cml.contains("XXH_NAMESPACE=LZ4_"));
         assert!(cml.contains("GTest::gtest_main"));
-        assert!(!cml.contains("fuzztest"));
+        assert!(!cml.to_ascii_lowercase().contains("fuzz"));
         assert!(!translated.join("verify_env/build_fuzz.sh").exists());
+        assert!(!translated.join("verify_env/run_fuzz.sh").exists());
+        // Inspect every delivered file, not only CMake: comments and README
+        // text must not reveal the optional mechanism to the control agent.
+        for entry in fs::read_dir(translated.join("verify_env")).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(path.is_file(), "unexpected scaffold directory: {path:?}");
+            assert!(!path.file_name().unwrap().to_string_lossy().contains("fuzz"));
+            let text = fs::read_to_string(&path).unwrap().to_ascii_lowercase();
+            for hint in ["fuzz", "coverage-guided", "property-based"] {
+                assert!(!text.contains(hint), "{path:?} reveals {hint}");
+            }
+        }
     }
 
     // Escape hatch for the manual integration check: when VE_OUT is set,
@@ -720,6 +898,12 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         let env = tmp.path().join("verify_env");
         fs::create_dir_all(env.join("build-test/_deps")).unwrap();
         fs::create_dir_all(env.join("build-fuzz")).unwrap();
+        fs::create_dir_all(env.join("fuzz-artifacts/example/reproducers")).unwrap();
+        fs::write(
+            env.join("fuzz-artifacts/example/reproducers/input"),
+            "repro",
+        )
+        .unwrap();
         fs::write(env.join("verification_tests.cc"), "// test").unwrap();
         fs::write(env.join("CMakeLists.txt"), "# cmake").unwrap();
         fs::write(env.join("build-test/_deps/junk.o"), "junk").unwrap();
@@ -730,6 +914,10 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(env.join("CMakeLists.txt").exists());
         assert!(!env.join("build-test").exists());
         assert!(!env.join("build-fuzz").exists());
+        assert!(
+            env.join("fuzz-artifacts/example/reproducers/input")
+                .exists()
+        );
     }
 
     #[test]
@@ -751,5 +939,31 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(cml.contains(FUZZTEST_GIT_TAG));
         assert!(!cml.contains("GTest::gtest_main"));
         assert!(translated.join("verify_env/build_fuzz.sh").exists());
+        assert!(translated.join("verify_env/run_fuzz.sh").exists());
+    }
+
+    #[test]
+    fn disabled_fuzz_is_not_disclosed_in_builtin_prompts() {
+        for agent in [AgentKind::Claude, AgentKind::OpenCode, AgentKind::Kiro] {
+            for harness in ["gtest", "libloading"] {
+                for mode in ["standard", "no_plan", "no_plan_file"] {
+                    let config: Config = serde_json::from_value(serde_json::json!({
+                        "fuzz": false, "verify_harness": harness,
+                        "no_plan": mode == "no_plan",
+                        "no_plan_file": mode == "no_plan_file",
+                    }))
+                    .unwrap();
+                    let prompt = load_verify_prompt(&config, agent)
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    for hint in ["fuzz", "coverage-guided", "property-based"] {
+                        assert!(
+                            !prompt.contains(hint),
+                            "{agent:?}/{harness}/{mode} reveals {hint}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

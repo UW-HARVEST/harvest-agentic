@@ -28,7 +28,7 @@ names (e.g. `LZ4_compress_default`). That is why the C side is linked statically
 and the Rust side is reached only through `dlopen`/`dlsym` — never link the Rust
 `.so` directly into the test binary.
 
-A GoogleTest file can mix ordinary fixed-input tests with property-style tests:
+Write fixed-input differential tests with GoogleTest:
 
 ```cpp
 #include "gtest/gtest.h"
