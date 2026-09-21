@@ -361,21 +361,31 @@ def cmd_from(graph: dict[str, set[str]], indirect: set[str],
     return 0
 
 
+def _dot_safe(name: str) -> str:
+    """
+    Make a function name safe to embed in DOT / the SVG it renders to.
+    Strips control characters (which are invalid in XML/SVG and cause
+    'invalid xmlChar value' errors downstream) and escapes double quotes.
+    """
+    name = re.sub(r'[\x00-\x1f\x7f]', '', name)
+    return name.replace('"', '\\"')
+
+
 def cmd_dot(graph: dict[str, set[str]], indirect: set[str]) -> int:
     print('digraph callgraph {')
     # Give functions with unresolved indirect call sites a distinct node
     # style so they stand out when rendered, and emit a grep-friendly
     # comment line for machine consumers (e.g. the plan generator).
     for func in sorted(indirect):
-        f = func.replace('"', '\\"')
-        print(f'  // indirect-call-site: {func}')
+        f = _dot_safe(func)
+        # Sanitize the comment line too — a stray control byte here would
+        # also end up in the file a machine consumer greps.
+        print(f'  // indirect-call-site: {f}')
         print(f'  "{f}" [style=filled, fillcolor="#ffd6d6", '
               f'tooltip="{INDIRECT_MARKER}"];')
     for func, callees in sorted(graph.items()):
         for callee in sorted(callees):
-            f = func.replace('"', '\\"')
-            c = callee.replace('"', '\\"')
-            print(f'  "{f}" -> "{c}";')
+            print(f'  "{_dot_safe(func)}" -> "{_dot_safe(callee)}";')
     print('}')
     return 0
 
