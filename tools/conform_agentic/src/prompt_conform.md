@@ -81,6 +81,9 @@ test, your hypothesis for the cause, the fix, and the outcome.
   context above). If a different version is active, stop and report an
   environment problem rather than treating failures as translation bugs.
 
+### Git discipline
+{GIT_DISCIPLINE}
+
 ## Log
 ### C<N>: <failing test> — <one-line hypothesis>
 - Status: open | fixed | refuted

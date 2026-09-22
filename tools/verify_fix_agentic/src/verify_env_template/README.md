@@ -17,8 +17,6 @@ test binary; the translated Rust cdylib is loaded as a black box via `dlopen`.
 - `rust_lib.h` — loads the translated `.so` (path from `RUST_LIB_PATH`) with
   `RTLD_LOCAL` and resolves symbols.
 - `build.sh` — build in unit-test mode.
-- `build_fuzz.sh`, `docs/` — present only when fuzzing is enabled: the fuzzing
-  build script and the vendored official FuzzTest reference docs (Apache-2.0).
 
 ## Build and run
 
@@ -37,3 +35,5 @@ RUST_LIB_PATH=$(pwd)/../target/release/lib<crate>.so ./build-test/verification_t
 The C and Rust sides export the same public symbol names; that is why the C side
 is linked statically and the Rust side is reached only through `dlopen`/`dlsym`.
 A symbol the Rust `.so` fails to export shows up immediately as a failed lookup.
+
+{FUZZTEST_README}

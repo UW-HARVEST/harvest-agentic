@@ -22,6 +22,16 @@ under test has them:
   different code paths. Give the parameter a domain (below) so the fuzzer varies it and
   the coverage guidance can drive each branch.
 
+Pick the mechanism per area of the API. Broad valid-path areas belong in
+`FUZZ_TEST` properties, because the fuzzer explores them far beyond what
+hand-picked inputs reach. An error path also belongs in a property when its
+triggers are cheap to express as a domain: derive invalid sizes, buffer
+offsets, or enum values from fuzz input bytes and let the fuzzer sweep them
+against the rejection contract. When a trigger is too specific for a domain,
+write a fixed single-point `TEST` for that `ERRORS.md` row instead. Both
+mechanisms count as coverage of the row; pick whichever expresses the row
+with less harness code.
+
 Choose a domain that covers the legal range (see the domain
 guide below and, for anything not covered here, `verify_env/docs/`). Refer to the C documentation and implementation to determine the legal range of each parameter.
 
@@ -75,30 +85,39 @@ Two build modes (use separate build directories — do not toggle the flag in pl
 
   ```
   RUST_LIB_PATH=<abs path to the Rust .so> \
-    ./build-fuzz/verification_tests --fuzz=CompressDifferential.CompressEquivalent
+    ./verify_env/run_fuzz.sh CompressDifferential.CompressEquivalent
   ```
 
-  or time-box every property with `--fuzz_for=30s`. See `verify_env/README.md`.
+  Run this from the project directory. `verify_env/README.md` describes budgets,
+  environment overrides, system prerequisites, and saved artifacts.
 
 Running discipline — a `FUZZ_TEST` is not exercised until you run a real
 campaign:
 
+- Run fuzz campaigns through `verify_env/run_fuzz.sh Suite.Property`, one at a
+  time. Adjust budgets in the configuration block at the top of that script
+  or through its environment variables; record effective budgets, changes,
+  and reasons in HYPOTHESES.md. Do not bypass resource limits to make an OOM disappear.
+- OOM, timeout, signal termination, or a failed launcher is an incomplete
+  campaign. Keep the log and file reproducer under
+  `verify_env/fuzz-artifacts/`. See `verify_env/README.md` for execution details.
 - Running the ordinary test binary (unit-test mode) only samples each
   `FUZZ_TEST` for about a second with no coverage feedback — a smoke check, not
   fuzzing. It will catch shallow divergences but never the ones that need a
   structured or rare-shaped input. Do not treat "the test binary passed" as
   "the property was fuzzed".
 - For each property worth fuzzing, run at least one fuzzing-mode campaign
-  (`build_fuzz.sh`, then `--fuzz=Suite.Prop` or `--fuzz_for=<T>`). Confirm it is
-  a real campaign: the output must show `Corpus size` / `Edges covered` /
+  (`build_fuzz.sh`, then `run_fuzz.sh Suite.Prop`).
+  Confirm it is a real campaign: the output must show `Corpus size` / `Edges covered` /
   `Total runs` climbing. If edges stay flat at the first value, the campaign is
   not making progress.
 - Let it run until coverage stops climbing meaningfully (edges plateau), not
-  just a token few seconds. A longer `--fuzz_for` on the property covering the
+  just a token few seconds. A longer `FUZZ_DURATION_SECONDS` on the property covering the
   most behavior is worth more than many one-second runs.
 - When a campaign finds a mismatch, save the printed reproducer as a fixed
-  regression `TEST` first, fix the Rust, then re-run BOTH that regression test
-  and the campaign.
+  regression `TEST` when possible, and retain the file reproducer (printed
+  values can be truncated). Fix the Rust, then re-run BOTH that regression
+  test and the campaign.
 
 Coverage guidance comes from the C reference (it is the instrumented side); the
 Rust translation is executed as a black box on every input, so any normalized
@@ -107,7 +126,7 @@ Because the campaign steers by the C reference and treats it as ground truth, a
 misbuilt C reference is especially damaging here: it will happily "find" a flood
 of failing inputs that are really the oracle's fault, not the translation's.
 Before starting a campaign, make sure the C side is compiled correctly (see the
-compile-definitions check in Step 2) — the instrumented, statically linked C in
+compile-definitions check in Step 3) — the instrumented, statically linked C in
 `c_under_test` must match how `c_src` is actually built.
 
 Crash handling: fuzzing runs in-process, so a segfault or abort on either side
@@ -116,6 +135,6 @@ or trips a sanitizer on an input, that is a reference-side issue (record it, do
 not conclude the Rust is wrong); if C completes (returning success or a normal
 error) and Rust diverges or crashes, that is a translation bug.
 
-When a campaign finds a failing input, FuzzTest prints a reproducer. Consider
-pinning it as a fixed regression `TEST` before you fix the Rust, so the case
-stays covered cheaply after the fix.
+Bound input sizes, output expansion, and work per input. Free both sides' contexts
+on every iteration, including error paths. An OOM can reflect cumulative growth,
+so check retained state as well as the last input.

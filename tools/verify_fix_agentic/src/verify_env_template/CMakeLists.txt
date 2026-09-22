@@ -5,10 +5,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
 
+# Use ccache when present.
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+  set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 include(FetchContent)
 
-# GoogleTest pinned to a release tag. Declared before FuzzTest so the whole
-# build reuses this one copy. Offline: pre-populate the source once and point
+# GoogleTest pinned to a release tag. Offline: pre-populate the source and point
 # CMake at it with -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=/path/to/googletest.
 FetchContent_Declare(
   googletest
@@ -23,10 +29,9 @@ FetchContent_MakeAvailable(googletest{FUZZTEST_MAKEAVAIL})
 enable_testing()
 include(GoogleTest)
 {FUZZTEST_SETUP_FLAGS}
-# C reference under test, compiled INTO the test binary so it carries coverage
-# instrumentation under fuzzing mode. The translated Rust is a black box loaded
-# via dlopen at run time (see rust_lib.h) — never linked here, so the two sides'
-# same-named exports do not collide.
+# C reference under test, compiled INTO the test binary. The translated Rust
+# is a black box loaded via dlopen at run time (see rust_lib.h) — never linked
+# here, so the two sides' same-named exports do not collide.
 file(GLOB C_UNDER_TEST_SOURCES CONFIGURE_DEPENDS
      "${CMAKE_CURRENT_SOURCE_DIR}/../c_src/src/*.c")
 add_library(c_under_test STATIC ${C_UNDER_TEST_SOURCES})

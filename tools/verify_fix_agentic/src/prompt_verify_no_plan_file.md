@@ -163,3 +163,6 @@ Field definitions:
 - `soundness`: `"required"` (must never give wrong answers), `"preferred"`, or `"not_needed"` (approximate/heuristic output is fine)
 - `completeness`: `"required"` (must cover all cases), `"preferred"`, or `"not_needed"` (partial results are useful enough)
 - `value`: integer 0–10 estimating how much this tool would have helped you in this specific task
+
+## Git discipline
+{GIT_DISCIPLINE}
