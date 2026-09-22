@@ -1567,6 +1567,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)] // spawns git; Miri cannot run subprocesses
     fn ensure_workdir_git_creates_repo_and_stays_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::write(dir.path().join("src.txt"), "content").expect("write file");
