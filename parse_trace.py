@@ -166,6 +166,12 @@ class ToolUse:
     # often a `task` sub-agent — was still in flight.
     frozen: bool = False
 
+    # Local execution window (epoch ms), 0 when the source has no timing.
+    # OpenCode exports carry `state.time.start/end` on every tool part; the
+    # Claude Code stream only timestamps tool results, so it leaves these 0.
+    start_ms: int = 0
+    end_ms: int = 0
+
 
 @dataclass
 class ContentBlock:
@@ -216,6 +222,23 @@ class Turn:
     # (Claude Code echoes usage on each streamed block; only the final
     # value is meaningful as the cumulative total for the API call)
     usage: Optional[TokenUsage] = None
+
+    # Step window (epoch ms): from the API request being issued to the step
+    # completing, tool execution included. 0 when the source has no timing
+    # (only OpenCode exports fill these: `message.info.time.created/completed`).
+    start_ms: int = 0
+    end_ms: int = 0
+
+    @property
+    def llm_end_ms(self) -> int:
+        """End of the Remote LLM interval for this step: the first tool start
+        (tools run after the model asked for them), or the step end when the
+        step issued no tool calls. 0 when the step has no timing."""
+        if not self.start_ms or not self.end_ms:
+            return 0
+        starts = [tu.start_ms for tu in self.tool_uses if tu.start_ms]
+        end = min(starts) if starts else self.end_ms
+        return max(self.start_ms, min(end, self.end_ms))
 
     @property
     def tool_uses(self) -> list[ToolUse]:
@@ -956,6 +979,12 @@ def print_session_stats(sessions: list[Session]) -> None:
                 print(f"      cache_read:    {mu.cache_read_tokens}")
                 print(f"      cache_create:  {mu.cache_creation_tokens}")
                 print(f"      cost_usd:      ${mu.cost_usd:.4f}")
+
+        ta = _time_attribution(s)
+        if ta is not None:
+            print(f"\n  --- Time (remote LLM vs local tools) ---")
+            for line in _format_time_report(ta):
+                print(f"    {line}")
         print()
 
 
@@ -1235,6 +1264,10 @@ def build_readable_history(sessions: list[Session]) -> str:
             f"  model: {s.init.model if s.init else '?'}  "
             f"duration: {duration_s}  cost: {cost}"
         )
+        ta = _time_attribution(s)
+        if ta is not None:
+            for line in _format_time_report(ta):
+                out.append(f"  {line}")
         out.append("=" * 70)
         out.append("")
 
@@ -1700,6 +1733,9 @@ class _Row:
     spacer: bool = False
     height: Optional[int] = None
     summary_text: Optional[str] = None
+    # A continuation line under the session banner (time report): same band,
+    # regular weight instead of bold.
+    summary_minor: bool = False
 
 
 @dataclass
@@ -1813,10 +1849,17 @@ def _flatten_rows(sessions: list[Session]) -> tuple[list[_Row], list[_Group]]:
         for ev in s.compact_events:
             by_after[ev.after_turn_index].append(ev)
         emit(s.conversation, prefix, 0, by_after, _session_ended(s))
-        # Append a summary banner at the end of this session.
+        # Append a summary banner at the end of this session, followed by the
+        # compact time report when the source carries per-step timing.
         rows.append(_Row(
             label="", depth=0, summary_text=_format_session_summary(s, s_idx),
         ))
+        ta = _time_attribution(s)
+        if ta is not None:
+            for line in _format_time_report(ta):
+                rows.append(_Row(
+                    label="", depth=0, summary_text=line, summary_minor=True,
+                ))
 
     return rows, groups
 
@@ -2000,6 +2043,161 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
     if frozen_n:
         parts.append(f"⚠ {frozen_n} frozen task(s) never completed")
     return "   ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Time attribution: Remote LLM Time vs Local Machine Time
+# ---------------------------------------------------------------------------
+#
+# Every agent (main or sub) is a chain alternating between an LLM interval
+# (API request issued → first tool start) and tool intervals. A `task`/`Agent`
+# tool is a container whose window is filled by the child's own chain, so it
+# is never counted as a leaf tool. Summing over all agents gives *work*
+# (parallel siblings count fully, like CPU time across threads); the wall
+# clock is the *span*. Only sources with per-step timestamps (OpenCode
+# exports) produce a report; otherwise the report is simply omitted.
+#
+# Abbreviations printed:
+#   wall       root session wall clock
+#   llm        Remote LLM Time, Σ over all agents (share of llm+tool)
+#   tool       Local Machine Time, Σ leaf tool intervals over all agents
+#   work/wall  (llm+tool)/wall — parallel speedup, 1.00x = fully serial
+#   llm-conc   avg: llm / union(LLM intervals) — time-weighted mean number of
+#              concurrent LLM calls while at least one is active;
+#              peak: the maximum number of concurrent LLM calls
+#   sub        the three longest sub-agents: label, duration, steps, llm share
+
+@dataclass
+class TimeAttribution:
+    wall_ms: int
+    llm_ms: int            # L_work
+    tool_ms: int           # T_work
+    llm_cov_ms: int        # union of LLM intervals
+    llm_peak: int          # max number of concurrent LLM calls
+    # Wall partition by what is active: "L" only LLM, "T" only tool,
+    # "LT" both, "idle" neither. Computed for downstream use, not printed.
+    coverage: dict[str, int]
+    # (label, duration_ms, steps, llm_ms, tool_ms) for the longest sub-agents.
+    top_subagents: list[tuple[str, int, int, int, int]]
+
+
+def _union_ms(intervals: list[tuple[int, int]]) -> int:
+    total = 0
+    cur_a = cur_b = None
+    for a, b in sorted(intervals):
+        if cur_b is None or a > cur_b:
+            if cur_b is not None:
+                total += cur_b - cur_a
+            cur_a, cur_b = a, b
+        else:
+            cur_b = max(cur_b, b)
+    if cur_b is not None:
+        total += cur_b - cur_a
+    return total
+
+
+def _collect_time_intervals(
+    turns: list[Turn],
+    llm_iv: list[tuple[int, int]],
+    tool_iv: list[tuple[int, int]],
+) -> None:
+    """Append the LLM and leaf-tool intervals of `turns` and, recursively, of
+    every sub-agent conversation nested under them."""
+    for t in turns:
+        llm_end = t.llm_end_ms
+        if t.start_ms and llm_end > t.start_ms:
+            llm_iv.append((t.start_ms, llm_end))
+        for tu in t.tool_uses:
+            if tu.subagent is not None:
+                _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv)
+                continue
+            if tu.name.lower() in ("agent", "task"):
+                continue  # container without a parsed child: not a leaf
+            if tu.start_ms and tu.end_ms > tu.start_ms:
+                tool_iv.append((tu.start_ms, tu.end_ms))
+
+
+def _time_attribution(s: Session) -> Optional[TimeAttribution]:
+    """Return the time attribution for a session, or None when the source
+    carries no per-step timing (e.g. the Claude Code stream)."""
+    llm_iv: list[tuple[int, int]] = []
+    tool_iv: list[tuple[int, int]] = []
+    _collect_time_intervals(s.conversation, llm_iv, tool_iv)
+    wall = s.wall_clock_ms
+    if not wall or not llm_iv:
+        return None
+    llm_ms = sum(b - a for a, b in llm_iv)
+    tool_ms = sum(b - a for a, b in tool_iv)
+    llm_cov = _union_ms(llm_iv)
+
+    # Coverage sweep over the wall clock, anchored at the first LLM start.
+    w0 = min(a for a, _ in llm_iv)
+    w1 = w0 + wall
+    events: list[tuple[int, int, int]] = []
+    for a, b in llm_iv:
+        events.append((a, 1, 0)); events.append((b, -1, 0))
+    for a, b in tool_iv:
+        events.append((a, 0, 1)); events.append((b, 0, -1))
+    coverage: dict[str, int] = {"L": 0, "T": 0, "LT": 0, "idle": 0}
+    n_l = n_t = 0
+    llm_peak = 0
+    prev = w0
+    for t, dl, dt in sorted(events):
+        t = min(max(t, w0), w1)
+        if t > prev:
+            key = ("L" if n_l else "") + ("T" if n_t else "")
+            coverage[key or "idle"] += t - prev
+        prev = t
+        n_l += dl
+        n_t += dt
+        llm_peak = max(llm_peak, n_l)
+    coverage["idle"] += max(0, w1 - prev)
+
+    # Longest sub-agents spawned by the main agent (direct children only).
+    subs: list[tuple[str, int, int, int, int]] = []
+    for t in s.conversation:
+        for tu in t.tool_uses:
+            if tu.subagent is None or not tu.start_ms or tu.end_ms <= tu.start_ms:
+                continue
+            sub_llm: list[tuple[int, int]] = []
+            sub_tool: list[tuple[int, int]] = []
+            _collect_time_intervals(tu.subagent.conversation, sub_llm, sub_tool)
+            label = (tu.subagent.description or "").strip() or f"#{tu.subagent.task_id[-6:]}"
+            subs.append((
+                label,
+                tu.end_ms - tu.start_ms,
+                len(tu.subagent.conversation),
+                sum(b - a for a, b in sub_llm),
+                sum(b - a for a, b in sub_tool),
+            ))
+    subs.sort(key=lambda x: -x[1])
+
+    return TimeAttribution(
+        wall_ms=wall, llm_ms=llm_ms, tool_ms=tool_ms, llm_cov_ms=llm_cov,
+        llm_peak=llm_peak, coverage=coverage, top_subagents=subs[:3],
+    )
+
+
+def _format_time_report(ta: TimeAttribution) -> list[str]:
+    """One or two compact lines: totals, then the longest sub-agents."""
+    work = ta.llm_ms + ta.tool_ms
+    # `key=value` cells separated by " | " so a label cannot be mistaken for
+    # belonging to the number on its left.
+    cells = [
+        f"wall={_format_duration(ta.wall_ms)}",
+        f"llm={_format_duration(ta.llm_ms)} ({100 * ta.llm_ms / work:.0f}%)",
+        f"tool={_format_duration(ta.tool_ms)} ({100 * ta.tool_ms / work:.0f}%)",
+        f"work/wall={work / ta.wall_ms:.2f}x",
+        f"llm-conc={ta.llm_ms / ta.llm_cov_ms:.2f}x avg, {ta.llm_peak} peak",
+    ]
+    lines = ["time: " + " | ".join(cells)]
+    if ta.top_subagents:
+        subs = []
+        for label, dur, steps, l_ms, t_ms in ta.top_subagents:
+            share = f"llm {100 * l_ms / (l_ms + t_ms):.0f}%" if l_ms + t_ms else "llm n/a"
+            subs.append(f"{label}: {_format_duration(dur)}, {steps} steps, {share}")
+        lines.append("sub: " + " | ".join(subs))
+    return lines
 
 
 # Chars that are illegal in XML 1.0 no matter how they are escaped
@@ -2218,9 +2416,10 @@ def render_timeline_svg(sessions: list[Session]) -> str:
                 f'<rect x="{band_x}" y="{y}" width="{band_w}" '
                 f'height="{rh}" fill="#2a2f3a" stroke="{_GRID}" stroke-width="0.5"/>'
             )
+            weight = "normal" if row.summary_minor else "bold"
             out.append(
                 f'<text x="{band_x + 8}" y="{y + 11}" '
-                f'fill="{_TITLE}" font-size="11" font-weight="bold">'
+                f'fill="{_TITLE}" font-size="11" font-weight="{weight}">'
                 f'{_svg_escape(row.summary_text)}</text>'
             )
             continue
@@ -2571,6 +2770,12 @@ class OpenCodeExportParser:
                 if ptype == "step-start":
                     turn_index += 1
                     current_turn = Turn(turn_index=turn_index)
+                    msg_time = msg_info.get("time") or {}
+                    created = msg_time.get("created")
+                    completed = msg_time.get("completed")
+                    if isinstance(created, (int, float)) and isinstance(completed, (int, float)):
+                        current_turn.start_ms = int(created)
+                        current_turn.end_ms = int(completed)
                     continue
 
                 if ptype == "reasoning" and current_turn is not None:
@@ -2637,6 +2842,12 @@ class OpenCodeExportParser:
                         id=call_id, name=tool_name, input=inp,
                         result=result, frozen=frozen,
                     )
+                    tool_time = state.get("time") or {}
+                    t_start = tool_time.get("start")
+                    t_end = tool_time.get("end")
+                    if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)):
+                        tu.start_ms = int(t_start)
+                        tu.end_ms = int(t_end)
                     current_turn.content_blocks.append(
                         ContentBlock(type="tool_use", tool_use=tu)
                     )
