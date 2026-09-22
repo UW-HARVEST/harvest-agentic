@@ -10,7 +10,9 @@ use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
 use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
+use harvest_core::fs::{
+    RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
+};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;

@@ -1540,7 +1540,10 @@ pub fn ensure_workdir_git(work_dir: &Path) {
             return;
         }
     }
-    ok(&["config", "user.name", "harvest-agent"], "config user.name");
+    ok(
+        &["config", "user.name", "harvest-agent"],
+        "config user.name",
+    );
     ok(
         &["config", "user.email", "harvest-agent@invalid"],
         "config user.email",
@@ -1549,10 +1552,7 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         work_dir.join(".gitignore"),
         "# Framework-written: build outputs and worktrees stay untracked.\ntarget/\nbuild*/\ncbuild/\nwt/\n.opencode/\n",
     ) {
-        warn!(
-            "failed to write .gitignore in {}: {e}",
-            work_dir.display()
-        );
+        warn!("failed to write .gitignore in {}: {e}", work_dir.display());
     }
     ok(&["add", "-A"], "add");
     ok(

@@ -440,10 +440,7 @@ impl RawDir {
             } else {
                 // Symlinks (and other special files) have no RawDir
                 // representation, warn and skip them.
-                tracing::warn!(
-                    "skipping symlink/special entry: {}",
-                    entry.path().display()
-                );
+                tracing::warn!("skipping symlink/special entry: {}", entry.path().display());
             }
         }
         Ok((RawDir(result), directories, files))
@@ -943,8 +940,7 @@ mod tests {
         symlink("sub", root.join("link_to_dir")).unwrap();
         symlink("/nonexistent/target", root.join("broken_link")).unwrap();
 
-        let (raw_dir, directories, files) =
-            RawDir::populate_from(read_dir(root).unwrap()).unwrap();
+        let (raw_dir, directories, files) = RawDir::populate_from(read_dir(root).unwrap()).unwrap();
 
         assert_eq!(directories, 1);
         assert_eq!(files, 2);

@@ -26,7 +26,9 @@
 use agent_runner::{AgentInvocation, AgentPhase};
 use full_source::{CargoPackage, ExternalTestSuite, RawSource, TestSuiteKind};
 use harvest_core::config::unknown_field_warning;
-use harvest_core::fs::{RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir};
+use harvest_core::fs::{
+    RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
+};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::Deserialize;
