@@ -206,21 +206,26 @@ pub struct ProgramRun {
     pub test_corpus_root: Option<PathBuf>,
 }
 
+/// Returns whether the directory is occupied, so a caller allowed through
+/// by `--force` knows it is reusing one.
+fn guard_occupied(dir: &Path, force: bool) -> HarvestResult<bool> {
+    let occupied = std::fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if occupied && !force {
+        return Err(format!(
+            "output directory {} is not empty; pass --force to overwrite it",
+            dir.display()
+        )
+        .into());
+    }
+    Ok(occupied)
+}
+
 /// Makes `output_dir` ready to receive a snapshot: it must not already hold
 /// one run's results when a second run writes into it.
 fn prepare_output_dir(output_dir: &Path, force: bool) -> HarvestResult<()> {
-    let occupied = std::fs::read_dir(output_dir)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
-    if occupied {
-        if !force {
-            return Err(format!(
-                "output program directory {} is not empty; pass --force to overwrite it \
-                 (reusing a populated directory mixes two runs' results)",
-                output_dir.display()
-            )
-            .into());
-        }
+    if guard_occupied(output_dir, force)? {
         log::warn!("--force: erasing existing {}", output_dir.display());
         std::fs::remove_dir_all(output_dir)?;
     }
@@ -832,9 +837,23 @@ fn main() -> HarvestResult<()> {
         .or(args.output_dir.as_ref())
         .expect("clap requires either --test or output_dir");
     ensure_output_directory(log_root)?;
+    // Guard the output root before `output.log` is created in it. `--test`
+    // re-grades an existing output in place by design, so it is exempt. The
+    // program directories inside are guarded again, one by one, in
+    // `prepare_output_dir`, which is where `--force` erases.
+    let reusing_root = match args.test {
+        Some(_) => false,
+        None => guard_occupied(log_root, args.force)?,
+    };
     let log_file = File::create(log_root.join("output.log"))?;
     TeeLogger::init(log::LevelFilter::Info, log_file)?;
     log::info!("Harvest version: {}", get_version());
+    if reusing_root {
+        log::warn!(
+            "--force: reusing populated output directory {}",
+            log_root.display()
+        );
+    }
     run(args)
 }
 
@@ -1372,6 +1391,33 @@ mod tests {
             select_validation_harness(TestHarness::Bin, dir.path(), true).unwrap(),
             ValidationHarness::Binary
         ));
+    }
+
+    #[test]
+    fn occupied_guard_passes_empty_dir_and_refuses_populated_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!guard_occupied(dir.path(), false).unwrap());
+        std::fs::write(dir.path().join("output.log"), "x").unwrap();
+        let err = guard_occupied(dir.path(), false).unwrap_err().to_string();
+        assert!(err.contains("--force"), "unexpected error: {err}");
+        assert!(guard_occupied(dir.path(), true).unwrap());
+        assert!(
+            dir.path().join("output.log").exists(),
+            "the guard itself never erases"
+        );
+    }
+
+    #[test]
+    fn program_dir_guard_refuses_populated_dir_and_erases_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("lz4");
+        std::fs::create_dir(&prog).unwrap();
+        std::fs::write(prog.join("PLAN.md"), "x").unwrap();
+        let err = prepare_output_dir(&prog, false).unwrap_err().to_string();
+        assert!(err.contains("--force"), "unexpected error: {err}");
+        assert!(prog.join("PLAN.md").exists());
+        prepare_output_dir(&prog, true).unwrap();
+        assert!(prog.exists() && !prog.join("PLAN.md").exists());
     }
 
     #[test]
