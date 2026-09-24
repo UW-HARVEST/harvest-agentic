@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -228,6 +229,11 @@ class Turn:
     # (only OpenCode exports fill these: `message.info.time.created/completed`).
     start_ms: int = 0
     end_ms: int = 0
+    # Streaming window of the model's visible output (reasoning + text parts):
+    # first part start and last part end. 0 when unknown. Tool-call argument
+    # streaming has no timestamp of its own; `llm_end_ms` covers it.
+    first_stream_ms: int = 0
+    last_stream_ms: int = 0
 
     @property
     def llm_end_ms(self) -> int:
@@ -1775,6 +1781,43 @@ def _session_ended(s: Session) -> bool:
     return bool(s.process_wall_ms)
 
 
+def _subagent_unfinished(tu: ToolUse) -> bool:
+    """A sub-agent dispatch with no completion yet: the export caught the tool
+    still running (tu.frozen) or the sub-agent status is stuck at
+    running/pending. FROZEN vs in-flight is decided by _session_ended()."""
+    return tu.frozen or (
+        tu.subagent is not None and tu.subagent.status in ("running", "pending")
+    )
+
+
+def _count_live_subagents(sessions: list[Session]) -> int:
+    """
+    Count sub-agents still in flight in live OpenCode sessions.
+
+    Only OpenCode counts: its sub-agents are opaque in the parent's JSONL, so
+    the trace file does not grow while one runs, yet a re-parse pulls fresh
+    child sessions via live-export. Claude sub-agents stream into the trace
+    itself, so the trace mtime already drives re-rendering. Written into the
+    SVG as a marker so visualize_all.py can re-render such traces on a timer.
+    """
+    def walk(turns: list[Turn]) -> int:
+        n = 0
+        for t in turns:
+            for tu in t.tool_uses:
+                if tu.name.lower() not in ("agent", "task", "workflow"):
+                    continue
+                if _subagent_unfinished(tu):
+                    n += 1
+                if tu.subagent is not None:
+                    n += walk(tu.subagent.conversation)
+        return n
+
+    return sum(
+        walk(s.conversation) for s in sessions
+        if s.agent_type == "opencode" and not _session_ended(s)
+    )
+
+
 def _flatten_rows(sessions: list[Session]) -> tuple[list[_Row], list[_Group]]:
     """
     Flatten sessions + sub-agents into renderable rows.
@@ -2065,7 +2108,17 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
 #   llm-conc   avg: llm / union(LLM intervals) — time-weighted mean number of
 #              concurrent LLM calls while at least one is active;
 #              peak: the maximum number of concurrent LLM calls
+#   decode     Σ generated tokens / Σ decode time over all agents, where decode
+#              time runs from the first streamed part to the end of streaming
+#              (last part end, or first tool start when the step called tools);
+#              token-weighted, so long steps dominate
+#   decode+ttft Σ generated tokens / Σ LLM interval — the same tokens over the
+#              whole request (first-token latency included)
 #   sub        the three longest sub-agents: label, duration, steps, llm share
+#
+# Generated tokens = output + reasoning as reported by the provider. Their split
+# is unreliable (opencode-go sometimes folds reasoning into output), the sum is
+# not; `Turn.usage.output_tokens` already holds that sum.
 
 @dataclass
 class TimeAttribution:
@@ -2074,6 +2127,9 @@ class TimeAttribution:
     tool_ms: int           # T_work
     llm_cov_ms: int        # union of LLM intervals
     llm_peak: int          # max number of concurrent LLM calls
+    gen_tokens: int        # Σ output(+reasoning) tokens over steps with timing
+    decode_ms: int         # Σ decode time (steps with a streaming window)
+    decode_tokens: int     # Σ generated tokens of those same steps
     # Wall partition by what is active: "L" only LLM, "T" only tool,
     # "LT" both, "idle" neither. Computed for downstream use, not printed.
     coverage: dict[str, int]
@@ -2100,16 +2156,28 @@ def _collect_time_intervals(
     turns: list[Turn],
     llm_iv: list[tuple[int, int]],
     tool_iv: list[tuple[int, int]],
+    acc: Optional[dict[str, int]] = None,
 ) -> None:
     """Append the LLM and leaf-tool intervals of `turns` and, recursively, of
-    every sub-agent conversation nested under them."""
+    every sub-agent conversation nested under them. When `acc` is given, also
+    accumulate generated tokens and decode time (keys: gen_tokens, decode_ms,
+    decode_tokens)."""
     for t in turns:
         llm_end = t.llm_end_ms
         if t.start_ms and llm_end > t.start_ms:
             llm_iv.append((t.start_ms, llm_end))
+            if acc is not None:
+                gen = t.usage.output_tokens if t.usage else 0
+                acc["gen_tokens"] = acc.get("gen_tokens", 0) + gen
+                if t.first_stream_ms:
+                    dec_end = max(t.last_stream_ms, llm_end)
+                    dec = dec_end - t.first_stream_ms
+                    if dec > 0:
+                        acc["decode_ms"] = acc.get("decode_ms", 0) + dec
+                        acc["decode_tokens"] = acc.get("decode_tokens", 0) + gen
         for tu in t.tool_uses:
             if tu.subagent is not None:
-                _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv)
+                _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv, acc)
                 continue
             if tu.name.lower() in ("agent", "task"):
                 continue  # container without a parsed child: not a leaf
@@ -2122,7 +2190,8 @@ def _time_attribution(s: Session) -> Optional[TimeAttribution]:
     carries no per-step timing (e.g. the Claude Code stream)."""
     llm_iv: list[tuple[int, int]] = []
     tool_iv: list[tuple[int, int]] = []
-    _collect_time_intervals(s.conversation, llm_iv, tool_iv)
+    acc: dict[str, int] = {}
+    _collect_time_intervals(s.conversation, llm_iv, tool_iv, acc)
     wall = s.wall_clock_ms
     if not wall or not llm_iv:
         return None
@@ -2175,6 +2244,8 @@ def _time_attribution(s: Session) -> Optional[TimeAttribution]:
     return TimeAttribution(
         wall_ms=wall, llm_ms=llm_ms, tool_ms=tool_ms, llm_cov_ms=llm_cov,
         llm_peak=llm_peak, coverage=coverage, top_subagents=subs[:3],
+        gen_tokens=acc.get("gen_tokens", 0), decode_ms=acc.get("decode_ms", 0),
+        decode_tokens=acc.get("decode_tokens", 0),
     )
 
 
@@ -2190,6 +2261,10 @@ def _format_time_report(ta: TimeAttribution) -> list[str]:
         f"work/wall={work / ta.wall_ms:.2f}x",
         f"llm-conc={ta.llm_ms / ta.llm_cov_ms:.2f}x avg, {ta.llm_peak} peak",
     ]
+    if ta.decode_ms and ta.decode_tokens:
+        cells.append(f"decode={1000 * ta.decode_tokens / ta.decode_ms:.1f} tok/s")
+    if ta.gen_tokens:
+        cells.append(f"decode+ttft={1000 * ta.gen_tokens / ta.llm_ms:.1f} tok/s")
     lines = ["time: " + " | ".join(cells)]
     if ta.top_subagents:
         subs = []
@@ -2250,6 +2325,8 @@ def render_timeline_svg(sessions: list[Session]) -> str:
 
     out: list[str] = []
     out.append('<?xml version="1.0" encoding="UTF-8"?>')
+    # Read by visualize_all.py (first line after the XML declaration).
+    out.append(f'<!-- harvest-live: in_flight_subagents={_count_live_subagents(sessions)} -->')
     out.append(
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'width="{width}" height="{height}" '
@@ -2312,13 +2389,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         # running (tu.frozen) or a sub-agent status stuck at running/pending.
         # Either is only FROZEN once the session actually ended; in a live
         # trace it just means the sub-agent is still running right now.
-        unfinished = grp.tool_use is not None and (
-            grp.tool_use.frozen
-            or (
-                grp.tool_use.subagent is not None
-                and grp.tool_use.subagent.status in ("running", "pending")
-            )
-        )
+        unfinished = grp.tool_use is not None and _subagent_unfinished(grp.tool_use)
         frozen = unfinished and grp.session_ended
         in_flight = unfinished and not grp.session_ended
         tooltip_lines = []
@@ -2719,6 +2790,22 @@ class OpenCodeParser:
         return session
 
 
+def _note_stream_time(turn: Turn, part: dict) -> None:
+    """Widen `turn`'s streaming window with a reasoning/text part's `time`."""
+    tm = part.get("time") or {}
+    start = tm.get("start")
+    end = tm.get("end", start)
+    if not isinstance(start, (int, float)):
+        return
+    if not isinstance(end, (int, float)):
+        end = start
+    start_i, end_i = int(start), int(end)
+    if not turn.first_stream_ms or start_i < turn.first_stream_ms:
+        turn.first_stream_ms = start_i
+    if end_i > turn.last_stream_ms:
+        turn.last_stream_ms = end_i
+
+
 class OpenCodeExportParser:
     """Parse an OpenCode export JSON (from `opencode export <sessionID>`) into a Session.
 
@@ -2784,6 +2871,7 @@ class OpenCodeExportParser:
                         current_turn.content_blocks.append(
                             ContentBlock(type="thinking", thinking=text)
                         )
+                    _note_stream_time(current_turn, part)
                     continue
 
                 if ptype == "text" and current_turn is not None:
@@ -2792,6 +2880,7 @@ class OpenCodeExportParser:
                         current_turn.content_blocks.append(
                             ContentBlock(type="text", text=text)
                         )
+                    _note_stream_time(current_turn, part)
                     continue
 
                 if ptype == "compaction":
@@ -3404,6 +3493,27 @@ def parse_trace_file(path: str, fmt: str = "auto") -> list[Session]:
     return parse_mixed_trace_file(path, fmt)
 
 
+def _write_atomic(path: str, content: str) -> None:
+    """Write via a temp file + rename so a concurrent reader (serve.bash while
+    the live loop re-renders) never sees a half-written file. The temp name
+    starts with "." so visualize_all.py's trace_* glob never picks it up."""
+    d, base = os.path.split(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=f".{base}.", dir=d)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(tmp, 0o666 & ~umask)  # mkstemp creates 0600
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -3463,8 +3573,7 @@ if __name__ == "__main__":
     if visualize:
         out_path = path.rsplit(".", 1)[0] + "_timeline.svg"
         content = render_timeline_svg(sessions)
-        with open(out_path, "w") as f:
-            f.write(content)
+        _write_atomic(out_path, content)
         print(f"Written to {out_path}  ({len(content):,} chars)")
 
     if file_io:
