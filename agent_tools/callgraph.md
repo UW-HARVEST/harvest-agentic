@@ -4,7 +4,7 @@
 
 Builds a whole-program call graph for a C project by compiling every source
 file to LLVM IR, linking the IR together, and running the LLVM call-graph
-analysis pass.  Output is human-readable indented text (or raw DOT for
+analysis pass. Output is human-readable indented text (or raw DOT for
 graphviz rendering).
 
 **Prerequisite:** the project must already have a `compile_commands.json`
@@ -12,9 +12,14 @@ graphviz rendering).
 All source files must compile — files that fail to compile are skipped with a
 warning.
 
-**Important limitation:** function pointers are NOT resolved.  A function
-called exclusively via a pointer appears as a leaf with no outgoing edges, and
-the call chain stops there.
+**Function pointers:** indirect calls through function pointers are NOT
+resolved (this is the points-to / alias problem, undecidable in general).
+Instead of silently dropping them, any function that *contains* an unresolved
+indirect call site is flagged with the marker
+`[indirect call site — callees unresolved]` in every output mode. Such a
+function has at least one call whose target the static graph cannot name, so
+it is not a true leaf — a downstream consumer should treat it as having
+unknown additional callees and recover the likely targets from context.
 
 ---
 
@@ -25,15 +30,16 @@ python3 {AGENT_TOOLS_DIR}/callgraph.py list <compile_commands.json>
 ```
 
 **Example:**
+
 ```
 python3 {AGENT_TOOLS_DIR}/callgraph.py list build/compile_commands.json
 ```
 
 Output (excerpt):
+
 ```
-SPX_chain_lengths
-  → base_w
-  → wots_checksum
+LZ4F_free  [indirect call site — callees unresolved]
+  → free
 SPX_compute_root
   → SPX_set_tree_height
   → SPX_set_tree_index
@@ -41,9 +47,12 @@ SPX_compute_root
 randombytes  [leaf]
 ```
 
-`[leaf]` means the function makes no calls to other functions in the
-translation unit (it is either a stub, an intrinsic, or all its callees are
-external).
+`[leaf]` means the function makes no resolved calls to other functions (it is
+either a stub, an intrinsic, or all its callees are external). A function
+tagged `[indirect call site — callees unresolved]` is different: it may show
+resolved callees *and* the marker (as `LZ4F_free` does above), or the marker
+alone — either way it dispatches through a function pointer whose target is
+unknown.
 
 ---
 
@@ -57,18 +66,23 @@ python3 {AGENT_TOOLS_DIR}/callgraph.py from <compile_commands.json> <function> [
   function the tool uses it automatically.
 - `--depth N` — limit traversal to N levels (default: unlimited).
 - Cycles and repeated subtrees are shown once, then marked `[↑ see above]`.
+- Functions with unresolved indirect calls carry the
+  `[indirect call site — callees unresolved]` marker in the tree too.
 
 **Example (full tree):**
+
 ```
 python3 {AGENT_TOOLS_DIR}/callgraph.py from build/compile_commands.json crypto_sign_verify
 ```
 
 **Example (depth-limited for a quick overview):**
+
 ```
 python3 {AGENT_TOOLS_DIR}/callgraph.py from build/compile_commands.json crypto_sign_verify --depth 3
 ```
 
 Output (excerpt):
+
 ```
 crypto_sign_verify
   SPX_wots_pk_from_sig
@@ -92,17 +106,28 @@ python3 {AGENT_TOOLS_DIR}/callgraph.py dot <compile_commands.json> > callgraph.d
 dot -Tsvg callgraph.dot -o callgraph.svg
 ```
 
+Functions with unresolved indirect call sites are emitted as filled nodes
+(distinct fill colour + tooltip) so they stand out when rendered, and each is
+preceded by a grep-friendly `// indirect-call-site: <name>` comment for
+machine consumers. To list just the flagged functions from a DOT file:
+
+```
+grep "indirect-call-site" callgraph.dot
+```
+
 ---
 
 #### Generating compile_commands.json
 
 **CMake projects:**
+
 ```
 cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 # compile_commands.json is written to build/
 ```
 
 **Any build system (using bear):**
+
 ```
 bear -- make        # or: bear -- cmake --build build
 # compile_commands.json is written to the current directory
@@ -117,7 +142,13 @@ bear -- make        # or: bear -- cmake --build build
 - When multiple build targets define the same symbol (e.g. two alternative
   implementations), the last definition wins — this is harmless for
   call-graph purposes.
-- LLVM intrinsics (`llvm.*`), compiler builtins (`__builtin_*`), and byte-swap
-  helpers (`__bswap_*`) are filtered from the output.
-- Requires `clang`, `llvm-link`, and `opt` on PATH (all part of the LLVM
-  package installed alongside clang).
+- `static` functions with the same name in different translation units are
+  kept distinct by LLVM with a numeric suffix (e.g. `LZ4_read32.2`); treat
+  `foo` and `foo.N` as the same source function.
+- LLVM intrinsics (`llvm.*`) and compiler/libc helpers (`__builtin_*`,
+  `__bswap_*`, `__uint*`, `__int*`) are filtered from the output.
+- Requires `clang`, `llvm-link`, `opt`, and `llvm-dis` on PATH (all part of
+  the LLVM package installed alongside clang). If `llvm-dis` is missing the
+  graph still builds, but indirect call sites will NOT be flagged (a warning
+  is printed) — so absence of markers only means "no function pointers" once
+  you've confirmed `llvm-dis` ran.
