@@ -1305,6 +1305,10 @@ fn run_tempdir(work_dir: &Path) -> &Path {
 /// blocks forever on the unanswerable permission prompt. Scoping external
 /// access to this run's temp directory and denying everything else makes "ask"
 /// unreachable.
+///
+/// `snapshot` is disabled. OpenCode snapshots a git work tree twice per agent
+/// step to back interactive undo/revert. It is the heaviest path-lookup load
+/// and coincided with `path_is_under` kernel Oops. A headless run does not need it anyways.
 fn opencode_project_config(
     work_dir: &Path,
     model: Option<&str>,
@@ -1330,6 +1334,7 @@ fn opencode_project_config(
     format!(
         r#"{{
   "$schema": "https://opencode.ai/config.json",
+  "snapshot": false,
   "permission": {{
     "external_directory": {{
       "*": "deny",
@@ -1729,6 +1734,25 @@ mod tests {
         assert!(raw.find("\"*\"").unwrap() < raw.find("/tmp/.tmpAbc123/**").unwrap());
         // No model → no provider routing block.
         assert!(config.get("provider").is_none());
+    }
+
+    #[test]
+    fn opencode_project_config_disables_snapshot() {
+        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let staged = (
+            "harvest-hyak".to_string(),
+            serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
+        );
+        for (model, staged) in [
+            (None, None),
+            (Some("openrouter/xiaomi/mimo-v2.5-pro"), None),
+            (Some("harvest-hyak/qwen3.8-27b"), Some(&staged)),
+        ] {
+            let raw = opencode_project_config(work_dir, model, staged);
+            let config: serde_json::Value =
+                serde_json::from_str(&raw).expect("project config must be valid JSON");
+            assert_eq!(config.get("snapshot"), Some(&serde_json::json!(false)));
+        }
     }
 
     #[test]
