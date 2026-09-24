@@ -50,6 +50,8 @@ const VE_RUST_LIB_H: &str = include_str!("verify_env_template/rust_lib.h");
 const VE_BUILD_SH: &str = include_str!("verify_env_template/build.sh");
 const VE_BUILD_FUZZ_SH: &str = include_str!("verify_env_template/build_fuzz.sh");
 const VE_RUN_FUZZ_SH: &str = include_str!("verify_env_template/run_fuzz.sh");
+const VE_RUN_TESTS_SH: &str = include_str!("verify_env_template/run_tests.sh");
+const VE_MEMORY_SCOPE_SH: &str = include_str!("verify_env_template/memory_scope.sh");
 const VE_README: &str = include_str!("verify_env_template/README.md");
 const VE_README_FUZZ: &str = include_str!("verify_env_template/README_fuzz.md");
 
@@ -460,6 +462,8 @@ fn materialize_verify_env(
         VE_README.replace("{FUZZTEST_README}", if fuzz { VE_README_FUZZ } else { "" }),
     )?;
     write_script(&env_dir.join("build.sh"), VE_BUILD_SH)?;
+    write_script(&env_dir.join("run_tests.sh"), VE_RUN_TESTS_SH)?;
+    fs::write(env_dir.join("memory_scope.sh"), VE_MEMORY_SCOPE_SH)?;
     if fuzz {
         write_script(&env_dir.join("build_fuzz.sh"), VE_BUILD_FUZZ_SH)?;
         write_script(&env_dir.join("run_fuzz.sh"), VE_RUN_FUZZ_SH)?;
@@ -678,6 +682,7 @@ mod tests {
             fs::create_dir(root.join("bin")).unwrap();
             fs::write(root.join("fake rust.so"), "").unwrap();
             write_script(&root.join("run_fuzz.sh"), VE_RUN_FUZZ_SH).unwrap();
+            fs::write(root.join("memory_scope.sh"), VE_MEMORY_SCOPE_SH).unwrap();
             write_script(
                 &root.join("build-fuzz/verification_tests"),
                 r#"#!/bin/sh
@@ -821,6 +826,136 @@ exit 86
         }
     }
 
+    // Same approach for the unit-test runner: shell stand-ins for the test
+    // binary and systemd-run, no real cgroup and no large allocations.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    mod test_runner {
+        use super::*;
+        use std::process::Command;
+
+        fn fixture() -> tempfile::TempDir {
+            let tmp = tempfile::Builder::new()
+                .prefix("test runner ")
+                .tempdir()
+                .unwrap();
+            let root = tmp.path();
+            fs::create_dir(root.join("build-test")).unwrap();
+            fs::create_dir(root.join("bin")).unwrap();
+            fs::write(root.join("fake rust.so"), "").unwrap();
+            write_script(&root.join("run_tests.sh"), VE_RUN_TESTS_SH).unwrap();
+            fs::write(root.join("memory_scope.sh"), VE_MEMORY_SCOPE_SH).unwrap();
+            // Records its arguments and the address-space limit it runs under.
+            write_script(
+                &root.join("build-test/verification_tests"),
+                r#"#!/bin/sh
+printf '%s\n' "$@" > "$OBSERVED"
+ulimit -v > "$OBSERVED_LIMIT"
+exit "$FAKE_EXIT"
+"#,
+            )
+            .unwrap();
+            write_script(
+                &root.join("bin/systemd-run"),
+                r#"#!/bin/sh
+printf '%s\n' "$@" > "$SCOPE_ARGS"
+exit 86
+"#,
+            )
+            .unwrap();
+            tmp
+        }
+
+        fn command(root: &Path) -> Command {
+            let mut cmd = Command::new("timeout");
+            cmd.args(["--kill-after=1s", "10s", "bash"])
+                .arg(root.join("run_tests.sh"))
+                .current_dir(root);
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("TEST_") {
+                    cmd.env_remove(key);
+                }
+            }
+            let mut paths = vec![root.join("bin")];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            cmd.env("PATH", std::env::join_paths(paths).unwrap())
+                .env("RUST_LIB_PATH", root.join("fake rust.so"))
+                .env("OBSERVED", root.join("observed"))
+                .env("OBSERVED_LIMIT", root.join("observed_limit"))
+                .env("SCOPE_ARGS", root.join("scope_args"))
+                .env("FAKE_EXIT", "0")
+                .env("TEST_HARD_LIMIT_MB", "0");
+            cmd
+        }
+
+        #[test]
+        fn passes_arguments_and_applies_address_space_limit() {
+            let tmp = fixture();
+            let root = tmp.path();
+            let output = command(root)
+                .args(["--gtest_filter=Suite.*", "--gtest_brief=1"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                fs::read_to_string(root.join("observed")).unwrap(),
+                "--gtest_filter=Suite.*\n--gtest_brief=1\n"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("observed_limit")).unwrap(),
+                "2097152\n"
+            );
+
+            // An override applies, and the test binary's exit code passes through.
+            let output = command(root)
+                .env("TEST_AS_LIMIT_MB", "512")
+                .env("FAKE_EXIT", "42")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(42), "{output:?}");
+            assert_eq!(
+                fs::read_to_string(root.join("observed_limit")).unwrap(),
+                "524288\n"
+            );
+        }
+
+        #[test]
+        fn invalid_configuration_never_starts_binary() {
+            let tmp = fixture();
+            for (name, value) in [
+                // The cgroup limit must stay above the per-process limit.
+                ("TEST_HARD_LIMIT_MB", "2048"),
+                ("RUST_LIB_PATH", "relative.so"),
+            ] {
+                let output = command(tmp.path()).env(name, value).output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{name}={value}: {output:?}");
+                assert!(!tmp.path().join("observed").exists());
+            }
+        }
+
+        #[test]
+        fn cgroup_failure_never_falls_back() {
+            let tmp = fixture();
+            let output = command(tmp.path())
+                .env_remove("TEST_HARD_LIMIT_MB")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(86), "{output:?}");
+            assert!(!tmp.path().join("observed").exists());
+            let args = fs::read_to_string(tmp.path().join("scope_args")).unwrap();
+            for expected in [
+                "MemoryMax=3072M",
+                "MemorySwapMax=0",
+                "--kill-after=5s",
+                "600s",
+            ] {
+                assert!(
+                    args.lines().any(|arg| arg == expected),
+                    "missing {expected}: {args}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn parses_lz4_style_compile_defs() {
         let cmake = "\
@@ -868,6 +1003,8 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(!cml.to_ascii_lowercase().contains("fuzz"));
         assert!(!translated.join("verify_env/build_fuzz.sh").exists());
         assert!(!translated.join("verify_env/run_fuzz.sh").exists());
+        assert!(translated.join("verify_env/run_tests.sh").exists());
+        assert!(translated.join("verify_env/memory_scope.sh").exists());
         // Inspect every delivered file, not only CMake: comments and README
         // text must not reveal the optional mechanism to the control agent.
         for entry in fs::read_dir(translated.join("verify_env")).unwrap() {
@@ -940,6 +1077,8 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(!cml.contains("GTest::gtest_main"));
         assert!(translated.join("verify_env/build_fuzz.sh").exists());
         assert!(translated.join("verify_env/run_fuzz.sh").exists());
+        assert!(translated.join("verify_env/run_tests.sh").exists());
+        assert!(translated.join("verify_env/memory_scope.sh").exists());
     }
 
     #[test]

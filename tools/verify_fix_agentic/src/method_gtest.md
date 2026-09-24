@@ -21,7 +21,24 @@ behavior:
   `dlopen(..., RTLD_LOCAL)` so its symbols never collide with the statically
   linked C reference of the same name, and resolves functions with `dlsym`.
 - `build.sh` — configures and builds the test binary.
+- `run_tests.sh` — runs the test binary with memory and time limits.
+  GoogleTest flags such as `--gtest_filter` go after the script name.
 - `README.md` — exact build/run commands and pointers.
+
+Always run the tests through `verify_env/run_tests.sh`, also in sub-agents. Do
+not run `build-test/verification_tests` directly. The script applies memory and
+time limits, so a test with a defect cannot stop the machine. If a test fails
+because of these limits, examine the test first. A loop that makes no progress
+can use all memory. If the test really needs more, read `verify_env/README.md`
+and `run_tests.sh` to understand the limits, and change a setting for that run.
+
+Add this rule to the `### Operational` invariants in `HYPOTHESES.md`, and copy
+it into every sub-agent prompt that runs tests:
+
+```
+- Run the GoogleTest binary only through `verify_env/run_tests.sh`, never
+  `build-test/verification_tests` directly.
+```
 
 The C reference and the Rust translation both export the same public symbol
 names (e.g. `LZ4_compress_default`). That is why the C side is linked statically
@@ -43,7 +60,8 @@ Then do the actual verification:
 
 1. Build the C reference and the Rust `.so`. `verify_env/README.md` has the exact
    commands; in short, `cargo build --release` for the Rust cdylib and
-   `verify_env/build.sh` for the test binary.
+   `verify_env/build.sh` for the test binary. Run the tests with
+   `verify_env/run_tests.sh`.
 
    Before you trust any comparison, confirm the C reference is built correctly:
    the CMakeLists compiled `c_src/` into the test binary with compile
@@ -69,8 +87,8 @@ Then do the actual verification:
    one step past a valid range, and enum arguments with no valid variant.
 4. Start with the lowest-level functions and work upward. Look at the C headers to
    identify the public API and call hierarchy.
-5. Run the test binary. Every time a test exposes a divergence, append a
-   hypothesis to `HYPOTHESES.md`.
+5. Run the tests with `verify_env/run_tests.sh`. Every time a test exposes a
+   divergence, append a hypothesis to `HYPOTHESES.md`.
 6. When a Rust function differs from C, fix the Rust code in `src/`, rebuild the
    `.so`, and re-run until the test passes. Update the matching hypothesis to
    `fixed` after the Edit.

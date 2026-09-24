@@ -1,8 +1,12 @@
 ## Bounded fuzz campaigns
 
 Additional files: `build_fuzz.sh` builds the campaign binary; `run_fuzz.sh` runs
-it and sets campaign budgets. `docs/` contains vendored official
+it and sets campaign budgets. `run_fuzz.sh` uses the same `memory_scope.sh`
+cgroup launcher as `run_tests.sh`. `docs/` contains vendored official
 FuzzTest reference docs (Apache-2.0).
+
+A unit-test run of the ordinary binary also runs each `FUZZ_TEST` for a short
+time. Use `run_tests.sh` for that run, as for all other unit tests.
 
 From the translated project directory, after building the Rust cdylib:
 
@@ -47,7 +51,9 @@ When running inside an already memory-limited container/cgroup without a user
 manager, explicitly set `FUZZ_HARD_LIMIT_MB=0` to use that external protection.
 This prints a warning and retains the FuzzTest RSS limit and timeouts. Do not
 use this override on an unbounded host. Do not substitute `ulimit -v`: it limits
-virtual address space and conflicts with ASan shadow mappings.
+virtual address space and conflicts with ASan shadow mappings. The campaign
+binary uses ASan. The unit-test binary does not, so `run_tests.sh` can use
+`ulimit -v`.
 
 Record budget increases and their reasons in `HYPOTHESES.md`. Investigate
 unexpected growth before raising limits: small inputs can expand into large

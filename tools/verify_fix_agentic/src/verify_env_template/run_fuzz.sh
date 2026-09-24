@@ -36,40 +36,10 @@ for tool in timeout tee mktemp; do
   command -v "$tool" >/dev/null || fail "required command is missing: $tool"
 done
 
-launcher=()
-memory_check=()
-if (( FUZZ_HARD_LIMIT_MB > 0 )); then
-  command -v systemd-run >/dev/null ||
-    fail "systemd-run is unavailable; use an external cgroup/container and explicitly set FUZZ_HARD_LIMIT_MB=0 (see README.md)"
-  # Failure to create the scope stops the run; never retry the binary unbounded.
-  launcher=(systemd-run --user --scope --quiet
-    -p "MemoryMax=${FUZZ_HARD_LIMIT_MB}M" -p MemorySwapMax=0)
-  # Verify kernel enforcement inside the scope. A user manager can exist on
-  # systems without a delegated memory controller; accepting a property alone
-  # is not proof that the campaign is bounded.
-  # shellcheck disable=SC2016 # Expand these variables inside the scoped shell.
-  memory_check=(bash -c '
-    set -euo pipefail
-    expected="$1"; shift
-    cgroup=""
-    while IFS=: read -r hierarchy controllers path; do
-      if [[ $hierarchy == 0 && -z $controllers ]]; then cgroup="$path"; break; fi
-    done < /proc/self/cgroup
-    base="/sys/fs/cgroup$cgroup"
-    if [[ -z $cgroup || ! -r $base/memory.max || ! -r $base/memory.swap.max ]]; then
-      echo "Campaign stopped: cgroup v2 memory controls are unavailable." >&2
-      exit 2
-    fi
-    if [[ $(< "$base/memory.max") != "$((expected * 1024 * 1024))" ||
-          $(< "$base/memory.swap.max") != 0 ]]; then
-      echo "Campaign stopped: requested cgroup memory/swap limits were not applied." >&2
-      exit 2
-    fi
-    exec "$@"
-  ' harvest-fuzz-memory-check "$FUZZ_HARD_LIMIT_MB")
-else
-  echo "WARNING: runner cgroup disabled explicitly; external memory protection is required." >&2
-fi
+[[ -r $here/memory_scope.sh ]] || fail "missing $here/memory_scope.sh"
+# shellcheck source=memory_scope.sh
+source "$here/memory_scope.sh"
+memory_scope_launcher "$FUZZ_HARD_LIMIT_MB" FUZZ_HARD_LIMIT_MB || exit 2
 
 mkdir -p "$here/fuzz-artifacts"
 artifacts="$(mktemp -d "$here/fuzz-artifacts/${property}.XXXXXX")"
@@ -79,7 +49,7 @@ export FUZZTEST_REPRODUCERS_OUT_DIR="$artifacts/reproducers"
 export FUZZTEST_TESTSUITE_OUT_DIR="$artifacts/corpus"
 # An OOM report must not create a multi-gigabyte core dump.
 ulimit -c 0
-command=("${launcher[@]}" "${memory_check[@]}" timeout --kill-after=5s
+command=("${MEMORY_SCOPE[@]}" timeout --kill-after=5s
   "$((FUZZ_DURATION_SECONDS + 30))s" "$binary"
   "--fuzz=$property" "--fuzz_for=${FUZZ_DURATION_SECONDS}s"
   "--rss_limit_mb=$FUZZ_RSS_LIMIT_MB"

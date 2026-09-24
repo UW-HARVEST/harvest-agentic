@@ -79,6 +79,7 @@ Two build modes (use separate build directories — do not toggle the flag in pl
 
 - **Unit-test mode** (default build): plain `TEST`s run normally and each
   `FUZZ_TEST` runs briefly as a smoke check. Good for a fast compile-and-check.
+  Run it with `verify_env/run_tests.sh`, like every other unit-test run.
 - **Fuzzing mode**: an instrumented, coverage-guided campaign against one property.
   `verify_env/build_fuzz.sh` configures it (Clang + `-DFUZZTEST_FUZZING_MODE=ON`).
   Run a campaign with:
@@ -101,7 +102,7 @@ campaign:
 - OOM, timeout, signal termination, or a failed launcher is an incomplete
   campaign. Keep the log and file reproducer under
   `verify_env/fuzz-artifacts/`. See `verify_env/README.md` for execution details.
-- Running the ordinary test binary (unit-test mode) only samples each
+- A unit-test run (`verify_env/run_tests.sh`) only samples each
   `FUZZ_TEST` for about a second with no coverage feedback — a smoke check, not
   fuzzing. It will catch shallow divergences but never the ones that need a
   structured or rare-shaped input. Do not treat "the test binary passed" as

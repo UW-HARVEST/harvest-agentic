@@ -4,6 +4,7 @@
 #
 # Requires the translated Rust cdylib to exist (cargo build --release in the
 # parent directory) so tests can dlopen it via RUST_LIB_PATH at run time.
+# Run the tests with run_tests.sh, which applies memory and time limits.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,4 +16,5 @@ cmake --build build-test --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 
 echo
 echo "Built build-test/verification_tests"
-echo "Run:  RUST_LIB_PATH=<abs path to translated .so> ./build-test/verification_tests"
+echo "Run:  RUST_LIB_PATH=<abs path to translated .so> $here/run_tests.sh [GoogleTest flags]"
+echo "Limits: see the configuration block at the top of run_tests.sh"
