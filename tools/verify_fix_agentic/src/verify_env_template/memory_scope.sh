@@ -21,11 +21,17 @@ memory_scope_launcher() {
     echo "${0##*/}: systemd-run is unavailable; use an external cgroup/container and explicitly set $switch_name=0 (see README.md)" >&2
     return 2
   fi
+  # Inside an agent command, stay in harvest.slice, under the memory limit all
+  # harvest agent commands share (agent_runner's agent_env).
+  local slice=()
+  if [[ $(cut -d: -f3 /proc/self/cgroup) == */harvest.slice/* ]]; then
+    slice=(--slice=harvest.slice)
+  fi
   # Failure to create the scope stops the run; never retry the binary unbounded.
   # A user manager can exist on systems without a delegated memory controller;
   # accepting a property alone is not proof that the run is bounded.
   # shellcheck disable=SC2016 # Expand these variables inside the scoped shell.
-  MEMORY_SCOPE=(systemd-run --user --scope --quiet
+  MEMORY_SCOPE=(systemd-run --user --scope --quiet "${slice[@]}"
     -p "MemoryMax=${limit_mb}M" -p MemorySwapMax=0
     bash -c '
     set -euo pipefail

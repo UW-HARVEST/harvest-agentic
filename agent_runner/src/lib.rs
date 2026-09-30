@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use tracing::{info, warn};
 
+mod agent_env;
+
 #[derive(Debug, Clone, Copy)]
 pub enum AgentPhase {
     Translate,
@@ -99,53 +101,22 @@ impl AgentInvocation<'_> {
     }
 }
 
-/// Temporary workaround for a Claude Code CLI bug: recent versions default to
-/// asynchronous sub-agents, and in headless (`claude -p`) mode the process
-/// exits as soon as the main agent ends its turn — killing any sub-agents
-/// still running in the background. Remove once the CLI is fixed.
-const CLAUDE_ASYNC_SUBAGENT_WARNING: &str = "\
-**Claude Code async sub-agent bug** \
-Recent Claude Code versions launch sub-agents asynchronously by default. \
-In this headless (`claude -p`) session that is fatal: ending your turn \
-with an asynchronous sub-agent call ends the entire session \
-instead of waiting for the sub-agent to finish.
-Therefore, you MUST launch EVERY sub-agent with `run_in_background: false` \
-(synchronous). You are still encouraged to launch multiple sub-agents \
-in a single turn when parallel execution is beneficial, but make sure \
-all of them are synchronous.";
-
-/// Temporary workaround for an OpenCode bug (upstream issue #29363): each
-/// model response is capped at 32000 output tokens regardless of the model's
-/// `limit.output`, and thinking tokens count against the same cap. A turn
-/// that burns the full cap in thinking ends without a tool call, OpenCode
-/// treats it as complete, and a sub-agent that ends this way returns an
-/// empty result. `run_bash_agent` raises the cap through
-/// `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`, but a hard cap remains, so the
-/// prompt must also steer the model away from long thinking and monolithic
-/// writes. Remove once the upstream cap respects `limit.output`.
-const OPENCODE_OUTPUT_CAP_WARNING: &str = "\
-**OpenCode output-token cap bug** \
-OpenCode caps the output tokens of each model response (upstream issue #29363). \
-Thinking tokens count against the same cap. \
-If thinking uses the full cap before your first tool call, the turn ends as if it were complete. \
-The session then stops silently. \
-A sub-agent that stops this way returns an empty result and writes no files.
-Therefore: keep thinking short. Do not draft a whole file in thinking. \
-Write long files in parts: create the file with one `write` call, \
-then append each next part with `edit`. Keep each part under ~300 lines. \
-Copy this whole warning into EVERY sub-agent prompt.";
-
 /// Agent-specific temporary bug workarounds, injected into every prompt.
 /// Prompt templates carry an `{AGENT_BUG_WORKAROUNDS}` placeholder, and
-/// prompt-building tools substitute this text for it. Each entry documents a
-/// known upstream bug and the behavior that avoids it. Add new entries here
-/// when an agent backend needs a temporary fix, and remove them when the
-/// upstream fix ships.
+/// prompt-building tools substitute this text for it. Each backend's text
+/// lives in `agent_bug_workarounds/<agent>.md` and states the known upstream
+/// bug and the behavior that avoids it. The main agent must copy it into
+/// every sub-agent prompt, because sub-agents do not see this prompt. Add a
+/// file when a backend needs a temporary fix, and remove it when the upstream
+/// fix ships.
 pub fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Kiro => "",
-        AgentKind::Claude => CLAUDE_ASYNC_SUBAGENT_WARNING,
-        AgentKind::OpenCode => OPENCODE_OUTPUT_CAP_WARNING,
+        // Async sub-agents are killed when a headless `claude -p` session ends.
+        AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),
+        // Upstream #29363. `run_bash_agent` also raises the cap through
+        // `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`, but a hard cap remains.
+        AgentKind::OpenCode => include_str!("agent_bug_workarounds/opencode.md").trim_end(),
     }
 }
 
@@ -495,7 +466,7 @@ fn extract_model_limits_from_output(
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     ensure_workdir_git(invocation.work_dir);
 
-    prepare_agent_files(&invocation)?;
+    prepare_agent_env(&invocation)?;
 
     let logs_dir = invocation
         .work_dir
@@ -614,13 +585,12 @@ fn iso_utc_now() -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
 }
 
-fn prepare_agent_files(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
-        AgentKind::Kiro => Ok(()),
+        AgentKind::Kiro => {}
         AgentKind::Claude => {
             let case_dir = invocation.work_dir.parent().unwrap_or(invocation.work_dir);
             write_claude_sandbox(case_dir)?;
-            Ok(())
         }
         AgentKind::OpenCode => write_opencode_agent(
             invocation.work_dir,
@@ -634,8 +604,10 @@ fn prepare_agent_files(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn s
                     .then(|| format!("cat {}", invocation.phase.recovery_files().join(" "))),
             },
             invocation.model,
-        ),
+            agent_env::install(run_tempdir(invocation.work_dir)).as_deref(),
+        )?,
     }
+    Ok(())
 }
 
 fn invoke_kiro(
@@ -1309,10 +1281,14 @@ fn run_tempdir(work_dir: &Path) -> &Path {
 /// `snapshot` is disabled. OpenCode snapshots a git work tree twice per agent
 /// step to back interactive undo/revert. It is the heaviest path-lookup load
 /// and coincided with `path_is_under` kernel Oops. A headless run does not need it anyways.
+///
+/// `shell` runs the agent's commands under memory limits (see `agent_env`).
+/// OpenCode uses it for tool calls, sub-agents included.
 fn opencode_project_config(
     work_dir: &Path,
     model: Option<&str>,
     staged_provider: Option<&(String, serde_json::Value)>,
+    shell: Option<&Path>,
 ) -> String {
     let tempdir_pattern = format!("{}/**", run_tempdir(work_dir).display());
     // The pin wins over a staged entry: a user shadowing a built-in provider
@@ -1331,10 +1307,19 @@ fn opencode_project_config(
         ),
         None => String::new(),
     };
+    let shell_line = shell
+        .map(|path| {
+            format!(
+                "\n  \"shell\": {},",
+                serde_json::to_string(&path.display().to_string())
+                    .expect("path serializes to JSON")
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"{{
   "$schema": "https://opencode.ai/config.json",
-  "snapshot": false,
+  "snapshot": false,{}
   "permission": {{
     "external_directory": {{
       "*": "deny",
@@ -1343,6 +1328,7 @@ fn opencode_project_config(
   }}{}
 }}
 "#,
+        shell_line,
         serde_json::to_string(&tempdir_pattern).expect("path pattern serializes to JSON"),
         provider_block,
     )
@@ -1450,6 +1436,7 @@ fn write_opencode_agent(
     work_dir: &Path,
     config: OpenCodeAgentConfig<'_>,
     model: Option<&str>,
+    shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agents_dir = work_dir.join(".opencode/agents");
     fs::create_dir_all(&agents_dir)?;
@@ -1458,7 +1445,7 @@ fn write_opencode_agent(
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     fs::write(
         work_dir.join(".opencode/opencode.json"),
-        opencode_project_config(work_dir, model, staged.as_ref()),
+        opencode_project_config(work_dir, model, staged.as_ref(), shell),
     )?;
 
     let mut permissions = String::new();
@@ -1610,15 +1597,6 @@ mod tests {
         assert!(!claude_uses_ccr(None));
     }
 
-    #[test]
-    fn agent_bug_workarounds_are_agent_specific() {
-        assert_eq!(agent_bug_workarounds(AgentKind::Kiro), "");
-        assert!(agent_bug_workarounds(AgentKind::Claude).contains("run_in_background: false"));
-        let opencode = agent_bug_workarounds(AgentKind::OpenCode);
-        assert!(opencode.contains("#29363"));
-        assert!(opencode.contains("sub-agent prompt"));
-    }
-
     /// Writes a JSONL log with the given events and assesses it.
     fn assess_log(lines: &[&str]) -> OpenCodeOutcome {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1717,7 +1695,7 @@ mod tests {
     #[test]
     fn opencode_project_config_scopes_external_directory_to_run_tempdir() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, None, None);
+        let raw = opencode_project_config(work_dir, None, None, None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         let rules = config
@@ -1748,7 +1726,7 @@ mod tests {
             (Some("openrouter/xiaomi/mimo-v2.5-pro"), None),
             (Some("harvest-hyak/qwen3.8-27b"), Some(&staged)),
         ] {
-            let raw = opencode_project_config(work_dir, model, staged);
+            let raw = opencode_project_config(work_dir, model, staged, None);
             let config: serde_json::Value =
                 serde_json::from_str(&raw).expect("project config must be valid JSON");
             assert_eq!(config.get("snapshot"), Some(&serde_json::json!(false)));
@@ -1756,9 +1734,32 @@ mod tests {
     }
 
     #[test]
+    fn opencode_project_config_sets_shell_only_when_given() {
+        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let shell = Path::new("/tmp/.tmpAbc123/agent_env/harvest-shell");
+        let with: serde_json::Value =
+            serde_json::from_str(&opencode_project_config(work_dir, None, None, Some(shell)))
+                .expect("project config must be valid JSON");
+        assert_eq!(
+            with.get("shell"),
+            Some(&serde_json::json!(
+                "/tmp/.tmpAbc123/agent_env/harvest-shell"
+            ))
+        );
+        let without: serde_json::Value =
+            serde_json::from_str(&opencode_project_config(work_dir, None, None, None)).unwrap();
+        assert!(without.get("shell").is_none());
+    }
+
+    #[test]
     fn opencode_project_config_pins_openrouter_to_author_endpoint() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, Some("openrouter/xiaomi/mimo-v2.5-pro"), None);
+        let raw = opencode_project_config(
+            work_dir,
+            Some("openrouter/xiaomi/mimo-v2.5-pro"),
+            None,
+            None,
+        );
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         let opts = config
@@ -1777,7 +1778,7 @@ mod tests {
     #[test]
     fn opencode_project_config_no_pin_for_non_openrouter() {
         let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, Some("opencode-go/mimo-v2.5"), None);
+        let raw = opencode_project_config(work_dir, Some("opencode-go/mimo-v2.5"), None, None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         assert!(config.get("provider").is_none());
@@ -1794,6 +1795,7 @@ mod tests {
             work_dir,
             Some("harvest-hyak/qwen3.8-27b"),
             Some(&("harvest-hyak".to_string(), definition)),
+            None,
         );
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
@@ -1815,6 +1817,7 @@ mod tests {
                 "openrouter".to_string(),
                 serde_json::json!({"npm": "shadowed"}),
             )),
+            None,
         );
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
@@ -1838,10 +1841,14 @@ mod tests {
                 recovery_command: None,
             },
             None,
+            None,
         )
         .unwrap();
         let config = fs::read_to_string(dir.path().join(".opencode/opencode.json")).unwrap();
-        assert_eq!(config, opencode_project_config(dir.path(), None, None));
+        assert_eq!(
+            config,
+            opencode_project_config(dir.path(), None, None, None)
+        );
         let agent_md =
             fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md")).unwrap();
         // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
@@ -1867,6 +1874,7 @@ mod tests {
                 description: "test",
                 recovery_command: Some("cat PLAN.md HYPOTHESES.md".to_string()),
             },
+            None,
             None,
         )
         .unwrap();

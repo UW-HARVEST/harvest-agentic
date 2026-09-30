@@ -1,0 +1,2 @@
+**OpenCode output-token cap bug** OpenCode caps the output tokens of each model response. Thinking tokens count against the same cap. If thinking uses the full cap before your first tool call, the turn ends as if it were complete. The session then stops silently. A sub-agent that stops this way returns an empty result and writes no files.
+Therefore, keep thinking short. Do not draft a whole file in thinking. Write long files in parts. Keep each part under ~300 lines. Copy this whole warning into every sub-agent prompt.

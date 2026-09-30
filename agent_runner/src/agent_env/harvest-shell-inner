@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Runs one agent command inside its scope and tells the agent when the shared
+# memory limit stopped or slowed it. Stays small, so the OOM killer picks the
+# command.
+set -uo pipefail
+
+cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
+slice="${cg%/*}"
+
+# A signal to this PID (OpenCode timeout or abort) kills the whole command,
+# including children that left its process group.
+trap 'echo 1 > "$cg/cgroup.kill"' TERM INT HUP
+# A background job reads /dev/null unless stdin is passed on explicitly.
+exec 3<&0
+/bin/bash -c "$1" <&3 3<&- &
+child=$!
+while :; do
+  # The redirect drops bash's own "Killed" job report, not the command's stderr.
+  wait "$child" 2>/dev/null
+  rc=$?
+  kill -0 "$child" 2>/dev/null || break  # else a trapped signal cut the wait short
+done
+
+mem_mb=$(( $(< "$slice/memory.max") >> 20 ))
+if (( $(awk '$1 == "oom_kill" { print $2 }' "$cg/memory.events.local") > 0 )); then
+  echo "[harvest] killed: the harvest agent commands on this machine together used up their" \
+    "$mem_mb MiB of memory and $(( $(< "$slice/memory.swap.max") >> 20 )) MiB of swap, and the OOM" \
+    "killer chose this one. Use less memory, or run fewer memory-heavy commands at once." >&2
+elif (( (swap_mb = $(< "$cg/memory.swap.peak") >> 20) >= 64 )); then
+  echo "[harvest] note: this command had up to $swap_mb MiB swapped out because the memory" \
+    "shared by harvest agent commands ($mem_mb MiB) was full; that made it slower." >&2
+fi
+exit "$rc"

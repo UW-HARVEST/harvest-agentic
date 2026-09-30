@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# OpenCode's `shell` for agent runs (see agent_env.rs). OpenCode runs every
+# bash tool call as `harvest-shell -c <command>`. Each command gets its own
+# scope under harvest.slice, which holds the memory and swap limits that all
+# harvest agent commands on this machine share.
+set -euo pipefail
+
+# Anything other than a tool call (e.g. an interactive terminal) is plain bash.
+[[ $# -eq 2 && $1 == -c ]] || exec /bin/bash "$@"
+
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# exec keeps the PID OpenCode spawned, so its timeout and abort signals land.
+exec systemd-run --user --scope --quiet --collect --expand-environment=no \
+  --slice=harvest.slice -p OOMPolicy=continue \
+  "$here/harvest-shell-inner" "$2"
