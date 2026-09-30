@@ -214,12 +214,17 @@ class Turn:
     from the previous Turn has completed and returned a result. This
     includes Agent tool calls (sub-agents), which may internally span
     many turns of their own. The next API request carries the full
-    accumulated context: all prior content + all tool results.
+    accumulated context: all prior content + all tool results. (Claude
+    Code may START a tool before the response finishes streaming, so a
+    result can appear in the trace between chunks of the same Turn.)
 
     turn_index counts only the turns of the agent that owns this
     conversation. Sub-agent turns (nested inside a SubAgent) are counted
     separately in their own conversation and never contribute to the
-    parent's index. This matches the num_turns field in the result event.
+    parent's index. This does NOT match the result event's num_turns,
+    which Claude Code appears to count per tool-result round trip (the old
+    per-round-trip split matched it), so a response with N parallel tool
+    calls adds up to N there but 1 here.
     """
     turn_index: int
     content_blocks: list[ContentBlock] = field(default_factory=list)
@@ -428,6 +433,34 @@ def _wall_clock_ms(events: list[tuple[int, dict]]) -> int:
     return int((last_ts - first_ts).total_seconds() * 1000)
 
 
+def _claude_turn_starts(records: list[tuple[int, dict]]) -> list[int]:
+    """Indices of the assistant records that open a new Turn.
+
+    Claude Code streams one API response as several assistant records that
+    share `message.id`, and runs each tool as soon as its block arrives. So a
+    user tool_result can sit between two chunks of the same response (e.g. a
+    fast sub-agent returns while the model is still writing the next Agent
+    call). A Turn therefore starts where `message.id` changes. Records without
+    an id fall back to "assistant after a non-assistant record"."""
+    starts: list[int] = []
+    cur_mid: Optional[str] = None
+    prev_was_assistant = False
+    for idx, (_, obj) in enumerate(records):
+        if obj.get("type") != "assistant":
+            prev_was_assistant = False
+            continue
+        mid = (obj.get("message") or {}).get("id") or None
+        if mid is not None and cur_mid is not None:
+            new_turn = mid != cur_mid
+        else:
+            new_turn = not prev_was_assistant
+        if new_turn or not starts:
+            starts.append(idx)
+        cur_mid = mid
+        prev_was_assistant = True
+    return starts
+
+
 def _extract_tool_result_content(raw_content) -> str:
     if isinstance(raw_content, str):
         return raw_content
@@ -623,17 +656,11 @@ class TraceParser:
         session.conversation = self._parse_conversation(main_records)
 
         # Locate each compact event in the main turn sequence by counting how
-        # many turn boundaries fall before its line number. A turn boundary
-        # is an assistant record that does not immediately follow another
-        # assistant record (consecutive assistant records are streamed chunks
-        # of one API response).
-        turn_start_linenos: list[int] = []
-        prev_was_assistant = False
-        for lineno, obj in main_records:
-            is_assistant = obj.get("type") == "assistant"
-            if is_assistant and not prev_was_assistant:
-                turn_start_linenos.append(lineno)
-            prev_was_assistant = is_assistant
+        # many turn boundaries fall before its line number. Same boundary rule
+        # as _parse_conversation, so the indices line up.
+        turn_start_linenos = [
+            main_records[idx][0] for idx in _claude_turn_starts(main_records)
+        ]
         for ev in session.compact_events:
             ev.after_turn_index = sum(
                 1 for ts in turn_start_linenos if ts < ev.line_number
@@ -763,32 +790,29 @@ class TraceParser:
         """
         Build a Turn list from a flat sequence of assistant/user records.
 
-        A new Turn begins at each assistant record that follows a non-
-        assistant record. Consecutive assistant records belong to the same
-        Turn (they are streaming chunks of one API response).
+        Turn boundaries follow _claude_turn_starts (one Turn per API
+        response, keyed by message.id).
 
-        Tool results are matched to ToolUse by tool_use_id, not by position,
-        so parallel tool calls with out-of-order results are handled correctly.
+        Tool results are matched to ToolUse by tool_use_id across the whole
+        conversation, not by position: Claude Code starts running a tool as
+        soon as its block streams in, so a result can land between two
+        chunks of the same response, or after later chunks.
         """
         turns: list[Turn] = []
-        i = 0
+        pending: dict[str, ToolUse] = {}   # tool_use_id -> ToolUse
+        starts = set(_claude_turn_starts(records))
+        turn: Optional[Turn] = None
 
-        while i < len(records):
-            _, obj = records[i]
-            if obj.get("type") != "assistant":
-                i += 1
-                continue
-
-            turn = Turn(turn_index=len(turns) + 1)
-            pending: dict[str, ToolUse] = {}   # tool_use_id -> ToolUse
-            last_usage: Optional[TokenUsage] = None
-
-            # Collect consecutive assistant records (one API response)
-            while i < len(records) and records[i][1].get("type") == "assistant":
-                msg = records[i][1].get("message", {})
+        for idx, (_, obj) in enumerate(records):
+            typ = obj.get("type")
+            msg = obj.get("message", {})
+            if typ == "assistant":
+                if idx in starts:
+                    turn = Turn(turn_index=len(turns) + 1)
+                    turns.append(turn)
                 raw_usage = msg.get("usage")
                 if raw_usage:
-                    last_usage = _parse_token_usage(raw_usage)
+                    turn.usage = _parse_token_usage(raw_usage)
                 for block in msg.get("content", []):
                     btype = block.get("type")
                     if btype == "thinking":
@@ -809,26 +833,19 @@ class TraceParser:
                         turn.content_blocks.append(ContentBlock(
                             type="tool_use", tool_use=tu,
                         ))
-                i += 1
-
-            turn.usage = last_usage
-
-            # Collect following user records (tool results for this turn)
-            while i < len(records) and records[i][1].get("type") == "user":
-                msg = records[i][1].get("message", {})
-                for block in msg.get("content", []):
+            elif typ == "user":
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
                     if block.get("type") == "tool_result":
                         tid = block.get("tool_use_id", "")
-                        result = ToolResult(
-                            tool_use_id=tid,
-                            content=_extract_tool_result_content(block.get("content", "")),
-                            is_error=block.get("is_error", False),
-                        )
                         if tid in pending:
-                            pending[tid].result = result
-                i += 1
-
-            turns.append(turn)
+                            pending[tid].result = ToolResult(
+                                tool_use_id=tid,
+                                content=_extract_tool_result_content(block.get("content", "")),
+                                is_error=block.get("is_error", False),
+                            )
 
         return turns
 
