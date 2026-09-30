@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-parse_trace.py — Multi-format parser for agentic coding session traces.
+parse_trace.py — Parser and visualizer for HARVEST agent session traces.
 
-Supports two trace formats:
-  - **Claude Code** (default): mixed plain-text + JSON Lines with
-    assistant/user message records, sub-agent task brackets, and
-    per-model usage summaries.
-  - **OpenCode** (`--format opencode`): flat JSONL event stream with
-    `step_start`, `reasoning`, `text`, `tool_use`, and `step_finish`
-    events.  Token/cost totals arrive per-step rather than per-session.
+A trace is the captured stdout of a benchmark run: agent_runner log lines
+interleaved with the agent's JSON stream. Two agent formats are supported
+and auto-detected (`--format auto|claude|opencode`):
 
-Auto-detection (`--format auto`, the default) peeks at the first few
-JSON records and chooses the right parser automatically.
+  - **Claude Code** `stream-json`: assistant/user records (sub-agent records
+    carry `parent_tool_use_id`), system/task_* monitoring events, and a final
+    `result` event with per-model usage.
+  - **OpenCode**: the `--format=json` event stream, plus the `opencode
+    export` blocks that agent_runner appends after each run. Per session the
+    most complete source wins: in-file export > live `opencode export` >
+    JSONL. Child sessions (sub-agents) are attached under their parent's
+    `task` call.
+
+Pipeline:
+  1. Parse into one agent-agnostic IR: Session → Turn → ContentBlock /
+     ToolUse, where ToolUse.subagent nests a sub-agent's own Turns.
+  2. Name each root session's stage and get its process wall time from the
+     agent_runner "Invoking … agent" markers.
+  3. Render from the IR: session statistics (default), readable transcript
+     (-r), SVG timeline (-v), per-file I/O report (-f).
 
 Usage:
-    python3 parse_trace.py trace.txt              # auto-detect
+    python3 parse_trace.py trace.txt              # print statistics
+    python3 parse_trace.py trace.txt -vr          # SVG + readable transcript
     python3 parse_trace.py trace.txt --format claude
-    python3 parse_trace.py trace.txt -r -v        # readable + SVG
 """
 
 from __future__ import annotations
@@ -30,11 +40,12 @@ import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from datetime import datetime
+from typing import Iterator, Literal, Optional
 
 
 # ---------------------------------------------------------------------------
-# Data Structures
+# Data structures: the agent-agnostic IR
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -78,9 +89,10 @@ class ToolResult:
 @dataclass
 class SubAgent:
     """
-    A sub-agent invocation embedded inside an Agent tool call.
+    A sub-agent invocation embedded inside an Agent tool call (Claude Code
+    Agent/Task/Workflow, or an OpenCode `task` call with its child session).
 
-    SYNC vs ASYNC:
+    SYNC vs ASYNC (Claude Code):
     - Synchronous (default; `run_in_background` not set or false): the parent's
       API call loop blocks until this SubAgent finishes and returns its result.
       Its full conversation is recorded in the trace as assistant/user records
@@ -146,9 +158,10 @@ class ToolUse:
     position, so parallel results that arrive out of order are handled
     correctly.
 
-    Sub-agent case: when name == "Agent", this ToolUse spawns a sub-agent.
-    The subtask field holds the full nested execution. The parent turn does
-    not advance until subtask completes and result is populated.
+    Sub-agent case: when name is Agent/Task/Workflow (Claude) or task
+    (OpenCode), this ToolUse spawns a sub-agent and the `subagent` field holds
+    the full nested execution. For a sync sub-agent, the parent turn does not
+    advance until it completes and `result` is populated.
     """
     id: str       # tool_use_id
     name: str     # e.g. "Bash", "Read", "Write", "Agent", "Edit"
@@ -271,11 +284,6 @@ class Turn:
         return [b.text for b in self.content_blocks
                 if b.type == "text" and b.text is not None]
 
-    @property
-    def is_final(self) -> bool:
-        """True if this turn produced no tool calls (conversation end)."""
-        return len(self.tool_uses) == 0
-
 
 @dataclass
 class MonitoringEvent:
@@ -362,7 +370,7 @@ class Session:
     SEPARATION OF CONCERNS:
     - conversation: only the top-level agent's Turns (pure API history)
     - monitoring:   framework events that never entered the API
-    Sub-agent turns live recursively inside ToolUse.subtask.conversation,
+    Sub-agent turns live recursively inside ToolUse.subagent.conversation,
     not in this list. This preserves the tree structure of nested agents
     while keeping the top-level view clean.
     """
@@ -374,7 +382,7 @@ class Session:
     # implies nothing about which stage it is. Unknown renders as no name.
     phase: Optional[str]
     agent_type: str = "claude"  # "claude" | "opencode"
-    data_source: str = "jsonl"  # "export" | "live-export" | "jsonl" | "sqlite"
+    data_source: str = "jsonl"  # "export" | "live-export" | "jsonl"
 
     init: Optional[InitEvent] = None
     conversation: list[Turn] = field(default_factory=list)
@@ -400,14 +408,42 @@ class Session:
 
 
 # ---------------------------------------------------------------------------
-# Parser
+# Input helpers
 # ---------------------------------------------------------------------------
+
+# Tool names (lowercased) that dispatch a sub-agent. Some consumers count only
+# Agent/Task: a Workflow call carries its phases as injected synthetic Task
+# calls (see TraceParser), so it is not an agent of its own there.
+_SUBAGENT_TOOLS = ("agent", "task", "workflow")
+_AGENT_TOOLS = ("agent", "task")
+
+
+def _iter_json_lines(path: str) -> Iterator[tuple[int, dict]]:
+    """Yield (lineno, obj) for every line of `path` that is a JSON object on
+    its own. Log lines and malformed JSON are skipped."""
+    with open(path, "r") as f:
+        for lineno, line in enumerate(f, 1):
+            stripped = line.strip()
+            if stripped.startswith("{"):
+                try:
+                    yield lineno, json.loads(stripped)
+                except json.JSONDecodeError:
+                    pass
+
+
+def _group_by_session(
+    records: Iterator[tuple[int, dict]], key: str,
+) -> dict[str, list[tuple[int, dict]]]:
+    by_session: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for lineno, obj in records:
+        by_session[obj.get(key, "unknown")].append((lineno, obj))
+    return by_session
+
 
 def _wall_clock_ms(events: list[tuple[int, dict]]) -> int:
     """Span between the earliest and latest event `timestamp` across `events`.
     Handles both ISO-8601 strings (Claude Code) and epoch-ms integers (OpenCode).
     Returns 0 if no timestamps are available."""
-    from datetime import datetime
     first_ts = None
     last_ts = None
     for _, obj in events:
@@ -432,6 +468,10 @@ def _wall_clock_ms(events: list[tuple[int, dict]]) -> int:
         return 0
     return int((last_ts - first_ts).total_seconds() * 1000)
 
+
+# ---------------------------------------------------------------------------
+# Claude Code parser (stream-json)
+# ---------------------------------------------------------------------------
 
 def _claude_turn_starts(records: list[tuple[int, dict]]) -> list[int]:
     """Indices of the assistant records that open a new Turn.
@@ -484,46 +524,32 @@ def _parse_token_usage(raw: dict) -> TokenUsage:
 
 class TraceParser:
     def parse_file(self, path: str) -> list[Session]:
-        """Read the trace file and return one Session per session_id."""
-        records: list[tuple[int, dict]] = []
-        with open(path, "r") as f:
-            for lineno, line in enumerate(f, 1):
-                stripped = line.strip()
-                if stripped.startswith("{"):
-                    try:
-                        records.append((lineno, json.loads(stripped)))
-                    except json.JSONDecodeError:
-                        pass
-
-        by_session: dict[str, list[tuple[int, dict]]] = defaultdict(list)
-        for lineno, obj in records:
-            sid = obj.get("session_id", "unknown")
-            by_session[sid].append((lineno, obj))
-
-        # The stage is not guessed from position; _apply_runner_phases fills
-        # it in from the runner's markers when the trace has them.
-        sessions = [
-            self._parse_session(sid, None, events)
+        """Read the trace file and return one Session per session_id.
+        The stage is not guessed from position; _apply_runner_phases fills
+        it in from the runner's markers when the trace has them."""
+        by_session = _group_by_session(_iter_json_lines(path), "session_id")
+        return [
+            self._parse_session(sid, events)
             for sid, events in by_session.items()
         ]
-        return sessions
 
     def _parse_session(
-        self, session_id: str, phase: str, events: list[tuple[int, dict]]
+        self, session_id: str, events: list[tuple[int, dict]]
     ) -> Session:
-        session = Session(session_id=session_id, phase=phase)
+        session = Session(session_id=session_id, phase=None)
 
         # ------------------------------------------------------------------
-        # Step 1: Identify sub-agent brackets.
+        # Step 1: Collect sub-agent metadata from the monitoring events.
         #
-        # A sub-agent bracket is the range of event indices [start+1, end)
-        # between a system/task_started and its matching task_notification,
-        # both carrying the same tool_use_id.
-        # Records inside a bracket belong to the sub-agent's conversation.
+        # task_started opens a sub-agent and task_notification closes it
+        # (same tool_use_id). The event indices in between form its
+        # "bracket". Brackets are used only to drop a sub-agent's own
+        # compact_boundary events from the main timeline; conversation
+        # records are routed by parent_tool_use_id in Step 2.
         # ------------------------------------------------------------------
         subagent_map: dict[str, SubAgent] = {}   # tool_use_id -> SubAgent
         task_stack: dict[str, int] = {}        # tool_use_id -> event index
-        task_brackets: dict[str, tuple[int, int]] = {}  # tool_use_id -> (start, end)
+        in_bracket: set[int] = set()           # event indices inside a sub-agent bracket
         workflow_tasks: dict[str, str] = {}    # task_id -> tool_use_id
         workflow_progress: dict[str, list[dict]] = defaultdict(list)  # tool_use_id -> progress events
 
@@ -534,30 +560,23 @@ class TraceParser:
                 task_id = obj.get("task_id", "")
                 if tid:
                     if obj.get("task_type") == "local_workflow":
-                        # Workflow: don't open a bracket (no task_notification).
-                        # Collect progress events and synthesize later.
+                        # Workflow: no bracket (no task_notification). Collect
+                        # its progress events and synthesize phases later.
                         workflow_tasks[task_id] = tid
-                        subagent_map[tid] = SubAgent(
-                            task_id=task_id,
-                            tool_use_id=tid,
-                            description=obj.get("description", ""),
-                            prompt=obj.get("prompt", ""),
-                            status="running",
-                        )
                     else:
                         task_stack[tid] = i
-                        subagent_map[tid] = SubAgent(
-                            task_id=task_id,
-                            tool_use_id=tid,
-                            description=obj.get("description", ""),
-                            prompt=obj.get("prompt", ""),
-                            status="running",
-                        )
+                    subagent_map[tid] = SubAgent(
+                        task_id=task_id,
+                        tool_use_id=tid,
+                        description=obj.get("description", ""),
+                        prompt=obj.get("prompt", ""),
+                        status="running",
+                    )
             elif sub == "task_notification":
                 tid = obj.get("tool_use_id", "")
                 if tid and tid in task_stack:
                     start_idx = task_stack.pop(tid)
-                    task_brackets[tid] = (start_idx, i)
+                    in_bracket.update(range(start_idx + 1, i))
                     st = subagent_map[tid]
                     st.status = obj.get("status", "completed")
                     usage = obj.get("usage", {})
@@ -588,12 +607,6 @@ class TraceParser:
                         if patch.get("status"):
                             subagent_map[tid].status = patch["status"]
 
-        # Map each event index to the sub-agent tool_use_id it belongs to
-        subagent_index: dict[int, str] = {}
-        for tid, (start, end) in task_brackets.items():
-            for i in range(start + 1, end):
-                subagent_index[i] = tid
-
         # ------------------------------------------------------------------
         # Step 2: Route each event to main conversation, sub-agent bucket,
         # or monitoring.
@@ -611,7 +624,7 @@ class TraceParser:
                 ))
                 if sub == "init":
                     session.init = self._parse_init(obj)
-                elif sub == "compact_boundary" and i not in subagent_index:
+                elif sub == "compact_boundary" and i not in in_bracket:
                     md = obj.get("compact_metadata") or {}
                     session.compact_events.append(CompactEvent(
                         pre_tokens=md.get("pre_tokens", 0),
@@ -629,12 +642,11 @@ class TraceParser:
             if typ not in ("assistant", "user"):
                 continue
 
-            # Route by parent_tool_use_id, NOT by task_brackets index ranges.
-            # When the main agent dispatches a second sub-agent before the first
-            # one finishes (e.g. it doesn't strictly wait), the brackets overlap
-            # and `subagent_index[i] = tid` becomes last-write-wins, mis-routing
-            # any record (including the parent's own tool_result) that falls in
-            # the overlap. parent_tool_use_id is the authoritative pointer:
+            # Route by parent_tool_use_id, NOT by bracket index ranges. When
+            # the main agent dispatches a second sub-agent before the first
+            # one finishes, the brackets overlap and cannot say which one a
+            # record (including the parent's own tool_result) belongs to.
+            # parent_tool_use_id is the authoritative pointer:
             # main-agent records have it empty, sub-agent records carry their
             # parent's tool_use_id. See c17 T17/T19 for the failure mode.
             parent_tid = obj.get("parent_tool_use_id") or ""
@@ -857,7 +869,7 @@ class TraceParser:
             for block in turn.content_blocks:
                 if block.type == "tool_use" and block.tool_use is not None:
                     tu = block.tool_use
-                    if tu.name.lower() in ("agent", "task", "workflow") and tu.id in subagent_map:
+                    if tu.name.lower() in _SUBAGENT_TOOLS and tu.id in subagent_map:
                         tu.subagent = subagent_map[tu.id]
 
     def _parse_init(self, obj: dict) -> InitEvent:
@@ -896,9 +908,966 @@ class TraceParser:
         )
 
 
+# Map from progress-event description prefix (per `last_tool_name`) to
+# regex that strips the prefix to recover the closest thing to the original
+# tool input. The prefix scheme is set by the framework, see how each tool
+# emits task_progress descriptions: e.g. Read → "Reading <path>", Bash →
+# "Running <agent-supplied-description>", etc.
+_PROGRESS_PREFIX = {
+    "Read":  re.compile(r"^Reading\s+", re.IGNORECASE),
+    "Write": re.compile(r"^Writing\s+", re.IGNORECASE),
+    "Edit":  re.compile(r"^Editing\s+", re.IGNORECASE),
+    "Glob":  re.compile(r"^Finding\s+", re.IGNORECASE),
+    "Grep":  re.compile(r"^Searching for\s+", re.IGNORECASE),
+    "Bash":  re.compile(r"^Running\s+", re.IGNORECASE),
+}
+
+
+def _synthesize_async_subagent_turns(
+    snapshots: list[ProgressSnapshot],
+) -> list[Turn]:
+    """Async sub-agents have no parented conversation records in the trace,
+    only `task_progress` snapshots. Build one pseudo-Turn per snapshot, each
+    holding a single ToolUse named after `last_tool_name`. Sizes use
+    `total_tokens` deltas as a proxy for "context grown by this tool call".
+
+    The synthesized turns are approximate — exact tool inputs/outputs are not
+    in the trace — but they are enough for the visualizer to render the
+    activity, and tooltips carry the framework-supplied description.
+
+    Per-tool input population: framework progress descriptions follow stable
+    prefix patterns ("Reading <path>", "Running <bash-desc>", ...). We strip
+    the prefix and put the body into the field _classify_tool / _segment_turn
+    expects (command for Bash, file_path for Read/Write/Edit, pattern for
+    Glob/Grep), so downstream classifiers see something useful instead of an
+    empty input dict.
+    """
+    turns: list[Turn] = []
+    prev_tokens = 0
+    for idx, snap in enumerate(snapshots):
+        token_delta = max(snap.total_tokens - prev_tokens, 0)
+        prev_tokens = snap.total_tokens
+        tool_name = snap.last_tool_name or "Bash"
+        # Strip the framework prefix to recover the body.
+        body = snap.description or ""
+        prefix_re = _PROGRESS_PREFIX.get(tool_name)
+        if prefix_re is not None:
+            body = prefix_re.sub("", body, count=1)
+        # Populate the input field downstream code looks at, by tool kind.
+        synthetic_input: dict = {"description": snap.description}
+        if tool_name == "Bash":
+            synthetic_input["command"] = body
+        elif tool_name in ("Read", "Write", "Edit"):
+            synthetic_input["file_path"] = body
+        elif tool_name in ("Glob", "Grep"):
+            synthetic_input["pattern"] = body
+        tu = ToolUse(
+            id=f"async-progress-{idx}",
+            name=tool_name,
+            input=synthetic_input,
+            size_override=token_delta,
+        )
+        turn = Turn(turn_index=len(turns) + 1)
+        turn.content_blocks.append(ContentBlock(type="tool_use", tool_use=tu))
+        turns.append(turn)
+    return turns
+
+
+def _synthesize_workflow_agent_turns(
+    progress_events: list[dict],
+    prev_tokens: int = 0,
+) -> tuple[list[Turn], int]:
+    """Workflow tasks contain multiple sequential agents, each tracked by
+    `task_progress` events.  Build one pseudo-Turn per progress event,
+    using token deltas between consecutive events to approximate work done.
+
+    The `workflow_progress` array in each event contains `workflow_agent`
+    entries with `lastToolName` and `lastToolSummary`, which describe the
+    actual tool the agent was using.  Use these for colorized tool names
+    instead of the generic "Other" fallback.
+
+    `prev_tokens` carries across agents because total_tokens is cumulative
+    across the entire workflow.  Returns (turns, final_prev_tokens).
+    """
+    turns: list[Turn] = []
+    for idx, ev in enumerate(progress_events):
+        usage = ev.get("usage", {})
+        total_tokens = usage.get("total_tokens", 0)
+        token_delta = max(total_tokens - prev_tokens, 0)
+        prev_tokens = total_tokens
+
+        desc = ev.get("description", "") or "workflow-step"
+
+        # Extract phase title and actual tool info from workflow_progress.
+        phase_title = ""
+        tool_name = ""
+        tool_summary = ""
+        for wp in ev.get("workflow_progress") or []:
+            if wp.get("type") == "workflow_phase":
+                phase_title = wp.get("title", "")
+            elif wp.get("type") == "workflow_agent":
+                # Prefer the most recent agent entry's tool info.
+                tn = wp.get("lastToolName", "")
+                ts = wp.get("lastToolSummary", "")
+                if tn:
+                    tool_name = tn
+                if ts:
+                    tool_summary = ts
+
+        label = f"{phase_title}: {desc}" if phase_title and phase_title not in desc else desc
+
+        # Build a ToolUse with the real tool name so _classify_tool assigns
+        # the right category (Read → read, Write → write, Bash → by command).
+        effective_name = tool_name if tool_name else "Other"
+        synthetic_input: dict = {"description": label}
+        if tool_name:
+            if tool_name.lower() == "bash":
+                synthetic_input["command"] = tool_summary
+            elif tool_name.lower() in ("read", "write", "edit"):
+                synthetic_input["file_path"] = tool_summary
+            elif tool_name.lower() == "apply_patch":
+                synthetic_input["patchText"] = tool_summary
+            elif tool_name.lower() in ("glob", "grep"):
+                synthetic_input["pattern"] = tool_summary
+
+        tu = ToolUse(
+            id=f"workflow-step-{idx}",
+            name=effective_name,
+            input=synthetic_input,
+            size_override=token_delta,
+        )
+        turn = Turn(turn_index=len(turns) + 1)
+        turn.content_blocks.append(ContentBlock(type="tool_use", tool_use=tu))
+        turns.append(turn)
+    return turns, prev_tokens
+
+
 # ---------------------------------------------------------------------------
-# Validation / Statistics
+# OpenCode parsers (JSONL stream, session exports, child sessions)
 # ---------------------------------------------------------------------------
+
+class OpenCodeParser:
+    """Parse an OpenCode --format=json event stream into Session objects.
+
+    OpenCode emits a flat JSONL stream:
+      step_start → reasoning? → text? → tool_use* → step_finish
+
+    Each step_start/step_finish pair becomes one Turn.
+    tool_use events carry both input AND output inside `part.state`.
+    Token/cost totals arrive in step_finish.
+    """
+
+    def parse_file(self, path: str) -> list[Session]:
+        """Parse every JSON line of `path` as JSONL events. Used only as the
+        last-resort fallback of parse_trace_file."""
+        by_session = _group_by_session(_iter_json_lines(path), "sessionID")
+        return [
+            self._parse_session(sid, events)
+            for sid, events in by_session.items()
+        ]
+
+    def _parse_session(
+        self, session_id: str, events: list[tuple[int, dict]]
+    ) -> Session:
+        session = Session(session_id=session_id, phase=None, agent_type="opencode", data_source="jsonl")
+        session.wall_clock_ms = _wall_clock_ms(events)
+
+        current_turn: Optional[Turn] = None
+        turn_index = 0
+        step_cost = 0.0
+
+        for lineno, obj in events:
+            typ = obj.get("type", "")
+            part = obj.get("part", {})
+
+            if typ == "step_start":
+                turn_index += 1
+                current_turn = Turn(turn_index=turn_index)
+                continue
+
+            if typ == "reasoning" and current_turn is not None:
+                text = part.get("text", "")
+                if text:
+                    current_turn.content_blocks.append(
+                        ContentBlock(type="thinking", thinking=text)
+                    )
+                continue
+
+            if typ == "text" and current_turn is not None:
+                text = part.get("text", "")
+                if text:
+                    current_turn.content_blocks.append(
+                        ContentBlock(type="text", text=text)
+                    )
+                continue
+
+            if typ == "tool_use" and current_turn is not None:
+                tool_name = part.get("tool", "unknown")
+                state = part.get("state", {})
+                inp = _opencode_tool_input(state)
+                output = state.get("output")
+                status = state.get("status", "")
+                call_id = part.get("callID", f"oc-{lineno}")
+
+                result = None
+                if output is not None or status:
+                    result = ToolResult(
+                        tool_use_id=call_id,
+                        content=str(output) if output is not None else "",
+                        is_error=status in ("error", "failed"),
+                    )
+
+                tu = ToolUse(id=call_id, name=tool_name, input=inp, result=result)
+                current_turn.content_blocks.append(
+                    ContentBlock(type="tool_use", tool_use=tu)
+                )
+                continue
+
+            if typ == "step_finish" and current_turn is not None:
+                current_turn.usage = _opencode_step_usage(part)
+                cost = part.get("cost")
+                if cost is not None:
+                    step_cost += float(cost)
+                session.conversation.append(current_turn)
+                current_turn = None
+                continue
+
+        session.result = ResultEvent(
+            is_error=False,
+            stop_reason="end",
+            num_turns=len(session.conversation),
+            duration_ms=session.wall_clock_ms,
+            duration_api_ms=0,
+            total_cost_usd=step_cost if step_cost > 0 else 0.0,
+            result_text="",
+            model_usage={},
+        )
+        return session
+
+
+def _opencode_step_usage(part: dict) -> TokenUsage:
+    """TokenUsage of an OpenCode step-finish part (JSONL and export alike)."""
+    tokens = part.get("tokens", {})
+    cache = tokens.get("cache", {})
+    # Use the explicit `input` field, NOT `total - output - reasoning`. The
+    # `total` field includes cache_read tokens, so the subtraction would
+    # inflate input by the cache_read amount.
+    in_tok = tokens.get("input", 0)
+    # OpenCode reports reasoning separately from output, but the provider
+    # bills reasoning at the output rate — fold it in so output_tokens is
+    # directly usable for cost estimation (see TokenUsage docstring).
+    reason_tok = tokens.get("reasoning", 0)
+    return TokenUsage(
+        input_tokens=in_tok,
+        output_tokens=tokens.get("output", 0) + reason_tok,
+        cache_creation_tokens=cache.get("write", 0),
+        cache_read_tokens=cache.get("read", 0),
+        reasoning_tokens=reason_tok,
+    )
+
+
+def _opencode_tool_input(state: dict) -> dict:
+    """A tool part's input as a dict (a bare value is wrapped as `input`)."""
+    inp = state.get("input") or {}
+    if not isinstance(inp, dict):
+        inp = {"input": inp}
+    return inp
+
+
+def _note_stream_time(turn: Turn, part: dict) -> None:
+    """Widen `turn`'s streaming window with a reasoning/text part's `time`."""
+    tm = part.get("time") or {}
+    start = tm.get("start")
+    end = tm.get("end", start)
+    if not isinstance(start, (int, float)):
+        return
+    if not isinstance(end, (int, float)):
+        end = start
+    start_i, end_i = int(start), int(end)
+    if not turn.first_stream_ms or start_i < turn.first_stream_ms:
+        turn.first_stream_ms = start_i
+    if end_i > turn.last_stream_ms:
+        turn.last_stream_ms = end_i
+
+
+class OpenCodeExportParser:
+    """Parse an OpenCode export JSON (from `opencode export <sessionID>`) into a Session.
+
+    Export format has `info` (session metadata) and `messages[]` (conversation).
+    Each message has `parts[]` with types: step-start, reasoning, text, tool, step-finish.
+    """
+
+    def parse_export(self, export_json: dict) -> Session:
+        info = export_json.get("info", {})
+        session_id = info.get("id", "unknown")
+        title = info.get("title", "")
+        agent_type = "opencode"
+        # OpenCode names its agent definitions harvest-translate /
+        # harvest-verify / harvest-conform, so the export itself usually says
+        # which stage this was; leave it unknown rather than guess.
+        haystack = f"{title} {info.get('agent', '')}".lower()
+        phase = None
+        for needle, name in (
+            ("translate", "translation"),
+            ("verify", "verification"),
+            ("conform", "conformance"),
+        ):
+            if needle in haystack:
+                phase = name
+                break
+
+        session = Session(session_id=session_id, phase=phase, agent_type=agent_type, data_source="export")
+
+        # Extract wall-clock from info.time
+        time_info = info.get("time", {})
+        created = time_info.get("created")
+        updated = time_info.get("updated")
+        if isinstance(created, (int, float)) and isinstance(updated, (int, float)):
+            session.wall_clock_ms = max(int(updated - created), 0)
+
+        # Parse messages into turns
+        messages = export_json.get("messages", [])
+        current_turn: Optional[Turn] = None
+        turn_index = 0
+        step_cost = 0.0
+
+        for msg in messages:
+            msg_info = msg.get("info", {})
+            parts = msg.get("parts", [])
+
+            for part in parts:
+                ptype = part.get("type", "")
+
+                if ptype == "step-start":
+                    # A step with no step-finish was cut off (the agent process
+                    # was killed, then the session was resumed). Keep it, as
+                    # the trailing flush below does: its tool calls may have
+                    # launched sub-agents that are linked to it.
+                    if current_turn is not None and current_turn.content_blocks:
+                        session.conversation.append(current_turn)
+                    turn_index += 1
+                    current_turn = Turn(turn_index=turn_index)
+                    msg_time = msg_info.get("time") or {}
+                    created = msg_time.get("created")
+                    completed = msg_time.get("completed")
+                    if isinstance(created, (int, float)) and isinstance(completed, (int, float)):
+                        current_turn.start_ms = int(created)
+                        current_turn.end_ms = int(completed)
+                    continue
+
+                if ptype == "reasoning" and current_turn is not None:
+                    text = part.get("text", "")
+                    if text:
+                        current_turn.content_blocks.append(
+                            ContentBlock(type="thinking", thinking=text)
+                        )
+                    _note_stream_time(current_turn, part)
+                    continue
+
+                if ptype == "text" and current_turn is not None:
+                    text = part.get("text", "")
+                    if text:
+                        current_turn.content_blocks.append(
+                            ContentBlock(type="text", text=text)
+                        )
+                    _note_stream_time(current_turn, part)
+                    continue
+
+                if ptype == "compaction":
+                    trigger = "auto" if part.get("auto") else "manual"
+                    if part.get("overflow"):
+                        trigger = f"{trigger}/overflow"
+                    session.compact_events.append(CompactEvent(
+                        pre_tokens=0,
+                        post_tokens=0,
+                        duration_ms=0,
+                        trigger=trigger,
+                        line_number=0,
+                        after_turn_index=len(session.conversation),
+                    ))
+                    continue
+
+                if ptype == "tool" and current_turn is not None:
+                    tool_name = part.get("tool", "unknown")
+                    state = part.get("state", {})
+                    inp = _opencode_tool_input(state)
+                    output = state.get("output")
+                    status = state.get("status", "")
+                    call_id = part.get("callID", f"export-{turn_index}")
+
+                    # A tool still "running"/"pending" in a post-mortem export
+                    # never completed: the agent process ended (usually killed
+                    # by the harness timeout) while this call was in flight.
+                    frozen = status in ("running", "pending")
+
+                    result = None
+                    if frozen:
+                        result = ToolResult(
+                            tool_use_id=call_id,
+                            content=f"[FROZEN: still '{status}' at export time — "
+                                    "never completed before the process ended]",
+                            is_error=True,
+                        )
+                    elif output is not None or status:
+                        result = ToolResult(
+                            tool_use_id=call_id,
+                            content=str(output) if output is not None else "",
+                            is_error=status in ("error", "failed"),
+                        )
+
+                    tu = ToolUse(
+                        id=call_id, name=tool_name, input=inp,
+                        result=result, frozen=frozen,
+                    )
+                    tool_time = state.get("time") or {}
+                    t_start = tool_time.get("start")
+                    t_end = tool_time.get("end")
+                    if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)):
+                        tu.start_ms = int(t_start)
+                        tu.end_ms = int(t_end)
+                    current_turn.content_blocks.append(
+                        ContentBlock(type="tool_use", tool_use=tu)
+                    )
+                    continue
+
+                if ptype == "step-finish" and current_turn is not None:
+                    current_turn.usage = _opencode_step_usage(part)
+                    cost = part.get("cost")
+                    if cost is not None:
+                        step_cost += float(cost)
+                    session.conversation.append(current_turn)
+                    current_turn = None
+                    continue
+
+        # Flush a trailing unfinished turn. A session that ended mid-flight
+        # (stall / timeout kill) has a final message with no step-finish;
+        # dropping it would hide exactly the frozen tool calls we want to see.
+        if current_turn is not None and current_turn.content_blocks:
+            session.conversation.append(current_turn)
+            current_turn = None
+
+        # Build result from info-level aggregation
+        info_tokens = info.get("tokens", {})
+        info_cost = info.get("cost", 0.0)
+        model_info = info.get("model", {})
+        model_id = model_info.get("id", "unknown")
+        model_usage = {}
+        if info_tokens:
+            # Fold reasoning into output: billed at the output rate
+            # (see TokenUsage docstring).
+            reason_tok = int(info_tokens.get("reasoning", 0))
+            model_usage[model_id] = ModelUsage(
+                model=model_id,
+                input_tokens=int(info_tokens.get("input", 0)),
+                output_tokens=int(info_tokens.get("output", 0)) + reason_tok,
+                cache_read_tokens=int(info_tokens.get("cache", {}).get("read", 0)),
+                cache_creation_tokens=int(info_tokens.get("cache", {}).get("write", 0)),
+                cost_usd=float(info_cost) if info_cost else 0.0,
+                reasoning_tokens=reason_tok,
+            )
+        session.result = ResultEvent(
+            is_error=False,
+            stop_reason="end",
+            num_turns=len(session.conversation),
+            duration_ms=session.wall_clock_ms,
+            duration_api_ms=0,
+            total_cost_usd=float(info_cost) if info_cost else 0.0,
+            result_text="",
+            model_usage=model_usage,
+        )
+        return session
+
+
+def _read_mixed_trace(
+    path: str,
+) -> tuple[dict[str, dict], dict[str, list[tuple[int, dict]]]]:
+    """Read a mixed-format trace file, separating export blocks from JSONL events.
+
+    Returns:
+        exports: session_id -> export JSON dict
+        jsonl_events: session_id -> list of (lineno, event_dict)
+    """
+    exports: dict[str, dict] = {}
+    jsonl_events: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+
+    def classify(obj: dict, lineno: int) -> None:
+        if "info" in obj and "messages" in obj:
+            exports[obj.get("info", {}).get("id", "unknown")] = obj
+        elif "type" in obj:
+            jsonl_events[obj.get("sessionID", "unknown")].append((lineno, obj))
+
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # Skip empty / non-JSON lines (ANSI logs, benchmark output, markers)
+        if not stripped:
+            i += 1
+            continue
+
+        # Detect export block: a multi-line JSON object with "info" + "messages".
+        # Single-line JSONL events are parsed immediately; multi-line export
+        # blocks are accumulated until json.loads succeeds.
+        if stripped.startswith("{"):
+            # Try single-line parse first (covers all JSONL events).
+            try:
+                obj = json.loads(stripped, strict=False)
+            except json.JSONDecodeError:
+                obj = None
+
+            if obj is not None:
+                # Single-line JSON: classify immediately.
+                classify(obj, i + 1)
+                i += 1
+                continue
+
+            # Multi-line JSON: accumulate lines until json.loads succeeds.
+            # Optimization: only attempt parsing when the line ends with '}'
+            # (likely end of a JSON object), avoiding O(n²) parse attempts.
+            buf_lines = [line]
+            j = i + 1
+            parsed_obj = None
+            while j < n:
+                buf_lines.append(lines[j])
+                if lines[j].rstrip().endswith("}"):
+                    buf = "".join(buf_lines).strip()
+                    try:
+                        parsed_obj = json.loads(buf, strict=False)
+                        break
+                    except json.JSONDecodeError:
+                        pass
+                j += 1
+
+            if parsed_obj is not None:
+                classify(parsed_obj, i + 1)
+                i = j + 1
+                continue
+
+            # Could not parse as JSON; skip this line.
+            i += 1
+            continue
+
+        # Non-JSON line; skip.
+        i += 1
+
+    return exports, jsonl_events
+
+
+def _export_opencode_session_live(session_id: str, timeout_s: int = 30) -> Optional[dict]:
+    """Try to export an OpenCode session directly from the local session store.
+
+    This is used while a trace is still being written. The trace file may only
+    contain live JSONL events because `agent_runner` appends `opencode export`
+    blocks after `opencode run` exits. For visualization during an active run,
+    pull the export by sessionID here and mark it as data_source="live-export".
+
+    Important: OpenCode 1.16.x can truncate `opencode export` output when stdout
+    is captured through a pipe. Mirror the Rust-side workaround: redirect stdout
+    to a temporary file, then read that file.
+    """
+    with tempfile.NamedTemporaryFile(prefix="opencode-export-", suffix=".json") as tmp:
+        try:
+            result = subprocess.run(
+                ["opencode", "export", session_id],
+                stdout=tmp,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+
+        if result.returncode != 0:
+            return None
+
+        tmp.flush()
+        tmp.seek(0)
+        data = tmp.read().decode("utf-8", errors="replace")
+
+    if not data.strip():
+        return None
+    try:
+        obj = json.loads(data, strict=False)
+    except json.JSONDecodeError:
+        return None
+    if "info" not in obj or "messages" not in obj:
+        return None
+    return obj
+
+
+def _opencode_session_parent_id(export_json: dict) -> str:
+    """Return an OpenCode export's parent session ID, if it has one."""
+    info = export_json.get("info", {}) or {}
+    for key in ("parentID", "parentId", "parentSessionID", "parentSessionId", "parent_session_id"):
+        sid = info.get(key)
+        if isinstance(sid, str) and sid:
+            return sid
+    return ""
+
+
+def _opencode_task_child_session_id(part: dict) -> str:
+    """Return the child session ID created by an OpenCode task tool part."""
+    state = part.get("state", {}) or {}
+    metadata = state.get("metadata", {}) or part.get("metadata", {}) or {}
+    for key in ("sessionID", "sessionId", "session_id"):
+        sid = metadata.get(key)
+        if isinstance(sid, str) and sid:
+            return sid
+    return ""
+
+
+def _iter_opencode_task_parts(export_json: dict) -> Iterator[dict]:
+    """Every `task` tool part of an OpenCode export, in message order."""
+    for msg in export_json.get("messages", []):
+        for part in msg.get("parts", []):
+            if part.get("type") == "tool" and str(part.get("tool", "")).lower() == "task":
+                yield part
+
+
+def _extract_opencode_sub_session_ids(export_json: dict) -> list[str]:
+    """Return child session IDs referenced by OpenCode task tool calls."""
+    found: list[str] = []
+    for part in _iter_opencode_task_parts(export_json):
+        sid = _opencode_task_child_session_id(part)
+        if sid and sid not in found:
+            found.append(sid)
+    return found
+
+
+def _opencode_info_token_total(info: dict) -> int:
+    tokens = info.get("tokens", {}) or {}
+    cache = tokens.get("cache", {}) or {}
+    return sum(
+        int(src.get(k, 0) or 0)
+        for src, k in ((tokens, "input"), (tokens, "output"), (tokens, "reasoning"),
+                       (cache, "read"), (cache, "write"))
+    )
+
+
+def _attach_opencode_child_sessions(
+    export_jsons: dict[str, dict],
+    parsed_sessions: dict[str, Session],
+) -> set[str]:
+    """Attach exported OpenCode child sessions to their parent task ToolUse.
+
+    OpenCode stdout JSONL only shows a `task` tool result in the parent session;
+    the child conversation lives in a separate `opencode export <childSessionId>`.
+    Once we have both exports, represent the child as `ToolUse.subagent` so the
+    existing SVG flattener draws nested rows and purple sub-agent guide lines,
+    instead of rendering child sessions as unrelated top-level S1/S2/... blocks.
+    """
+    child_sids: set[str] = set()
+
+    # First pass: explicit parentID on child exports. This prevents child
+    # sessions from being rendered top-level even if the parent task part is not
+    # present yet in a live/incomplete export.
+    for sid, export_json in export_jsons.items():
+        parent_sid = _opencode_session_parent_id(export_json)
+        if parent_sid and parent_sid in parsed_sessions:
+            child_sids.add(sid)
+
+    # Second pass: connect task ToolUse -> child SubAgent using task metadata.
+    for parent_sid, export_json in export_jsons.items():
+        parent_session = parsed_sessions.get(parent_sid)
+        if parent_session is None:
+            continue
+
+        for part in _iter_opencode_task_parts(export_json):
+            child_sid = _opencode_task_child_session_id(part)
+            child_session = parsed_sessions.get(child_sid)
+            if not child_sid or child_session is None:
+                continue
+
+            call_id = part.get("callID", "")
+            if not call_id:
+                continue
+            task_tool = _find_tool_use_by_id(parent_session.conversation, call_id)
+            if task_tool is None:
+                continue
+
+            state = part.get("state", {}) or {}
+            inp = state.get("input") or {}
+            if not isinstance(inp, dict):
+                inp = {}
+            child_info = export_jsons.get(child_sid, {}).get("info", {}) or {}
+            task_tool.subagent = SubAgent(
+                task_id=child_sid,
+                tool_use_id=call_id,
+                description=inp.get("description", "") or child_info.get("title", ""),
+                prompt=inp.get("prompt", ""),
+                status=state.get("status", "completed"),
+                conversation=child_session.conversation,
+                is_async=False,
+                compact_events=child_session.compact_events,
+                total_tokens=_opencode_info_token_total(child_info),
+                total_tool_uses=sum(len(t.tool_uses) for t in child_session.conversation),
+                duration_ms=child_session.wall_clock_ms,
+                cost_usd=(
+                    child_session.result.total_cost_usd if child_session.result else None
+                ),
+            )
+            child_sids.add(child_sid)
+
+    return child_sids
+
+
+def _fetch_live_opencode_exports(
+    jsonl_events: dict[str, list[tuple[int, dict]]],
+    existing_exports: dict[str, dict],
+) -> dict[str, dict]:
+    """Fetch export JSON for JSONL sessions that lack in-file export blocks.
+
+    Returns only successfully fetched exports. Failures are deliberately silent:
+    the caller will fall back to JSONL for any session that cannot be exported.
+    Child sessions discovered from task tool metadata are fetched breadth-first so
+    live visualization can show sub-agent conversations before the run finishes.
+    """
+    live_exports: dict[str, dict] = {}
+    queue = [sid for sid in jsonl_events if sid not in existing_exports]
+    queued: set[str] = set(queue)
+
+    while queue:
+        sid = queue.pop(0)
+        if sid in existing_exports or sid in live_exports:
+            continue
+
+        exported = _export_opencode_session_live(sid)
+        if exported is None:
+            continue
+
+        live_exports[sid] = exported
+
+        for child_sid in _extract_opencode_sub_session_ids(exported):
+            if (
+                child_sid not in existing_exports
+                and child_sid not in live_exports
+                and child_sid not in queued
+            ):
+                queue.append(child_sid)
+                queued.add(child_sid)
+
+    return live_exports
+
+
+# ---------------------------------------------------------------------------
+# Top-level parse: format detection, runner markers
+# ---------------------------------------------------------------------------
+
+_ISO_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
+
+
+# agent_runner logs one of these per agent process, e.g.
+#   Invoking OpenCode verification agent (model=..., timeout=...)
+#   Invoking Claude Code translation agent (model=..., no_plan=...)
+# The phase word is whatever AgentPhase::label() returns, so a stage added on
+# the Rust side shows up here without this script being taught about it.
+_RUNNER_INVOKE_RE = re.compile(r"Invoking .+? (\w+) agent\b")
+
+
+def _extract_runner_phase_windows(path: str) -> list[tuple[str, int, Optional[int]]]:
+    """Extract per-phase agent *process* windows from agent_runner log lines.
+
+    The benchmark trace interleaves the agent's JSON stream with agent_runner
+    tracing lines (ISO-8601 timestamps). The window from
+    "Invoking <agent> <phase> agent" to the first post-exit marker
+    ("Exporting OpenCode session" / "Appended agent trace") is the real
+    process lifetime — including any stall between the session's last
+    activity and the harness timeout kill, which is invisible in the
+    session's own data.
+
+    These lines are also the trace's only authoritative record of *which*
+    stages ran: since the stages became independently runnable, a trace may
+    hold a verify alone, a conform alone, or any combination, so position in
+    the file says nothing about which stage a session is.
+
+    Returns (phase, start_ms, end_ms) in file order. `end_ms` is None for a
+    window that never closed (the process was killed, or the run died), which
+    is kept rather than dropped so the list stays aligned with the agent
+    processes that actually started.
+    """
+    windows: list[tuple[str, int, Optional[int]]] = []
+    open_phase: Optional[str] = None
+    open_start_ms = 0
+
+    def _iso_ms(line: str) -> Optional[int]:
+        m = _ISO_TS_RE.search(line)
+        if not m:
+            return None
+        try:
+            dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return int(dt.timestamp() * 1000)
+
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if line.lstrip().startswith("{"):
+                    continue  # JSON event/export content, not a runner log line
+                m = _RUNNER_INVOKE_RE.search(line)
+                if m:
+                    ts = _iso_ms(line)
+                    if ts is None:
+                        continue
+                    if open_phase is not None:
+                        windows.append((open_phase, open_start_ms, None))
+                    open_phase = m.group(1)
+                    open_start_ms = ts
+                elif open_phase is not None and (
+                    "Exporting OpenCode session" in line
+                    or "Appended agent trace" in line
+                ):
+                    ts = _iso_ms(line)
+                    end_ms = ts if ts is not None and ts >= open_start_ms else None
+                    windows.append((open_phase, open_start_ms, end_ms))
+                    open_phase = None
+    except OSError:
+        return []
+
+    if open_phase is not None:
+        windows.append((open_phase, open_start_ms, None))
+    return windows
+
+
+def _apply_runner_phases(path: str, sessions: list[Session]) -> list[Session]:
+    """Name root sessions after the stages the runner actually invoked, and
+    give them their agent-process wall time.
+
+    Pairing is by order of appearance: the Nth agent process the runner
+    started produced the Nth root session. A session with no corresponding
+    marker keeps `phase = None` and is rendered without a stage name — an
+    unnamed lane is honest, a mislabeled one is not.
+    """
+    windows = _extract_runner_phase_windows(path)
+    if not windows:
+        return sessions
+    if len(windows) != len(sessions):
+        # Something is missing on one side (a crashed export, an unparsed
+        # session). Pairing by position would start mislabeling from the first
+        # gap onwards, so name nothing.
+        return sessions
+    for session, (phase, start_ms, end_ms) in zip(sessions, windows):
+        if session.phase is None:
+            session.phase = phase
+        if session.process_wall_ms == 0 and end_ms is not None:
+            session.process_wall_ms = end_ms - start_ms
+    return sessions
+
+
+def _detect_format(records: list[tuple[int, dict]]) -> str:
+    """Peek at the first few JSON records and return 'opencode' or 'claude'.
+
+    OpenCode traces always contain `step_start` / `step_finish` events.
+    Claude traces use `type=assistant` / `type=user` / `type=system`.
+    """
+    for _, obj in records[:20]:
+        typ = obj.get("type", "")
+        if typ in ("step_start", "step_finish", "reasoning"):
+            return "opencode"
+        if typ in ("assistant", "user", "system", "result"):
+            return "claude"
+    return "claude"
+
+
+def parse_trace_file(path: str, fmt: str = "auto") -> list[Session]:
+    """Top-level entry point: detect the format (unless forced) and parse.
+
+    OpenCode traces may hold JSONL events and export blocks for the same
+    session. Priority per session:
+      1. Export block in file -> OpenCodeExportParser (data_source="export")
+      2. Live `opencode export <sessionID>` -> OpenCodeExportParser (data_source="live-export")
+      3. JSONL events -> OpenCodeParser (data_source="jsonl")
+    Child exports are attached under their parent's `task` call; only root
+    sessions stay top-level.
+    """
+    if fmt == "auto":
+        # Peek at the first JSON records (within the first 200 lines).
+        peek_records: list[tuple[int, dict]] = []
+        for lineno, obj in _iter_json_lines(path):
+            if lineno > 200:
+                break
+            peek_records.append((lineno, obj))
+            if len(peek_records) >= 5:
+                break
+        fmt = _detect_format(peek_records)
+
+    if fmt == "claude":
+        return _apply_runner_phases(path, TraceParser().parse_file(path))
+
+    exports, jsonl_events = _read_mixed_trace(path)
+    live_exports = _fetch_live_opencode_exports(jsonl_events, exports)
+
+    # Parse every available export first (in-file ones win over live ones).
+    combined_exports: dict[str, dict] = dict(exports)
+    export_sources = {sid: "export" for sid in exports}
+    for sid, export_json in live_exports.items():
+        if sid not in combined_exports:
+            combined_exports[sid] = export_json
+            export_sources[sid] = "live-export"
+
+    export_parser = OpenCodeExportParser()
+    parsed_exports: dict[str, Session] = {}
+    for sid, export_json in combined_exports.items():
+        session = export_parser.parse_export(export_json)
+        session.data_source = export_sources[sid]
+        parsed_exports[sid] = session
+
+    child_export_sids = _attach_opencode_child_sessions(combined_exports, parsed_exports)
+
+    # Root sessions, in file order. The export usually names its own stage
+    # (OpenCode's agent definitions are harvest-translate/-verify/-conform);
+    # anything still unnamed is resolved from the runner's markers below.
+    sessions = [
+        parsed_exports[sid] for sid in combined_exports
+        if sid not in child_export_sids
+    ]
+
+    # Then sessions that only exist as JSONL events (no export for that sid).
+    jsonl_parser = OpenCodeParser()
+    for sid, events in jsonl_events.items():
+        if sid not in parsed_exports:
+            sessions.append(jsonl_parser._parse_session(sid, events))
+
+    # If we found nothing at all, fall back to the raw JSONL parser.
+    if not sessions:
+        return jsonl_parser.parse_file(path)
+
+    # Name the stages and attach agent-process wall time from the runner's
+    # markers, so stall time between a session's last activity and the
+    # process's death (timeout kill) becomes visible.
+    return _apply_runner_phases(path, sessions)
+
+
+# ---------------------------------------------------------------------------
+# Session analysis: tree walks, liveness, token/cost aggregates
+# ---------------------------------------------------------------------------
+
+def _iter_tool_uses(turns: list[Turn]) -> Iterator[ToolUse]:
+    """Every ToolUse in the turn tree, pre-order: each call is yielded before
+    the calls of the sub-agent it spawned."""
+    for t in turns:
+        for tu in t.tool_uses:
+            yield tu
+            if tu.subagent is not None:
+                yield from _iter_tool_uses(tu.subagent.conversation)
+
+
+def _iter_subagents(turns: list[Turn]) -> Iterator[SubAgent]:
+    """Every SubAgent in the turn tree, nested ones included."""
+    for tu in _iter_tool_uses(turns):
+        if tu.subagent is not None:
+            yield tu.subagent
+
+
+def _find_tool_use_by_id(turns: list[Turn], tool_use_id: str) -> Optional[ToolUse]:
+    """Find a tool call by ID, descending into already-linked subagents."""
+    return next((tu for tu in _iter_tool_uses(turns) if tu.id == tool_use_id), None)
+
 
 def count_tools_in_conversation(turns: list[Turn]) -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
@@ -907,6 +1876,372 @@ def count_tools_in_conversation(turns: list[Turn]) -> dict[str, int]:
             counts[tu.name] += 1
     return dict(counts)
 
+
+def _count_subagents(turns: list[Turn]) -> tuple[int, int]:
+    """Count (sync, async) sub-agents recursively across the turn tree."""
+    async_ = sum(1 for sa in _iter_subagents(turns) if sa.is_async)
+    total = sum(1 for _ in _iter_subagents(turns))
+    return total - async_, async_
+
+
+def _count_frozen_tools(turns: list[Turn]) -> int:
+    """Recursively count tool calls frozen mid-flight (never completed)."""
+    return sum(1 for tu in _iter_tool_uses(turns) if tu.frozen)
+
+
+def _session_ended(s: Session) -> bool:
+    """
+    Whether the process behind this session is known to have finished.
+
+    A Claude stream trace ends with a `result` event; without one the trace
+    is either still being written (live visualization of a running session)
+    or was killed hard. A sub-agent with status "running" must NOT be
+    reported as frozen unless the session actually ended — otherwise every
+    in-flight sync sub-agent in a live trace shows up as a false FROZEN.
+
+    OpenCode sessions can also be live: live-exports (and JSONL tails) of a
+    running session report in-flight tools as status "running" exactly like
+    a genuinely frozen one. The reliable end signal is the agent_runner
+    phase window: `process_wall_ms` is only set once the trace contains the
+    closing "Exporting"/"Appended" runner marker, which a live run has not
+    written yet. (Session.result is synthesized for OpenCode and says
+    nothing about liveness.)
+    """
+    if s.agent_type == "claude":
+        return s.result is not None
+    return bool(s.process_wall_ms)
+
+
+def _subagent_unfinished(tu: ToolUse) -> bool:
+    """A sub-agent dispatch with no completion yet: the export caught the tool
+    still running (tu.frozen) or the sub-agent status is stuck at
+    running/pending. FROZEN vs in-flight is decided by _session_ended()."""
+    return tu.frozen or (
+        tu.subagent is not None and tu.subagent.status in ("running", "pending")
+    )
+
+
+_STALL_GAP_MS = 600_000  # ≥10 min between last session activity and process death
+
+
+def _stall_gap_ms(s: Session) -> int:
+    """Dead time between the session's last recorded activity and the agent
+    process's end. Nonzero only when agent_runner markers were found and the
+    gap exceeds `_STALL_GAP_MS` — the signature of a stalled process that sat
+    idle until the harness timeout killed it."""
+    if (
+        s.process_wall_ms
+        and s.wall_clock_ms
+        and s.process_wall_ms > s.wall_clock_ms + _STALL_GAP_MS
+    ):
+        return s.process_wall_ms - s.wall_clock_ms
+    return 0
+
+
+def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
+    """Recursively sum token usage from all sub-agents in a turn tree.
+
+    Returns a dict with keys: input, output, cache_read, cache_write, unclassified.
+    - input/output/cache_read/cache_write: tokens from sub-agents that have per-turn
+      breakdown (OpenCode exports).
+    - unclassified: flat total_tokens from sub-agents without breakdown (Claude).
+    """
+    agg = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0}
+
+    for sa in _iter_subagents(turns):
+        # Prefer per-turn breakdown from the sub-agent's conversation.
+        has_breakdown = False
+        for t in sa.conversation:
+            if t.usage:
+                agg["input"] += t.usage.input_tokens
+                agg["output"] += t.usage.output_tokens
+                agg["cache_read"] += t.usage.cache_read_tokens
+                agg["cache_write"] += t.usage.cache_creation_tokens
+                has_breakdown = True
+
+        # If no per-turn breakdown, count as unclassified.
+        if not has_breakdown and sa.total_tokens:
+            agg["unclassified"] += sa.total_tokens
+
+    return agg
+
+
+def _session_token_totals(s: Session) -> dict[str, int]:
+    """Main-session tokens (from the result event) plus the classified
+    sub-agent tokens; same keys as _sum_subagent_tokens, whose `unclassified`
+    passes through unchanged."""
+    tok = _sum_subagent_tokens(s.conversation)
+    if s.result is not None:
+        for mu in s.result.model_usage.values():
+            tok["input"] += mu.input_tokens
+            tok["output"] += mu.output_tokens
+            tok["cache_read"] += mu.cache_read_tokens
+            tok["cache_write"] += mu.cache_creation_tokens
+    return tok
+
+
+def _sum_subagent_cost(turns: list[Turn]) -> tuple[float, int]:
+    """Recursively sum the separately billed cost of all sub-agents in a turn
+    tree. Returns (cost_usd, number of sub-agents that carry a cost).
+    Recursive rather than flat over _iter_subagents on purpose: it keeps the
+    float summation order, so printed costs never shift in the last digit."""
+    cost = 0.0
+    count = 0
+    for turn in turns:
+        for tu in turn.tool_uses:
+            sa = tu.subagent
+            if sa is None:
+                continue
+            if sa.cost_usd is not None:
+                cost += sa.cost_usd
+                count += 1
+            child_cost, child_count = _sum_subagent_cost(sa.conversation)
+            cost += child_cost
+            count += child_count
+    return cost, count
+
+
+def _session_total_cost(s: Session) -> tuple[float, int]:
+    """Cost of a session including its separately billed sub-agents.
+    Returns (cost_usd, number of sub-agents added to the main cost)."""
+    main = s.result.total_cost_usd if s.result else 0.0
+    sub_cost, sub_count = _sum_subagent_cost(s.conversation)
+    return main + sub_cost, sub_count
+
+
+def _format_duration(ms: int) -> str:
+    if ms <= 0: return "?"
+    s = ms // 1000
+    if s < 60: return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60: return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _format_compact_int(n: int) -> str:
+    if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _format_token_totals(tok: dict[str, int]) -> str:
+    return (
+        f"{_format_compact_int(tok['input'] + tok['output'])} new tok "
+        f"(in={_format_compact_int(tok['input'])} out={_format_compact_int(tok['output'])} "
+        f"cache_r={_format_compact_int(tok['cache_read'])} "
+        f"cache_c={_format_compact_int(tok['cache_write'])})"
+    )
+
+
+def _apply_patch_files(patch_text: str) -> list[str]:
+    """
+    Extract per-file operations from an OpenAI `apply_patch` envelope
+    (`*** Add File: p`, `*** Update File: p`, `*** Delete File: p`).
+    GPT-family models on OpenCode write files through this tool instead of
+    write/edit, so the visualizer must treat it as a write action.
+    """
+    ops = []
+    for line in patch_text.splitlines():
+        line = line.strip()
+        for marker, tag in (("*** Add File:", "add"),
+                            ("*** Update File:", "update"),
+                            ("*** Delete File:", "delete")):
+            if line.startswith(marker):
+                ops.append(f"{tag} {line[len(marker):].strip()}")
+    return ops
+
+
+# ---------------------------------------------------------------------------
+# Time attribution: Remote LLM Time vs Local Machine Time
+# ---------------------------------------------------------------------------
+#
+# Every agent (main or sub) is a chain alternating between an LLM interval
+# (API request issued → first tool start) and tool intervals. A `task`/`Agent`
+# tool is a container whose window is filled by the child's own chain, so it
+# is never counted as a leaf tool. Summing over all agents gives *work*
+# (parallel siblings count fully, like CPU time across threads); the wall
+# clock is the *span*. Only sources with per-step timestamps (OpenCode
+# exports) produce a report; otherwise the report is simply omitted.
+#
+# Abbreviations printed:
+#   wall       root session wall clock
+#   llm        Remote LLM Time, Σ over all agents (share of llm+tool)
+#   tool       Local Machine Time, Σ leaf tool intervals over all agents
+#   work/wall  (llm+tool)/wall — parallel speedup, 1.00x = fully serial
+#   llm-conc   avg: llm / union(LLM intervals) — time-weighted mean number of
+#              concurrent LLM calls while at least one is active;
+#              peak: the maximum number of concurrent LLM calls
+#   decode     Σ generated tokens / Σ decode time over all agents, where decode
+#              time runs from the first streamed part to the end of streaming
+#              (last part end, or first tool start when the step called tools);
+#              token-weighted, so long steps dominate
+#   decode+ttft Σ generated tokens / Σ LLM interval — the same tokens over the
+#              whole request (first-token latency included)
+#   sub        the three longest sub-agents: label, duration, steps, llm share
+#
+# Generated tokens = output + reasoning as reported by the provider. Their split
+# is unreliable (opencode-go sometimes folds reasoning into output), the sum is
+# not; `Turn.usage.output_tokens` already holds that sum.
+
+@dataclass
+class TimeAttribution:
+    wall_ms: int
+    llm_ms: int            # L_work
+    tool_ms: int           # T_work
+    llm_cov_ms: int        # union of LLM intervals
+    llm_peak: int          # max number of concurrent LLM calls
+    gen_tokens: int        # Σ output(+reasoning) tokens over steps with timing
+    decode_ms: int         # Σ decode time (steps with a streaming window)
+    decode_tokens: int     # Σ generated tokens of those same steps
+    # Wall partition by what is active: "L" only LLM, "T" only tool,
+    # "LT" both, "idle" neither. Computed for downstream use, not printed.
+    coverage: dict[str, int]
+    # (label, duration_ms, steps, llm_ms, tool_ms) for the longest sub-agents.
+    top_subagents: list[tuple[str, int, int, int, int]]
+
+
+def _union_ms(intervals: list[tuple[int, int]]) -> int:
+    total = 0
+    cur_a = cur_b = None
+    for a, b in sorted(intervals):
+        if cur_b is None or a > cur_b:
+            if cur_b is not None:
+                total += cur_b - cur_a
+            cur_a, cur_b = a, b
+        else:
+            cur_b = max(cur_b, b)
+    if cur_b is not None:
+        total += cur_b - cur_a
+    return total
+
+
+def _collect_time_intervals(
+    turns: list[Turn],
+    llm_iv: list[tuple[int, int]],
+    tool_iv: list[tuple[int, int]],
+    acc: Optional[dict[str, int]] = None,
+) -> None:
+    """Append the LLM and leaf-tool intervals of `turns` and, recursively, of
+    every sub-agent conversation nested under them. When `acc` is given, also
+    accumulate generated tokens and decode time (keys: gen_tokens, decode_ms,
+    decode_tokens)."""
+    for t in turns:
+        llm_end = t.llm_end_ms
+        if t.start_ms and llm_end > t.start_ms:
+            llm_iv.append((t.start_ms, llm_end))
+            if acc is not None:
+                gen = t.usage.output_tokens if t.usage else 0
+                acc["gen_tokens"] = acc.get("gen_tokens", 0) + gen
+                if t.first_stream_ms:
+                    dec_end = max(t.last_stream_ms, llm_end)
+                    dec = dec_end - t.first_stream_ms
+                    if dec > 0:
+                        acc["decode_ms"] = acc.get("decode_ms", 0) + dec
+                        acc["decode_tokens"] = acc.get("decode_tokens", 0) + gen
+        for tu in t.tool_uses:
+            if tu.subagent is not None:
+                _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv, acc)
+                continue
+            if tu.name.lower() in _AGENT_TOOLS:
+                continue  # container without a parsed child: not a leaf
+            if tu.start_ms and tu.end_ms > tu.start_ms:
+                tool_iv.append((tu.start_ms, tu.end_ms))
+
+
+def _time_attribution(s: Session) -> Optional[TimeAttribution]:
+    """Return the time attribution for a session, or None when the source
+    carries no per-step timing (e.g. the Claude Code stream)."""
+    llm_iv: list[tuple[int, int]] = []
+    tool_iv: list[tuple[int, int]] = []
+    acc: dict[str, int] = {}
+    _collect_time_intervals(s.conversation, llm_iv, tool_iv, acc)
+    wall = s.wall_clock_ms
+    if not wall or not llm_iv:
+        return None
+    llm_ms = sum(b - a for a, b in llm_iv)
+    tool_ms = sum(b - a for a, b in tool_iv)
+    llm_cov = _union_ms(llm_iv)
+
+    # Coverage sweep over the wall clock, anchored at the first LLM start.
+    w0 = min(a for a, _ in llm_iv)
+    w1 = w0 + wall
+    events: list[tuple[int, int, int]] = []
+    for a, b in llm_iv:
+        events.append((a, 1, 0)); events.append((b, -1, 0))
+    for a, b in tool_iv:
+        events.append((a, 0, 1)); events.append((b, 0, -1))
+    coverage: dict[str, int] = {"L": 0, "T": 0, "LT": 0, "idle": 0}
+    n_l = n_t = 0
+    llm_peak = 0
+    prev = w0
+    for t, dl, dt in sorted(events):
+        t = min(max(t, w0), w1)
+        if t > prev:
+            key = ("L" if n_l else "") + ("T" if n_t else "")
+            coverage[key or "idle"] += t - prev
+        prev = t
+        n_l += dl
+        n_t += dt
+        llm_peak = max(llm_peak, n_l)
+    coverage["idle"] += max(0, w1 - prev)
+
+    # Longest sub-agents spawned by the main agent (direct children only).
+    subs: list[tuple[str, int, int, int, int]] = []
+    for t in s.conversation:
+        for tu in t.tool_uses:
+            if tu.subagent is None or not tu.start_ms or tu.end_ms <= tu.start_ms:
+                continue
+            sub_llm: list[tuple[int, int]] = []
+            sub_tool: list[tuple[int, int]] = []
+            _collect_time_intervals(tu.subagent.conversation, sub_llm, sub_tool)
+            label = (tu.subagent.description or "").strip() or f"#{tu.subagent.task_id[-6:]}"
+            subs.append((
+                label,
+                tu.end_ms - tu.start_ms,
+                len(tu.subagent.conversation),
+                sum(b - a for a, b in sub_llm),
+                sum(b - a for a, b in sub_tool),
+            ))
+    subs.sort(key=lambda x: -x[1])
+
+    return TimeAttribution(
+        wall_ms=wall, llm_ms=llm_ms, tool_ms=tool_ms, llm_cov_ms=llm_cov,
+        llm_peak=llm_peak, coverage=coverage, top_subagents=subs[:3],
+        gen_tokens=acc.get("gen_tokens", 0), decode_ms=acc.get("decode_ms", 0),
+        decode_tokens=acc.get("decode_tokens", 0),
+    )
+
+
+def _format_time_report(ta: TimeAttribution) -> list[str]:
+    """One or two compact lines: totals, then the longest sub-agents."""
+    work = ta.llm_ms + ta.tool_ms
+    # `key=value` cells separated by " | " so a label cannot be mistaken for
+    # belonging to the number on its left.
+    cells = [
+        f"wall={_format_duration(ta.wall_ms)}",
+        f"llm={_format_duration(ta.llm_ms)} ({100 * ta.llm_ms / work:.0f}%)",
+        f"tool={_format_duration(ta.tool_ms)} ({100 * ta.tool_ms / work:.0f}%)",
+        f"work/wall={work / ta.wall_ms:.2f}x",
+        f"llm-conc={ta.llm_ms / ta.llm_cov_ms:.2f}x avg, {ta.llm_peak} peak",
+    ]
+    if ta.decode_ms and ta.decode_tokens:
+        cells.append(f"decode={1000 * ta.decode_tokens / ta.decode_ms:.1f} tok/s")
+    if ta.gen_tokens:
+        cells.append(f"decode+ttft={1000 * ta.gen_tokens / ta.llm_ms:.1f} tok/s")
+    lines = ["time: " + " | ".join(cells)]
+    if ta.top_subagents:
+        subs = []
+        for label, dur, steps, l_ms, t_ms in ta.top_subagents:
+            share = f"llm {100 * l_ms / (l_ms + t_ms):.0f}%" if l_ms + t_ms else "llm n/a"
+            subs.append(f"{label}: {_format_duration(dur)}, {steps} steps, {share}")
+        lines.append("sub: " + " | ".join(subs))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Output: session statistics (default)
+# ---------------------------------------------------------------------------
 
 def print_session_stats(sessions: list[Session]) -> None:
     print(f"Sessions parsed: {len(sessions)}")
@@ -930,7 +2265,7 @@ def print_session_stats(sessions: list[Session]) -> None:
         main_tool_uses = count_tools_in_conversation(s.conversation)
         agent_calls = [
             tu for t in s.conversation for tu in t.tool_uses
-            if tu.name.lower() in ("agent", "task") and tu.subagent is not None
+            if tu.name.lower() in _AGENT_TOOLS and tu.subagent is not None
         ]
 
         print(f"\n  --- Main conversation ---")
@@ -996,14 +2331,12 @@ def print_session_stats(sessions: list[Session]) -> None:
             print(f"    total_cost_usd: ${r.total_cost_usd:.4f}")
             all_cost, sub_count = _session_total_cost(s)
             if sub_count:
-                sub_tok = _sum_subagent_tokens(s.conversation)
-                mus = r.model_usage.values()
+                tok = _session_token_totals(s)
                 print(
                     f"    all sessions:   ${all_cost:.4f} "
                     f"(main + {sub_count} sub-agents), "
-                    f"input={sum(mu.input_tokens for mu in mus) + sub_tok['input']} "
-                    f"output={sum(mu.output_tokens for mu in mus) + sub_tok['output']} "
-                    f"cache_read={sum(mu.cache_read_tokens for mu in mus) + sub_tok['cache_read']}"
+                    f"input={tok['input']} output={tok['output']} "
+                    f"cache_read={tok['cache_read']}"
                 )
             for model, mu in r.model_usage.items():
                 print(f"    [{model}]")
@@ -1028,7 +2361,7 @@ def print_session_stats(sessions: list[Session]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Human-readable history printer
+# Output: readable transcript (-r)
 # ---------------------------------------------------------------------------
 
 def _truncate(text: str, max_len: int = 30000) -> str:
@@ -1036,24 +2369,6 @@ def _truncate(text: str, max_len: int = 30000) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len] + f"  …[+{len(text) - max_len} chars]"
-
-
-def _apply_patch_files(patch_text: str) -> list[str]:
-    """
-    Extract per-file operations from an OpenAI `apply_patch` envelope
-    (`*** Add File: p`, `*** Update File: p`, `*** Delete File: p`).
-    GPT-family models on OpenCode write files through this tool instead of
-    write/edit, so the visualizer must treat it as a write action.
-    """
-    ops = []
-    for line in patch_text.splitlines():
-        line = line.strip()
-        for marker, tag in (("*** Add File:", "add"),
-                            ("*** Update File:", "update"),
-                            ("*** Delete File:", "delete")):
-            if line.startswith(marker):
-                ops.append(f"{tag} {line[len(marker):].strip()}")
-    return ops
 
 
 def _fmt_tool_input(name: str, inp: dict) -> str:
@@ -1083,7 +2398,7 @@ def _fmt_tool_input(name: str, inp: dict) -> str:
             new = inp.get("new_string", inp.get("newString", ""))[:60].replace("\n", "↵")
             extra = f"\n         - {old!r}\n         + {new!r}"
         return f"{path}{extra}"
-    if name_lower in ("agent", "task"):
+    if name_lower in _AGENT_TOOLS:
         desc = inp.get("description", "")
         sub_type = inp.get("subagent_type", "")
         prompt_preview = _truncate(inp.get("prompt", ""))
@@ -1114,7 +2429,7 @@ def _fmt_turns(turns: list[Turn], out: list[str], indent: str = "") -> None:
 
         # Tool calls
         for tu in turn.tool_uses:
-            is_agent = tu.name.lower() in ("agent", "task")
+            is_agent = tu.name.lower() in _AGENT_TOOLS
             icon = "🤖" if is_agent else "🔧"
             fmt_input = _fmt_tool_input(tu.name, tu.input)
             input_lines = fmt_input.splitlines()
@@ -1150,9 +2465,73 @@ def _fmt_turns(turns: list[Turn], out: list[str], indent: str = "") -> None:
         out.append("")
 
 
+def build_readable_history(sessions: list[Session]) -> str:
+    """
+    Build a human-readable narrative of the full agent execution.
+    Returns a single string. Uses list accumulation + join for efficiency
+    since the output can be very large (multiple MB).
+    """
+    out: list[str] = []
+    total = len(sessions)
+
+    for idx, s in enumerate(sessions, 1):
+        r = s.result
+        duration_s = f"{r.duration_ms / 1000:.1f}s" if r else "?"
+        cost = f"${r.total_cost_usd:.4f}" if r else "?"
+        all_cost, sub_count = _session_total_cost(s)
+        header_cost = (
+            f"${all_cost:.4f} (main {cost} + {sub_count} sub-agents)"
+            if sub_count
+            else cost
+        )
+
+        out.append("")
+        out.append("=" * 70)
+        heading = f"  Session {idx}/{total}"
+        if s.phase:
+            heading += f" — {s.phase.upper()}"
+        out.append(heading)
+        out.append(
+            f"  model: {s.init.model if s.init else '?'}  "
+            f"duration: {duration_s}  cost: {header_cost}"
+        )
+        ta = _time_attribution(s)
+        if ta is not None:
+            for line in _format_time_report(ta):
+                out.append(f"  {line}")
+        out.append("=" * 70)
+        out.append("")
+
+        # Surface rate-limit events
+        for m in s.monitoring:
+            if m.type == "rate_limit_event" or m.subtype == "rate_limit_event":
+                info = m.raw.get("rate_limit_info", {})
+                out.append(
+                    f"  ⚠️  Rate limit: status={info.get('status')}  "
+                    f"type={info.get('rateLimitType')}"
+                )
+
+        out.append("")
+        _fmt_turns(s.conversation, out)
+
+        if r:
+            out.append(
+                f"  ✅ Session ended: {r.stop_reason}  "
+                f"turns={r.num_turns}  cost={cost}"
+            )
+            for model, mu in r.model_usage.items():
+                short = model.split("-")[1] if "-" in model else model
+                out.append(
+                    f"     [{short}] in={mu.input_tokens} out={mu.output_tokens}  "
+                    f"cache_read={mu.cache_read_tokens}  ${mu.cost_usd:.4f}"
+                )
+        out.append("")
+
+    return "\n".join(out)
+
 
 # ---------------------------------------------------------------------------
-# File I/O Analysis (--file-io)
+# Output: file I/O report (-f)
 # ---------------------------------------------------------------------------
 
 def _normalize_io_path(path: str) -> str:
@@ -1176,8 +2555,10 @@ def _estimate_read_bytes(offset: int, limit: int) -> int:
     return max(0, (limit - offset + 1)) * 80
 
 
-def _flatten_tool_uses(sessions: list[Session]) -> list[tuple[str, ToolUse]]:
-    """Yield (session_id, ToolUse) recursively including sub-agents."""
+def _flatten_tool_uses(sessions: list[Session]) -> Iterator[tuple[str, ToolUse]]:
+    """Yield (session_id, ToolUse) recursively including sub-agents. A
+    sub-agent's calls are keyed by its task_id. Sub-agents are visited from a
+    LIFO stack after their parent's calls, which fixes the report's op order."""
     stack: list[tuple[str, Session]] = [(s.session_id, s) for s in sessions]
     while stack:
         sid, sess = stack.pop()
@@ -1194,9 +2575,7 @@ def generate_file_io_report(sessions: list[Session]) -> dict:
 
     for sid, tu in _flatten_tool_uses(sessions):
         inp = tu.input if isinstance(tu.input, dict) else {}
-        ts = ''
-        if tu.result and hasattr(tu.result, 'timestamp'):
-            ts = tu.result.timestamp or ''
+        ts = ''  # the IR carries no per-call timestamp; kept for the report schema
 
         name_lower = tu.name.lower()
         if name_lower == 'read':
@@ -1279,73 +2658,8 @@ def generate_file_io_report(sessions: list[Session]) -> dict:
     }
 
 
-def build_readable_history(sessions: list[Session]) -> str:
-    """
-    Build a human-readable narrative of the full agent execution.
-    Returns a single string. Uses list accumulation + join for efficiency
-    since the output can be very large (multiple MB).
-    """
-    out: list[str] = []
-    total = len(sessions)
-
-    for idx, s in enumerate(sessions, 1):
-        r = s.result
-        duration_s = f"{r.duration_ms / 1000:.1f}s" if r else "?"
-        cost = f"${r.total_cost_usd:.4f}" if r else "?"
-        all_cost, sub_count = _session_total_cost(s)
-        header_cost = (
-            f"${all_cost:.4f} (main {cost} + {sub_count} sub-agents)"
-            if sub_count
-            else cost
-        )
-
-        out.append("")
-        out.append("=" * 70)
-        heading = f"  Session {idx}/{total}"
-        if s.phase:
-            heading += f" — {s.phase.upper()}"
-        out.append(heading)
-        out.append(
-            f"  model: {s.init.model if s.init else '?'}  "
-            f"duration: {duration_s}  cost: {header_cost}"
-        )
-        ta = _time_attribution(s)
-        if ta is not None:
-            for line in _format_time_report(ta):
-                out.append(f"  {line}")
-        out.append("=" * 70)
-        out.append("")
-
-        # Surface rate-limit events
-        for m in s.monitoring:
-            if m.type == "rate_limit_event" or m.subtype == "rate_limit_event":
-                info = m.raw.get("rate_limit_info", {})
-                out.append(
-                    f"  ⚠️  Rate limit: status={info.get('status')}  "
-                    f"type={info.get('rateLimitType')}"
-                )
-
-        out.append("")
-        _fmt_turns(s.conversation, out)
-
-        if r:
-            out.append(
-                f"  ✅ Session ended: {r.stop_reason}  "
-                f"turns={r.num_turns}  cost={cost}"
-            )
-            for model, mu in r.model_usage.items():
-                short = model.split("-")[1] if "-" in model else model
-                out.append(
-                    f"     [{short}] in={mu.input_tokens} out={mu.output_tokens}  "
-                    f"cache_read={mu.cache_read_tokens}  ${mu.cost_usd:.4f}"
-                )
-        out.append("")
-
-    return "\n".join(out)
-
-
 # ---------------------------------------------------------------------------
-# Timeline Visualization (SVG)
+# Output: SVG timeline (-v)
 #
 # Each turn becomes one horizontal bar. The bar is split into colored
 # segments, one per operation, in execution order. Segment width is
@@ -1358,7 +2672,12 @@ def build_readable_history(sessions: list[Session]) -> str:
 #           Bash redirects/sed -i)
 #   build — execution-style operations (cargo/cmake/make/gcc/python/...)
 #           sized by tool_result length (the output that re-entered context)
+#   subagent — a sub-agent dispatch, sized by its returned result; the
+#           sub-agent's own turns follow as indented rows with a guide line
 #   other — anything we couldn't classify
+#
+# Synthesized turns (async sub-agents, workflow phases) have no content, so
+# their segments are sized by `size_override` (a token delta) instead.
 #
 # Bar TOTAL width is normalized to the longest turn in the trace, so a
 # row that fills the whole strip = the heaviest turn; short rows = short
@@ -1523,10 +2842,8 @@ def _classify_tool(tu: ToolUse) -> str:
     if name_lower == "bash":
         cmd = tu.input.get("command", "") if isinstance(tu.input, dict) else ""
         return _classify_bash(cmd)
-    if name_lower in ("agent", "task", "workflow"):
+    if name_lower in _SUBAGENT_TOOLS:
         return CAT_SUBAGENT
-    if name_lower in ("todowrite", "lsp"):
-        return CAT_OTHER
     return CAT_OTHER
 
 
@@ -1549,140 +2866,6 @@ def _tool_size(tu: ToolUse) -> int:
     return len(tu.result.content) if tu.result else 0
 
 
-# Map from progress-event description prefix (per `last_tool_name`) to
-# regex that strips the prefix to recover the closest thing to the original
-# tool input. The prefix scheme is set by the framework, see how each tool
-# emits task_progress descriptions: e.g. Read → "Reading <path>", Bash →
-# "Running <agent-supplied-description>", etc.
-_PROGRESS_PREFIX = {
-    "Read":  re.compile(r"^Reading\s+", re.IGNORECASE),
-    "Write": re.compile(r"^Writing\s+", re.IGNORECASE),
-    "Edit":  re.compile(r"^Editing\s+", re.IGNORECASE),
-    "Glob":  re.compile(r"^Finding\s+", re.IGNORECASE),
-    "Grep":  re.compile(r"^Searching for\s+", re.IGNORECASE),
-    "Bash":  re.compile(r"^Running\s+", re.IGNORECASE),
-}
-
-
-def _synthesize_async_subagent_turns(
-    snapshots: list[ProgressSnapshot],
-) -> list[Turn]:
-    """Async sub-agents have no parented conversation records in the trace,
-    only `task_progress` snapshots. Build one pseudo-Turn per snapshot, each
-    holding a single ToolUse named after `last_tool_name`. Sizes use
-    `total_tokens` deltas as a proxy for "context grown by this tool call".
-
-    The synthesized turns are approximate — exact tool inputs/outputs are not
-    in the trace — but they are enough for the visualizer to render the
-    activity, and tooltips carry the framework-supplied description.
-
-    Per-tool input population: framework progress descriptions follow stable
-    prefix patterns ("Reading <path>", "Running <bash-desc>", ...). We strip
-    the prefix and put the body into the field _classify_tool / _segment_turn
-    expects (command for Bash, file_path for Read/Write/Edit, pattern for
-    Glob/Grep), so downstream classifiers see something useful instead of an
-    empty input dict.
-    """
-    turns: list[Turn] = []
-    prev_tokens = 0
-    for idx, snap in enumerate(snapshots):
-        token_delta = max(snap.total_tokens - prev_tokens, 0)
-        prev_tokens = snap.total_tokens
-        tool_name = snap.last_tool_name or "Bash"
-        # Strip the framework prefix to recover the body.
-        body = snap.description or ""
-        prefix_re = _PROGRESS_PREFIX.get(tool_name)
-        if prefix_re is not None:
-            body = prefix_re.sub("", body, count=1)
-        # Populate the input field downstream code looks at, by tool kind.
-        synthetic_input: dict = {"description": snap.description}
-        if tool_name == "Bash":
-            synthetic_input["command"] = body
-        elif tool_name in ("Read", "Write", "Edit"):
-            synthetic_input["file_path"] = body
-        elif tool_name in ("Glob", "Grep"):
-            synthetic_input["pattern"] = body
-        tu = ToolUse(
-            id=f"async-progress-{idx}",
-            name=tool_name,
-            input=synthetic_input,
-            size_override=token_delta,
-        )
-        turn = Turn(turn_index=len(turns) + 1)
-        turn.content_blocks.append(ContentBlock(type="tool_use", tool_use=tu))
-        turns.append(turn)
-    return turns
-
-
-def _synthesize_workflow_agent_turns(
-    progress_events: list[dict],
-    prev_tokens: int = 0,
-) -> tuple[list[Turn], int]:
-    """Workflow tasks contain multiple sequential agents, each tracked by
-    `task_progress` events.  Build one pseudo-Turn per progress event,
-    using token deltas between consecutive events to approximate work done.
-
-    The `workflow_progress` array in each event contains `workflow_agent`
-    entries with `lastToolName` and `lastToolSummary`, which describe the
-    actual tool the agent was using.  Use these for colorized tool names
-    instead of the generic "Other" fallback.
-
-    `prev_tokens` carries across agents because total_tokens is cumulative
-    across the entire workflow.  Returns (turns, final_prev_tokens).
-    """
-    turns: list[Turn] = []
-    for idx, ev in enumerate(progress_events):
-        usage = ev.get("usage", {})
-        total_tokens = usage.get("total_tokens", 0)
-        token_delta = max(total_tokens - prev_tokens, 0)
-        prev_tokens = total_tokens
-
-        desc = ev.get("description", "") or "workflow-step"
-
-        # Extract phase title and actual tool info from workflow_progress.
-        phase_title = ""
-        tool_name = ""
-        tool_summary = ""
-        for wp in ev.get("workflow_progress") or []:
-            if wp.get("type") == "workflow_phase":
-                phase_title = wp.get("title", "")
-            elif wp.get("type") == "workflow_agent":
-                # Prefer the most recent agent entry's tool info.
-                tn = wp.get("lastToolName", "")
-                ts = wp.get("lastToolSummary", "")
-                if tn:
-                    tool_name = tn
-                if ts:
-                    tool_summary = ts
-
-        label = f"{phase_title}: {desc}" if phase_title and phase_title not in desc else desc
-
-        # Build a ToolUse with the real tool name so _classify_tool assigns
-        # the correct color (Read=blue, Write=green, Bash=build/yellow, etc.).
-        effective_name = tool_name if tool_name else "Other"
-        synthetic_input: dict = {"description": label}
-        if tool_name:
-            if tool_name.lower() == "bash":
-                synthetic_input["command"] = tool_summary
-            elif tool_name.lower() in ("read", "write", "edit"):
-                synthetic_input["file_path"] = tool_summary
-            elif tool_name.lower() == "apply_patch":
-                synthetic_input["patchText"] = tool_summary
-            elif tool_name.lower() in ("glob", "grep"):
-                synthetic_input["pattern"] = tool_summary
-
-        tu = ToolUse(
-            id=f"workflow-step-{idx}",
-            name=effective_name,
-            input=synthetic_input,
-            size_override=token_delta,
-        )
-        turn = Turn(turn_index=len(turns) + 1)
-        turn.content_blocks.append(ContentBlock(type="tool_use", tool_use=tu))
-        turns.append(turn)
-    return turns, prev_tokens
-
-
 def _think_size(turn: Turn) -> int:
     return sum(
         len(b.thinking or "") if b.type == "thinking" else len(b.text or "")
@@ -1698,6 +2881,22 @@ class _Segment:
     tooltip: str
 
 PREVIEW_SIZE = 400  # chars of tool input/result to show in tooltip
+
+
+def _task_previews(tu: ToolUse) -> tuple[str, str, str]:
+    """(description, prompt preview, result preview) of a sub-agent dispatch,
+    for tooltips. A Workflow call's input has only "script"; fall back to its
+    SubAgent's description and prompt."""
+    inp = tu.input if isinstance(tu.input, dict) else {}
+    desc = inp.get("description", "")
+    prompt_text = inp.get("prompt", "")
+    if tu.subagent:
+        desc = desc or tu.subagent.description or ""
+        prompt_text = prompt_text or tu.subagent.prompt or ""
+    prompt_preview = prompt_text[:PREVIEW_SIZE].replace("\n", " ") if prompt_text else ""
+    result_preview = (tu.result.content[:PREVIEW_SIZE] if tu.result else "").replace("\n", " ")
+    return desc, prompt_preview, result_preview
+
 
 def _segment_turn(turn: Turn) -> list[_Segment]:
     """Break a turn into ordered segments; think first, then tool ops."""
@@ -1719,43 +2918,30 @@ def _segment_turn(turn: Turn) -> list[_Segment]:
         if size <= 0:
             continue
         cat = _classify_tool(tu)
+        inp = tu.input if isinstance(tu.input, dict) else {}
         # For synthesized async-sub-agent ToolUses the only input we have is
         # `description` (lifted from a task_progress snapshot). Use it as a
         # universal fallback when the usual fields aren't present.
-        desc_fallback = tu.input.get("description", "") if isinstance(tu.input, dict) else ""
+        desc_fallback = inp.get("description", "")
         name_lower = tu.name.lower()
         if name_lower == "bash":
-            cmd = tu.input.get("command", "") if isinstance(tu.input, dict) else ""
+            cmd = inp.get("command", "")
             tip = f"$ {cmd[:400]}" if cmd else f"Bash: {desc_fallback}"
         elif name_lower in ("read", "glob", "grep"):
             target = (
-                (tu.input.get("file_path") if isinstance(tu.input, dict) else None)
-                or (tu.input.get("filePath") if isinstance(tu.input, dict) else None)
-                or (tu.input.get("pattern", "") if isinstance(tu.input, dict) else "")
-                or desc_fallback
+                inp.get("file_path") or inp.get("filePath")
+                or inp.get("pattern", "") or desc_fallback
             )
             tip = f"{tu.name}: {target}"
         elif name_lower in ("write", "edit"):
-            target = ((tu.input.get("file_path") or tu.input.get("filePath") or "") if isinstance(tu.input, dict) else "") or desc_fallback
+            target = inp.get("file_path") or inp.get("filePath") or desc_fallback
             tip = f"{tu.name}: {target}"
         elif name_lower == "apply_patch":
-            patch = tu.input.get("patchText", "") if isinstance(tu.input, dict) else ""
-            ops = _apply_patch_files(patch)
+            ops = _apply_patch_files(inp.get("patchText", ""))
             target = "; ".join(ops) or desc_fallback
             tip = f"{tu.name}: {target}"
-        elif name_lower in ("agent", "task", "workflow"):
-            desc = ""
-            prompt_text = ""
-            result_preview = ""
-            if isinstance(tu.input, dict):
-                desc = tu.input.get("description", "")
-                prompt_text = tu.input.get("prompt", "")
-            # Workflow ToolUse.input has only "script"; fall back to SubAgent.
-            if tu.subagent:
-                desc = desc or tu.subagent.description or ""
-                prompt_text = prompt_text or tu.subagent.prompt or ""
-            prompt_preview = prompt_text[:PREVIEW_SIZE].replace("\n", " ") if prompt_text else ""
-            result_preview = (tu.result.content[:PREVIEW_SIZE] if tu.result else "").replace("\n", " ")
+        elif name_lower in _SUBAGENT_TOOLS:
+            desc, prompt_preview, result_preview = _task_previews(tu)
             frozen_note = "⚠ FROZEN — never completed\n" if tu.frozen else ""
             tip = f"{frozen_note}[task] {desc}\n[prompt] {prompt_preview}\n[result] {result_preview}"
         else:
@@ -1797,38 +2983,6 @@ class _Group:
     session_ended: bool = True  # False for a live trace (no result event yet)
 
 
-def _session_ended(s: Session) -> bool:
-    """
-    Whether the process behind this session is known to have finished.
-
-    A Claude stream trace ends with a `result` event; without one the trace
-    is either still being written (live visualization of a running session)
-    or was killed hard. A sub-agent with status "running" must NOT be
-    reported as frozen unless the session actually ended — otherwise every
-    in-flight sync sub-agent in a live trace shows up as a false FROZEN.
-
-    OpenCode sessions can also be live: live-exports (and JSONL tails) of a
-    running session report in-flight tools as status "running" exactly like
-    a genuinely frozen one. The reliable end signal is the agent_runner
-    phase window: `process_wall_ms` is only set once the trace contains the
-    closing "Exporting"/"Appended" runner marker, which a live run has not
-    written yet. (Session.result is synthesized for OpenCode and says
-    nothing about liveness.)
-    """
-    if s.agent_type == "claude":
-        return s.result is not None
-    return bool(s.process_wall_ms)
-
-
-def _subagent_unfinished(tu: ToolUse) -> bool:
-    """A sub-agent dispatch with no completion yet: the export caught the tool
-    still running (tu.frozen) or the sub-agent status is stuck at
-    running/pending. FROZEN vs in-flight is decided by _session_ended()."""
-    return tu.frozen or (
-        tu.subagent is not None and tu.subagent.status in ("running", "pending")
-    )
-
-
 def _count_live_subagents(sessions: list[Session]) -> int:
     """
     Count sub-agents still in flight in live OpenCode sessions.
@@ -1839,21 +2993,12 @@ def _count_live_subagents(sessions: list[Session]) -> int:
     itself, so the trace mtime already drives re-rendering. Written into the
     SVG as a marker so visualize_all.py can re-render such traces on a timer.
     """
-    def walk(turns: list[Turn]) -> int:
-        n = 0
-        for t in turns:
-            for tu in t.tool_uses:
-                if tu.name.lower() not in ("agent", "task", "workflow"):
-                    continue
-                if _subagent_unfinished(tu):
-                    n += 1
-                if tu.subagent is not None:
-                    n += walk(tu.subagent.conversation)
-        return n
-
     return sum(
-        walk(s.conversation) for s in sessions
+        1
+        for s in sessions
         if s.agent_type == "opencode" and not _session_ended(s)
+        for tu in _iter_tool_uses(s.conversation)
+        if tu.name.lower() in _SUBAGENT_TOOLS and _subagent_unfinished(tu)
     )
 
 
@@ -1886,37 +3031,34 @@ def _flatten_rows(sessions: list[Session]) -> tuple[list[_Row], list[_Group]]:
             # A turn can issue several Agent calls (true parallel via multiple
             # tool_use blocks in one message); without numbering, every
             # sub-agent's "T1" looks identical to every other sub-agent's "T1".
-            sub_idx = 0
-            sub_count = sum(
-                1 for tu in t.tool_uses
-                if tu.name.lower() in ("agent", "task", "workflow") and tu.subagent is not None
-            )
-            for tu in t.tool_uses:
-                if tu.name.lower() in ("agent", "task", "workflow") and tu.subagent:
-                    sub_idx += 1
-                    sub_prefix = f"{prefix}T{t.turn_index}/A{sub_idx}:"
-                    grp_start = len(rows)
-                    sub_compacts: dict[int, list[CompactEvent]] = defaultdict(list)
-                    for ev in tu.subagent.compact_events:
-                        sub_compacts[ev.after_turn_index].append(ev)
-                    emit(tu.subagent.conversation, sub_prefix, depth + 1,
-                         sub_compacts, session_ended)
-                    grp_end = len(rows) - 1
-                    if grp_end >= grp_start:
-                        groups.append(_Group(
-                            depth=depth + 1,
-                            start_idx=grp_start, end_idx=grp_end,
-                            tool_use=tu,
-                            is_async=tu.subagent.is_async,
-                            session_ended=session_ended,
-                        ))
-                    # Insert a thin spacer between sibling sub-agents so the
-                    # boundary between A{n} and A{n+1} is visually obvious
-                    # without wasting a full row of vertical space.
-                    if sub_idx < sub_count:
-                        rows.append(_Row(
-                            label="", depth=depth + 1, spacer=True, height=8,
-                        ))
+            subs = [
+                tu for tu in t.tool_uses
+                if tu.name.lower() in _SUBAGENT_TOOLS and tu.subagent is not None
+            ]
+            for sub_idx, tu in enumerate(subs, 1):
+                sub_prefix = f"{prefix}T{t.turn_index}/A{sub_idx}:"
+                grp_start = len(rows)
+                sub_compacts: dict[int, list[CompactEvent]] = defaultdict(list)
+                for ev in tu.subagent.compact_events:
+                    sub_compacts[ev.after_turn_index].append(ev)
+                emit(tu.subagent.conversation, sub_prefix, depth + 1,
+                     sub_compacts, session_ended)
+                grp_end = len(rows) - 1
+                if grp_end >= grp_start:
+                    groups.append(_Group(
+                        depth=depth + 1,
+                        start_idx=grp_start, end_idx=grp_end,
+                        tool_use=tu,
+                        is_async=tu.subagent.is_async,
+                        session_ended=session_ended,
+                    ))
+                # Insert a thin spacer between sibling sub-agents so the
+                # boundary between A{n} and A{n+1} is visually obvious
+                # without wasting a full row of vertical space.
+                if sub_idx < len(subs):
+                    rows.append(_Row(
+                        label="", depth=depth + 1, spacer=True, height=8,
+                    ))
             for ev in compacts_by_after.get(t.turn_index, []):
                 rows.append(_Row(label="", depth=depth, compact=ev))
 
@@ -1946,137 +3088,7 @@ def _flatten_rows(sessions: list[Session]) -> tuple[list[_Row], list[_Group]]:
     return rows, groups
 
 
-def _count_subagents(turns: list[Turn]) -> tuple[int, int]:
-    """Count (sync, async) sub-agents recursively across the turn tree."""
-    sync = 0
-    async_ = 0
-    for t in turns:
-        for blk in t.content_blocks:
-            if blk.type == "tool_use" and blk.tool_use and blk.tool_use.subagent:
-                sa = blk.tool_use.subagent
-                if sa.is_async:
-                    async_ += 1
-                else:
-                    sync += 1
-                ns, na = _count_subagents(sa.conversation)
-                sync += ns
-                async_ += na
-    return sync, async_
-
-
-def _format_duration(ms: int) -> str:
-    if ms <= 0: return "?"
-    s = ms // 1000
-    if s < 60: return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60: return f"{m}m{s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h{m:02d}m"
-
-
-_STALL_GAP_MS = 600_000  # ≥10 min between last session activity and process death
-
-
-def _stall_gap_ms(s: Session) -> int:
-    """Dead time between the session's last recorded activity and the agent
-    process's end. Nonzero only when agent_runner markers were found and the
-    gap exceeds `_STALL_GAP_MS` — the signature of a stalled process that sat
-    idle until the harness timeout killed it."""
-    if (
-        s.process_wall_ms
-        and s.wall_clock_ms
-        and s.process_wall_ms > s.wall_clock_ms + _STALL_GAP_MS
-    ):
-        return s.process_wall_ms - s.wall_clock_ms
-    return 0
-
-
-def _count_frozen_tools(turns: list[Turn]) -> int:
-    """Recursively count tool calls frozen mid-flight (never completed)."""
-    n = 0
-    for t in turns:
-        for tu in t.tool_uses:
-            if tu.frozen:
-                n += 1
-            if tu.subagent is not None:
-                n += _count_frozen_tools(tu.subagent.conversation)
-    return n
-
-
-def _format_compact_int(n: int) -> str:
-    if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:     return f"{n / 1_000:.1f}k"
-    return str(n)
-
-
-def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
-    """Recursively sum token usage from all sub-agents in a turn tree.
-
-    Returns a dict with keys: input, output, cache_read, cache_write, total, unclassified.
-    - input/output/cache_read/cache_write: tokens from sub-agents that have per-turn
-      breakdown (OpenCode exports).
-    - unclassified: flat total_tokens from sub-agents without breakdown (Claude).
-    - total: sum of all tokens regardless of classification.
-    """
-    agg = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total": 0, "unclassified": 0}
-
-    for turn in turns:
-        for blk in turn.content_blocks:
-            if blk.type != "tool_use" or not blk.tool_use or not blk.tool_use.subagent:
-                continue
-            sa = blk.tool_use.subagent
-
-            # Prefer per-turn breakdown from the sub-agent's conversation.
-            has_breakdown = False
-            for t in sa.conversation:
-                if t.usage:
-                    agg["input"] += t.usage.input_tokens
-                    agg["output"] += t.usage.output_tokens
-                    agg["cache_read"] += t.usage.cache_read_tokens
-                    agg["cache_write"] += t.usage.cache_creation_tokens
-                    has_breakdown = True
-
-            # If no per-turn breakdown, count as unclassified.
-            if not has_breakdown and sa.total_tokens:
-                agg["unclassified"] += sa.total_tokens
-
-            # Recurse into nested sub-agents.
-            child = _sum_subagent_tokens(sa.conversation)
-            for k in agg:
-                agg[k] += child[k]
-
-    agg["total"] = agg["input"] + agg["output"] + agg["cache_read"] + agg["cache_write"] + agg["unclassified"]
-    return agg
-
-
-def _sum_subagent_cost(turns: list[Turn]) -> tuple[float, int]:
-    """Recursively sum the separately billed cost of all sub-agents in a turn
-    tree. Returns (cost_usd, number of sub-agents that carry a cost)."""
-    cost = 0.0
-    count = 0
-    for turn in turns:
-        for blk in turn.content_blocks:
-            if blk.type != "tool_use" or not blk.tool_use or not blk.tool_use.subagent:
-                continue
-            sa = blk.tool_use.subagent
-            if sa.cost_usd is not None:
-                cost += sa.cost_usd
-                count += 1
-            child_cost, child_count = _sum_subagent_cost(sa.conversation)
-            cost += child_cost
-            count += child_count
-    return cost, count
-
-
-def _session_total_cost(s: Session) -> tuple[float, int]:
-    """Cost of a session including its separately billed sub-agents.
-    Returns (cost_usd, number of sub-agents added to the main cost)."""
-    main = s.result.total_cost_usd if s.result else 0.0
-    sub_cost, sub_count = _sum_subagent_cost(s.conversation)
-    return main + sub_cost, sub_count
-
-
-def _format_cost_label(s: Session, sub_tok: dict[str, int]) -> str:
+def _format_cost_label(s: Session, unclassified_tok: int) -> str:
     """SVG cost label: the total over the main session and its separately
     billed sub-agents, or the main cost marked as such when sub-agent cost is
     not in the trace."""
@@ -2086,7 +3098,7 @@ def _format_cost_label(s: Session, sub_tok: dict[str, int]) -> str:
     label = f"${total:.2f}"
     if sub_count:
         label += f" (main + {sub_count} sub-agents)"
-    elif sub_tok["unclassified"] > 0:
+    elif unclassified_tok > 0:
         label += " (main only)"
     return label
 
@@ -2106,33 +3118,13 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
     if s.compact_events:
         parts.append(f"{len(s.compact_events)} compactions")
     # Token totals: main session + classified sub-agent tokens.
-    in_tok = 0
-    out_tok = 0
-    cache_r = 0
-    cache_c = 0
-    if r is not None and r.model_usage:
-        for mu in r.model_usage.values():
-            in_tok += mu.input_tokens
-            out_tok += mu.output_tokens
-            cache_r += mu.cache_read_tokens
-            cache_c += mu.cache_creation_tokens
-    sub_tok = _sum_subagent_tokens(s.conversation)
-    in_tok += sub_tok["input"]
-    out_tok += sub_tok["output"]
-    cache_r += sub_tok["cache_read"]
-    cache_c += sub_tok["cache_write"]
-    # Main + classified sub-agent tokens.
-    if in_tok or out_tok or cache_r or cache_c:
-        parts.append(
-            f"{_format_compact_int(in_tok + out_tok)} new tok "
-            f"(in={_format_compact_int(in_tok)} out={_format_compact_int(out_tok)} "
-            f"cache_r={_format_compact_int(cache_r)} "
-            f"cache_c={_format_compact_int(cache_c)})"
-        )
+    tok = _session_token_totals(s)
+    if tok["input"] or tok["output"] or tok["cache_read"] or tok["cache_write"]:
+        parts.append(_format_token_totals(tok))
     # Unclassified sub-agent tokens (Claude: no per-turn breakdown available).
-    if sub_tok["unclassified"] > 0:
+    if tok["unclassified"] > 0:
         parts.append(
-            f"+{_format_compact_int(sub_tok['unclassified'])} sub-agent tok (mixed)"
+            f"+{_format_compact_int(tok['unclassified'])} sub-agent tok (mixed)"
         )
     # Use the timestamp-derived wall clock — the only field that matches
     # actual elapsed time. Frame-side `duration_ms` is broken for async
@@ -2148,7 +3140,7 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
             )
     elif r is not None and r.duration_ms:
         parts.append(_format_duration(r.duration_ms))
-    cost_label = _format_cost_label(s, sub_tok)
+    cost_label = _format_cost_label(s, tok["unclassified"])
     if cost_label:
         parts.append(cost_label)
     if r is not None and r.is_error:
@@ -2165,193 +3157,6 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
     if frozen_n:
         parts.append(f"⚠ {frozen_n} frozen task(s) never completed")
     return "   ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Time attribution: Remote LLM Time vs Local Machine Time
-# ---------------------------------------------------------------------------
-#
-# Every agent (main or sub) is a chain alternating between an LLM interval
-# (API request issued → first tool start) and tool intervals. A `task`/`Agent`
-# tool is a container whose window is filled by the child's own chain, so it
-# is never counted as a leaf tool. Summing over all agents gives *work*
-# (parallel siblings count fully, like CPU time across threads); the wall
-# clock is the *span*. Only sources with per-step timestamps (OpenCode
-# exports) produce a report; otherwise the report is simply omitted.
-#
-# Abbreviations printed:
-#   wall       root session wall clock
-#   llm        Remote LLM Time, Σ over all agents (share of llm+tool)
-#   tool       Local Machine Time, Σ leaf tool intervals over all agents
-#   work/wall  (llm+tool)/wall — parallel speedup, 1.00x = fully serial
-#   llm-conc   avg: llm / union(LLM intervals) — time-weighted mean number of
-#              concurrent LLM calls while at least one is active;
-#              peak: the maximum number of concurrent LLM calls
-#   decode     Σ generated tokens / Σ decode time over all agents, where decode
-#              time runs from the first streamed part to the end of streaming
-#              (last part end, or first tool start when the step called tools);
-#              token-weighted, so long steps dominate
-#   decode+ttft Σ generated tokens / Σ LLM interval — the same tokens over the
-#              whole request (first-token latency included)
-#   sub        the three longest sub-agents: label, duration, steps, llm share
-#
-# Generated tokens = output + reasoning as reported by the provider. Their split
-# is unreliable (opencode-go sometimes folds reasoning into output), the sum is
-# not; `Turn.usage.output_tokens` already holds that sum.
-
-@dataclass
-class TimeAttribution:
-    wall_ms: int
-    llm_ms: int            # L_work
-    tool_ms: int           # T_work
-    llm_cov_ms: int        # union of LLM intervals
-    llm_peak: int          # max number of concurrent LLM calls
-    gen_tokens: int        # Σ output(+reasoning) tokens over steps with timing
-    decode_ms: int         # Σ decode time (steps with a streaming window)
-    decode_tokens: int     # Σ generated tokens of those same steps
-    # Wall partition by what is active: "L" only LLM, "T" only tool,
-    # "LT" both, "idle" neither. Computed for downstream use, not printed.
-    coverage: dict[str, int]
-    # (label, duration_ms, steps, llm_ms, tool_ms) for the longest sub-agents.
-    top_subagents: list[tuple[str, int, int, int, int]]
-
-
-def _union_ms(intervals: list[tuple[int, int]]) -> int:
-    total = 0
-    cur_a = cur_b = None
-    for a, b in sorted(intervals):
-        if cur_b is None or a > cur_b:
-            if cur_b is not None:
-                total += cur_b - cur_a
-            cur_a, cur_b = a, b
-        else:
-            cur_b = max(cur_b, b)
-    if cur_b is not None:
-        total += cur_b - cur_a
-    return total
-
-
-def _collect_time_intervals(
-    turns: list[Turn],
-    llm_iv: list[tuple[int, int]],
-    tool_iv: list[tuple[int, int]],
-    acc: Optional[dict[str, int]] = None,
-) -> None:
-    """Append the LLM and leaf-tool intervals of `turns` and, recursively, of
-    every sub-agent conversation nested under them. When `acc` is given, also
-    accumulate generated tokens and decode time (keys: gen_tokens, decode_ms,
-    decode_tokens)."""
-    for t in turns:
-        llm_end = t.llm_end_ms
-        if t.start_ms and llm_end > t.start_ms:
-            llm_iv.append((t.start_ms, llm_end))
-            if acc is not None:
-                gen = t.usage.output_tokens if t.usage else 0
-                acc["gen_tokens"] = acc.get("gen_tokens", 0) + gen
-                if t.first_stream_ms:
-                    dec_end = max(t.last_stream_ms, llm_end)
-                    dec = dec_end - t.first_stream_ms
-                    if dec > 0:
-                        acc["decode_ms"] = acc.get("decode_ms", 0) + dec
-                        acc["decode_tokens"] = acc.get("decode_tokens", 0) + gen
-        for tu in t.tool_uses:
-            if tu.subagent is not None:
-                _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv, acc)
-                continue
-            if tu.name.lower() in ("agent", "task"):
-                continue  # container without a parsed child: not a leaf
-            if tu.start_ms and tu.end_ms > tu.start_ms:
-                tool_iv.append((tu.start_ms, tu.end_ms))
-
-
-def _time_attribution(s: Session) -> Optional[TimeAttribution]:
-    """Return the time attribution for a session, or None when the source
-    carries no per-step timing (e.g. the Claude Code stream)."""
-    llm_iv: list[tuple[int, int]] = []
-    tool_iv: list[tuple[int, int]] = []
-    acc: dict[str, int] = {}
-    _collect_time_intervals(s.conversation, llm_iv, tool_iv, acc)
-    wall = s.wall_clock_ms
-    if not wall or not llm_iv:
-        return None
-    llm_ms = sum(b - a for a, b in llm_iv)
-    tool_ms = sum(b - a for a, b in tool_iv)
-    llm_cov = _union_ms(llm_iv)
-
-    # Coverage sweep over the wall clock, anchored at the first LLM start.
-    w0 = min(a for a, _ in llm_iv)
-    w1 = w0 + wall
-    events: list[tuple[int, int, int]] = []
-    for a, b in llm_iv:
-        events.append((a, 1, 0)); events.append((b, -1, 0))
-    for a, b in tool_iv:
-        events.append((a, 0, 1)); events.append((b, 0, -1))
-    coverage: dict[str, int] = {"L": 0, "T": 0, "LT": 0, "idle": 0}
-    n_l = n_t = 0
-    llm_peak = 0
-    prev = w0
-    for t, dl, dt in sorted(events):
-        t = min(max(t, w0), w1)
-        if t > prev:
-            key = ("L" if n_l else "") + ("T" if n_t else "")
-            coverage[key or "idle"] += t - prev
-        prev = t
-        n_l += dl
-        n_t += dt
-        llm_peak = max(llm_peak, n_l)
-    coverage["idle"] += max(0, w1 - prev)
-
-    # Longest sub-agents spawned by the main agent (direct children only).
-    subs: list[tuple[str, int, int, int, int]] = []
-    for t in s.conversation:
-        for tu in t.tool_uses:
-            if tu.subagent is None or not tu.start_ms or tu.end_ms <= tu.start_ms:
-                continue
-            sub_llm: list[tuple[int, int]] = []
-            sub_tool: list[tuple[int, int]] = []
-            _collect_time_intervals(tu.subagent.conversation, sub_llm, sub_tool)
-            label = (tu.subagent.description or "").strip() or f"#{tu.subagent.task_id[-6:]}"
-            subs.append((
-                label,
-                tu.end_ms - tu.start_ms,
-                len(tu.subagent.conversation),
-                sum(b - a for a, b in sub_llm),
-                sum(b - a for a, b in sub_tool),
-            ))
-    subs.sort(key=lambda x: -x[1])
-
-    return TimeAttribution(
-        wall_ms=wall, llm_ms=llm_ms, tool_ms=tool_ms, llm_cov_ms=llm_cov,
-        llm_peak=llm_peak, coverage=coverage, top_subagents=subs[:3],
-        gen_tokens=acc.get("gen_tokens", 0), decode_ms=acc.get("decode_ms", 0),
-        decode_tokens=acc.get("decode_tokens", 0),
-    )
-
-
-def _format_time_report(ta: TimeAttribution) -> list[str]:
-    """One or two compact lines: totals, then the longest sub-agents."""
-    work = ta.llm_ms + ta.tool_ms
-    # `key=value` cells separated by " | " so a label cannot be mistaken for
-    # belonging to the number on its left.
-    cells = [
-        f"wall={_format_duration(ta.wall_ms)}",
-        f"llm={_format_duration(ta.llm_ms)} ({100 * ta.llm_ms / work:.0f}%)",
-        f"tool={_format_duration(ta.tool_ms)} ({100 * ta.tool_ms / work:.0f}%)",
-        f"work/wall={work / ta.wall_ms:.2f}x",
-        f"llm-conc={ta.llm_ms / ta.llm_cov_ms:.2f}x avg, {ta.llm_peak} peak",
-    ]
-    if ta.decode_ms and ta.decode_tokens:
-        cells.append(f"decode={1000 * ta.decode_tokens / ta.decode_ms:.1f} tok/s")
-    if ta.gen_tokens:
-        cells.append(f"decode+ttft={1000 * ta.gen_tokens / ta.llm_ms:.1f} tok/s")
-    lines = ["time: " + " | ".join(cells)]
-    if ta.top_subagents:
-        subs = []
-        for label, dur, steps, l_ms, t_ms in ta.top_subagents:
-            share = f"llm {100 * l_ms / (l_ms + t_ms):.0f}%" if l_ms + t_ms else "llm n/a"
-            subs.append(f"{label}: {_format_duration(dur)}, {steps} steps, {share}")
-        lines.append("sub: " + " | ".join(subs))
-    return lines
 
 
 # Chars that are illegal in XML 1.0 no matter how they are escaped
@@ -2377,7 +3182,6 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         (sum(seg.size for seg in row.segments) for row in rows), default=1
     ) or 1
     max_depth = max((row.depth for row in rows), default=0)
-    n_turn_rows = sum(1 for row in rows if row.compact is None and not row.spacer)
 
     row_h = 14
     label_w = 90
@@ -2414,7 +3218,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
     )
     out.append(f'<rect width="{width}" height="{height}" fill="{_BG}"/>')
 
-    title = f"Trace timeline — {n_turn_rows} turns"
+    title = "Trace timeline"
     out.append(
         f'<text x="20" y="28" font-size="16" font-weight="bold" fill="{_TITLE}">'
         f'{_svg_escape(title)}</text>'
@@ -2453,7 +3257,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
     # at the column where bars would have started without `bar_inset`,
     # `bar_inset` pixels to the left of the actual bars. Hovering the line
     # surfaces the same tooltip as the parent's purple Agent bar segment.
-    group_color = CAT_COLORS.get(CAT_SUBAGENT, "#9b80c8")
+    group_color = CAT_COLORS[CAT_SUBAGENT]
     # Unfinished sub-agents keep the normal purple but the guide line fades
     # out toward the bottom ("the thread was never closed") and ends in a
     # small glyph: ✕ = still running when the process ended (killed),
@@ -2475,17 +3279,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
         if grp.tool_use is not None:
             tu = grp.tool_use
             size = _tool_size(tu)
-            desc = ""
-            prompt_text = ""
-            result_preview = ""
-            if isinstance(tu.input, dict):
-                desc = tu.input.get("description", "")
-                prompt_text = tu.input.get("prompt", "")
-            if tu.subagent:
-                desc = desc or tu.subagent.description or ""
-                prompt_text = prompt_text or tu.subagent.prompt or ""
-            prompt_preview = prompt_text[:PREVIEW_SIZE].replace("\n", " ") if prompt_text else ""
-            result_preview = (tu.result.content[:PREVIEW_SIZE] if tu.result else "").replace("\n", " ")
+            desc, prompt_preview, result_preview = _task_previews(tu)
             if frozen:
                 tooltip_lines.append(
                     "⚠ FROZEN — still running when the process ended"
@@ -2644,45 +3438,20 @@ def render_timeline_svg(sessions: list[Session]) -> str:
 
     # Grand total across all sessions.
     if len(sessions) > 1:
-        grand_in = 0
-        grand_out = 0
-        grand_cache_r = 0
-        grand_cache_c = 0
-        grand_unc = 0
+        grand = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0}
         grand_cost = 0.0
         for s in sessions:
-            r = s.result
-            if r is not None and r.model_usage:
-                for mu in r.model_usage.values():
-                    grand_in += mu.input_tokens
-                    grand_out += mu.output_tokens
-                    grand_cache_r += mu.cache_read_tokens
-                    grand_cache_c += mu.cache_creation_tokens
             grand_cost += _session_total_cost(s)[0]
-            sub = _sum_subagent_tokens(s.conversation)
-            grand_in += sub["input"]
-            grand_out += sub["output"]
-            grand_cache_r += sub["cache_read"]
-            grand_cache_c += sub["cache_write"]
-            grand_unc += sub["unclassified"]
+            for k, v in _session_token_totals(s).items():
+                grand[k] += v
         grand_y = cursor + 6
-        grand_text = (
-            f"Grand total: "
-            f"{_format_compact_int(grand_in + grand_out)} new tok "
-            f"(in={_format_compact_int(grand_in)} out={_format_compact_int(grand_out)} "
-            f"cache_r={_format_compact_int(grand_cache_r)} "
-            f"cache_c={_format_compact_int(grand_cache_c)})"
-        )
-        if grand_unc > 0:
-            grand_text += f"   +{_format_compact_int(grand_unc)} sub-agent tok (mixed)"
+        grand_text = f"Grand total: {_format_token_totals(grand)}"
+        if grand["unclassified"] > 0:
+            grand_text += f"   +{_format_compact_int(grand['unclassified'])} sub-agent tok (mixed)"
         if grand_cost > 0:
-            grand_cost_label = f"   ${grand_cost:.2f}"
-            has_unclassified = any(
-                _sum_subagent_tokens(s.conversation)["unclassified"] > 0 for s in sessions
-            )
-            if has_unclassified:
-                grand_cost_label += " (main only)"
-            grand_text += grand_cost_label
+            grand_text += f"   ${grand_cost:.2f}"
+            if grand["unclassified"] > 0:
+                grand_text += " (main only)"
         band_x = label_w
         band_w = width - band_x - 40
         out.append(
@@ -2700,885 +3469,8 @@ def render_timeline_svg(sessions: list[Session]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Format detection & OpenCode parser
+# Command-line entry point
 # ---------------------------------------------------------------------------
-
-_OPENCODE_EVENT_TYPES = {"step_start", "step_finish", "reasoning", "text", "tool_use"}
-
-
-def _detect_format(records: list[tuple[int, dict]]) -> str:
-    """Peek at the first few JSON records and return 'opencode' or 'claude'.
-
-    OpenCode traces always contain `step_start` / `step_finish` events.
-    Claude traces use `type=assistant` / `type=user` / `type=system`.
-    """
-    for _, obj in records[:20]:
-        typ = obj.get("type", "")
-        if typ in ("step_start", "step_finish", "reasoning"):
-            return "opencode"
-        if typ in ("assistant", "user", "system", "result"):
-            return "claude"
-    return "claude"
-
-
-class OpenCodeParser:
-    """Parse an OpenCode --format=json event stream into Session objects.
-
-    OpenCode emits a flat JSONL stream:
-      step_start → reasoning? → text? → tool_use* → step_finish
-
-    Each step_start/step_finish pair becomes one Turn.
-    tool_use events carry both input AND output inside `part.state`.
-    Token/cost totals arrive in step_finish.
-    """
-
-    def parse_file(self, path: str) -> list[Session]:
-        records: list[tuple[int, dict]] = []
-        with open(path, "r") as f:
-            for lineno, line in enumerate(f, 1):
-                stripped = line.strip()
-                if stripped.startswith("{"):
-                    try:
-                        records.append((lineno, json.loads(stripped)))
-                    except json.JSONDecodeError:
-                        pass
-
-        by_session: dict[str, list[tuple[int, dict]]] = defaultdict(list)
-        for lineno, obj in records:
-            sid = obj.get("sessionID", "unknown")
-            by_session[sid].append((lineno, obj))
-
-        # The stage is not guessed from position; _apply_runner_phases fills
-        # it in from the runner's markers when the trace has them.
-        sessions = [
-            self._parse_session(sid, None, events)
-            for sid, events in by_session.items()
-        ]
-        return sessions
-
-    def _parse_session(
-        self, session_id: str, phase: str, events: list[tuple[int, dict]]
-    ) -> Session:
-        session = Session(session_id=session_id, phase=phase, agent_type="opencode", data_source="jsonl")
-        session.wall_clock_ms = _wall_clock_ms(events)
-
-        current_turn: Optional[Turn] = None
-        turn_index = 0
-        accumulated_usage = TokenUsage(0, 0, 0, 0, 0)
-        step_cost = 0.0
-
-        for lineno, obj in events:
-            typ = obj.get("type", "")
-            part = obj.get("part", {})
-
-            if typ == "step_start":
-                turn_index += 1
-                current_turn = Turn(turn_index=turn_index)
-                continue
-
-            if typ == "reasoning" and current_turn is not None:
-                text = part.get("text", "")
-                if text:
-                    current_turn.content_blocks.append(
-                        ContentBlock(type="thinking", thinking=text)
-                    )
-                continue
-
-            if typ == "text" and current_turn is not None:
-                text = part.get("text", "")
-                if text:
-                    current_turn.content_blocks.append(
-                        ContentBlock(type="text", text=text)
-                    )
-                continue
-
-            if typ == "tool_use" and current_turn is not None:
-                tool_name = part.get("tool", "unknown")
-                state = part.get("state", {})
-                inp = state.get("input") or {}
-                if not isinstance(inp, dict):
-                    inp = {"input": inp}
-                output = state.get("output")
-                status = state.get("status", "")
-                call_id = part.get("callID", f"oc-{lineno}")
-
-                result = None
-                if output is not None or status:
-                    result = ToolResult(
-                        tool_use_id=call_id,
-                        content=str(output) if output is not None else "",
-                        is_error=status in ("error", "failed"),
-                    )
-
-                tu = ToolUse(id=call_id, name=tool_name, input=inp, result=result)
-                current_turn.content_blocks.append(
-                    ContentBlock(type="tool_use", tool_use=tu)
-                )
-                continue
-
-            if typ == "step_finish" and current_turn is not None:
-                tokens = part.get("tokens", {})
-                cache = tokens.get("cache", {})
-                # Use the explicit `input` field from step_finish, NOT
-                # `total - output - reasoning`.  The `total` field includes
-                # cache_read tokens, so subtracting output/reasoning from it
-                # inflates input by the cache_read amount.  The `input` field
-                # already contains only the true non-cached input tokens.
-                in_tok = tokens.get("input", 0)
-                # OpenCode reports reasoning separately from output, but the
-                # provider bills reasoning at the output rate — fold it in so
-                # output_tokens is directly usable for cost estimation.
-                reason_tok = tokens.get("reasoning", 0)
-                out_tok = tokens.get("output", 0) + reason_tok
-                turn_usage = TokenUsage(
-                    input_tokens=in_tok,
-                    output_tokens=out_tok,
-                    cache_creation_tokens=cache.get("write", 0),
-                    cache_read_tokens=cache.get("read", 0),
-                    reasoning_tokens=reason_tok,
-                )
-                current_turn.usage = turn_usage
-
-                cost = part.get("cost")
-                if cost is not None:
-                    step_cost += float(cost)
-
-                accumulated_usage = TokenUsage(
-                    input_tokens=accumulated_usage.input_tokens + turn_usage.input_tokens,
-                    output_tokens=accumulated_usage.output_tokens + turn_usage.output_tokens,
-                    cache_creation_tokens=accumulated_usage.cache_creation_tokens + turn_usage.cache_creation_tokens,
-                    cache_read_tokens=accumulated_usage.cache_read_tokens + turn_usage.cache_read_tokens,
-                    reasoning_tokens=accumulated_usage.reasoning_tokens + turn_usage.reasoning_tokens,
-                )
-
-                session.conversation.append(current_turn)
-                current_turn = None
-                continue
-
-        session.result = ResultEvent(
-            is_error=False,
-            stop_reason="end",
-            num_turns=len(session.conversation),
-            duration_ms=session.wall_clock_ms,
-            duration_api_ms=0,
-            total_cost_usd=step_cost if step_cost > 0 else 0.0,
-            result_text="",
-            model_usage={},
-        )
-        return session
-
-
-def _note_stream_time(turn: Turn, part: dict) -> None:
-    """Widen `turn`'s streaming window with a reasoning/text part's `time`."""
-    tm = part.get("time") or {}
-    start = tm.get("start")
-    end = tm.get("end", start)
-    if not isinstance(start, (int, float)):
-        return
-    if not isinstance(end, (int, float)):
-        end = start
-    start_i, end_i = int(start), int(end)
-    if not turn.first_stream_ms or start_i < turn.first_stream_ms:
-        turn.first_stream_ms = start_i
-    if end_i > turn.last_stream_ms:
-        turn.last_stream_ms = end_i
-
-
-class OpenCodeExportParser:
-    """Parse an OpenCode export JSON (from `opencode export <sessionID>`) into a Session.
-
-    Export format has `info` (session metadata) and `messages[]` (conversation).
-    Each message has `parts[]` with types: step-start, reasoning, text, tool, step-finish.
-    """
-
-    def parse_export(self, export_json: dict) -> Session:
-        info = export_json.get("info", {})
-        session_id = info.get("id", "unknown")
-        title = info.get("title", "")
-        agent_type = "opencode"
-        # OpenCode names its agent definitions harvest-translate /
-        # harvest-verify / harvest-conform, so the export itself usually says
-        # which stage this was; leave it unknown rather than guess.
-        haystack = f"{title} {info.get('agent', '')}".lower()
-        phase = None
-        for needle, name in (
-            ("translate", "translation"),
-            ("verify", "verification"),
-            ("conform", "conformance"),
-        ):
-            if needle in haystack:
-                phase = name
-                break
-
-        session = Session(session_id=session_id, phase=phase, agent_type=agent_type, data_source="export")
-
-        # Extract wall-clock from info.time
-        time_info = info.get("time", {})
-        created = time_info.get("created")
-        updated = time_info.get("updated")
-        if isinstance(created, (int, float)) and isinstance(updated, (int, float)):
-            session.wall_clock_ms = max(int(updated - created), 0)
-
-        # Parse messages into turns
-        messages = export_json.get("messages", [])
-        current_turn: Optional[Turn] = None
-        turn_index = 0
-        step_cost = 0.0
-
-        for msg in messages:
-            msg_info = msg.get("info", {})
-            parts = msg.get("parts", [])
-
-            for part in parts:
-                ptype = part.get("type", "")
-
-                if ptype == "step-start":
-                    # A step with no step-finish was cut off (the agent process
-                    # was killed, then the session was resumed). Keep it, as
-                    # the trailing flush below does: its tool calls may have
-                    # launched sub-agents that are linked to it.
-                    if current_turn is not None and current_turn.content_blocks:
-                        session.conversation.append(current_turn)
-                    turn_index += 1
-                    current_turn = Turn(turn_index=turn_index)
-                    msg_time = msg_info.get("time") or {}
-                    created = msg_time.get("created")
-                    completed = msg_time.get("completed")
-                    if isinstance(created, (int, float)) and isinstance(completed, (int, float)):
-                        current_turn.start_ms = int(created)
-                        current_turn.end_ms = int(completed)
-                    continue
-
-                if ptype == "reasoning" and current_turn is not None:
-                    text = part.get("text", "")
-                    if text:
-                        current_turn.content_blocks.append(
-                            ContentBlock(type="thinking", thinking=text)
-                        )
-                    _note_stream_time(current_turn, part)
-                    continue
-
-                if ptype == "text" and current_turn is not None:
-                    text = part.get("text", "")
-                    if text:
-                        current_turn.content_blocks.append(
-                            ContentBlock(type="text", text=text)
-                        )
-                    _note_stream_time(current_turn, part)
-                    continue
-
-                if ptype == "compaction":
-                    trigger = "auto" if part.get("auto") else "manual"
-                    if part.get("overflow"):
-                        trigger = f"{trigger}/overflow"
-                    session.compact_events.append(CompactEvent(
-                        pre_tokens=0,
-                        post_tokens=0,
-                        duration_ms=0,
-                        trigger=trigger,
-                        line_number=0,
-                        after_turn_index=len(session.conversation),
-                    ))
-                    continue
-
-                if ptype == "tool" and current_turn is not None:
-                    tool_name = part.get("tool", "unknown")
-                    state = part.get("state", {})
-                    inp = state.get("input") or {}
-                    if not isinstance(inp, dict):
-                        inp = {"input": inp}
-                    output = state.get("output")
-                    status = state.get("status", "")
-                    call_id = part.get("callID", f"export-{turn_index}")
-
-                    # A tool still "running"/"pending" in a post-mortem export
-                    # never completed: the agent process ended (usually killed
-                    # by the harness timeout) while this call was in flight.
-                    frozen = status in ("running", "pending")
-
-                    result = None
-                    if frozen:
-                        result = ToolResult(
-                            tool_use_id=call_id,
-                            content=f"[FROZEN: still '{status}' at export time — "
-                                    "never completed before the process ended]",
-                            is_error=True,
-                        )
-                    elif output is not None or status:
-                        result = ToolResult(
-                            tool_use_id=call_id,
-                            content=str(output) if output is not None else "",
-                            is_error=status in ("error", "failed"),
-                        )
-
-                    tu = ToolUse(
-                        id=call_id, name=tool_name, input=inp,
-                        result=result, frozen=frozen,
-                    )
-                    tool_time = state.get("time") or {}
-                    t_start = tool_time.get("start")
-                    t_end = tool_time.get("end")
-                    if isinstance(t_start, (int, float)) and isinstance(t_end, (int, float)):
-                        tu.start_ms = int(t_start)
-                        tu.end_ms = int(t_end)
-                    current_turn.content_blocks.append(
-                        ContentBlock(type="tool_use", tool_use=tu)
-                    )
-                    continue
-
-                if ptype == "step-finish" and current_turn is not None:
-                    tokens = part.get("tokens", {})
-                    cache = tokens.get("cache", {})
-                    # Use the explicit `input` field, NOT `total - output -
-                    # reasoning`.  The `total` field includes cache_read, so
-                    # the subtraction would inflate input by the cache_read amount.
-                    in_tok = tokens.get("input", 0)
-                    # Fold reasoning into output: billed at the output rate
-                    # (see TokenUsage docstring).
-                    reason_tok = tokens.get("reasoning", 0)
-                    out_tok = tokens.get("output", 0) + reason_tok
-                    current_turn.usage = TokenUsage(
-                        input_tokens=in_tok,
-                        output_tokens=out_tok,
-                        cache_creation_tokens=cache.get("write", 0),
-                        cache_read_tokens=cache.get("read", 0),
-                        reasoning_tokens=reason_tok,
-                    )
-                    cost = part.get("cost")
-                    if cost is not None:
-                        step_cost += float(cost)
-                    session.conversation.append(current_turn)
-                    current_turn = None
-                    continue
-
-        # Flush a trailing unfinished turn. A session that ended mid-flight
-        # (stall / timeout kill) has a final message with no step-finish;
-        # dropping it would hide exactly the frozen tool calls we want to see.
-        if current_turn is not None and current_turn.content_blocks:
-            session.conversation.append(current_turn)
-            current_turn = None
-
-        # Build result from info-level aggregation
-        info_tokens = info.get("tokens", {})
-        info_cost = info.get("cost", 0.0)
-        model_info = info.get("model", {})
-        model_id = model_info.get("id", "unknown")
-        model_usage = {}
-        if info_tokens:
-            # Fold reasoning into output: billed at the output rate
-            # (see TokenUsage docstring).
-            reason_tok = int(info_tokens.get("reasoning", 0))
-            model_usage[model_id] = ModelUsage(
-                model=model_id,
-                input_tokens=int(info_tokens.get("input", 0)),
-                output_tokens=int(info_tokens.get("output", 0)) + reason_tok,
-                cache_read_tokens=int(info_tokens.get("cache", {}).get("read", 0)),
-                cache_creation_tokens=int(info_tokens.get("cache", {}).get("write", 0)),
-                cost_usd=float(info_cost) if info_cost else 0.0,
-                reasoning_tokens=reason_tok,
-            )
-        session.result = ResultEvent(
-            is_error=False,
-            stop_reason="end",
-            num_turns=len(session.conversation),
-            duration_ms=session.wall_clock_ms,
-            duration_api_ms=0,
-            total_cost_usd=float(info_cost) if info_cost else 0.0,
-            result_text="",
-            model_usage=model_usage,
-        )
-        return session
-
-
-def _read_mixed_trace(
-    path: str,
-) -> tuple[dict[str, dict], dict[str, list[tuple[int, dict]]]]:
-    """Read a mixed-format trace file, separating export blocks from JSONL events.
-
-    Returns:
-        exports: session_id -> export JSON dict
-        jsonl_events: session_id -> list of (lineno, event_dict)
-    """
-    exports: dict[str, dict] = {}
-    jsonl_events: dict[str, list[tuple[int, dict]]] = defaultdict(list)
-
-    with open(path, "r") as f:
-        lines = f.readlines()
-
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        stripped = line.strip()
-
-        # Skip empty / non-JSON lines (ANSI logs, benchmark output, markers)
-        if not stripped:
-            i += 1
-            continue
-
-        # Detect export block: a multi-line JSON object with "info" + "messages".
-        # Single-line JSONL events are parsed immediately; multi-line export
-        # blocks are accumulated until json.loads succeeds.
-        if stripped.startswith("{"):
-            # Try single-line parse first (covers all JSONL events).
-            try:
-                obj = json.loads(stripped, strict=False)
-            except json.JSONDecodeError:
-                obj = None
-
-            if obj is not None:
-                # Single-line JSON: classify immediately.
-                if "info" in obj and "messages" in obj:
-                    sid = obj.get("info", {}).get("id", "unknown")
-                    exports[sid] = obj
-                elif "type" in obj:
-                    sid = obj.get("sessionID", "unknown")
-                    jsonl_events[sid].append((i + 1, obj))
-                i += 1
-                continue
-
-            # Multi-line JSON: accumulate lines until json.loads succeeds.
-            # Optimization: only attempt parsing when the line ends with '}'
-            # (likely end of a JSON object), avoiding O(n²) parse attempts.
-            buf_lines = [line]
-            j = i + 1
-            parsed_obj = None
-            while j < n:
-                buf_lines.append(lines[j])
-                if lines[j].rstrip().endswith("}"):
-                    buf = "".join(buf_lines).strip()
-                    try:
-                        parsed_obj = json.loads(buf, strict=False)
-                        break
-                    except json.JSONDecodeError:
-                        pass
-                j += 1
-
-            if parsed_obj is not None:
-                if "info" in parsed_obj and "messages" in parsed_obj:
-                    sid = parsed_obj.get("info", {}).get("id", "unknown")
-                    exports[sid] = parsed_obj
-                elif "type" in parsed_obj:
-                    sid = parsed_obj.get("sessionID", "unknown")
-                    jsonl_events[sid].append((i + 1, parsed_obj))
-                i = j + 1
-                continue
-
-            # Could not parse as JSON; skip this line.
-            i += 1
-            continue
-
-        # Non-JSON line; skip.
-        i += 1
-
-    return exports, jsonl_events
-
-
-def _export_opencode_session_live(session_id: str, timeout_s: int = 30) -> Optional[dict]:
-    """Try to export an OpenCode session directly from the local session store.
-
-    This is used while a trace is still being written. The trace file may only
-    contain live JSONL events because `agent_runner` appends `opencode export`
-    blocks after `opencode run` exits. For visualization during an active run,
-    pull the export by sessionID here and mark it as data_source="live-export".
-
-    Important: OpenCode 1.16.x can truncate `opencode export` output when stdout
-    is captured through a pipe. Mirror the Rust-side workaround: redirect stdout
-    to a temporary file, then read that file.
-    """
-    with tempfile.NamedTemporaryFile(prefix="opencode-export-", suffix=".json") as tmp:
-        try:
-            result = subprocess.run(
-                ["opencode", "export", session_id],
-                stdout=tmp,
-                stderr=subprocess.DEVNULL,
-                timeout=timeout_s,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            return None
-
-        if result.returncode != 0:
-            return None
-
-        tmp.flush()
-        tmp.seek(0)
-        data = tmp.read().decode("utf-8", errors="replace")
-
-    if not data.strip():
-        return None
-    try:
-        obj = json.loads(data, strict=False)
-    except json.JSONDecodeError:
-        return None
-    if "info" not in obj or "messages" not in obj:
-        return None
-    return obj
-
-
-def _opencode_session_parent_id(export_json: dict) -> str:
-    """Return an OpenCode export's parent session ID, if it has one."""
-    info = export_json.get("info", {}) or {}
-    for key in ("parentID", "parentId", "parentSessionID", "parentSessionId", "parent_session_id"):
-        sid = info.get(key)
-        if isinstance(sid, str) and sid:
-            return sid
-    return ""
-
-
-def _opencode_task_child_session_id(part: dict) -> str:
-    """Return the child session ID created by an OpenCode task tool part."""
-    state = part.get("state", {}) or {}
-    metadata = state.get("metadata", {}) or part.get("metadata", {}) or {}
-    for key in ("sessionID", "sessionId", "session_id"):
-        sid = metadata.get(key)
-        if isinstance(sid, str) and sid:
-            return sid
-    return ""
-
-
-def _extract_opencode_sub_session_ids(export_json: dict) -> list[str]:
-    """Return child session IDs referenced by OpenCode task tool calls."""
-    found: list[str] = []
-    seen: set[str] = set()
-
-    for msg in export_json.get("messages", []):
-        for part in msg.get("parts", []):
-            tool_name = str(part.get("tool", "")).lower()
-            if part.get("type") != "tool" or tool_name != "task":
-                continue
-
-            sid = _opencode_task_child_session_id(part)
-            if sid and sid not in seen:
-                seen.add(sid)
-                found.append(sid)
-
-    return found
-
-
-def _find_tool_use_by_id(turns: list[Turn], tool_use_id: str) -> Optional[ToolUse]:
-    """Find a tool call by ID, descending into already-linked subagents."""
-    for turn in turns:
-        for tu in turn.tool_uses:
-            if tu.id == tool_use_id:
-                return tu
-            if tu.subagent is not None:
-                found = _find_tool_use_by_id(tu.subagent.conversation, tool_use_id)
-                if found is not None:
-                    return found
-    return None
-
-
-def _opencode_info_token_total(info: dict) -> int:
-    tokens = info.get("tokens", {}) or {}
-    cache = tokens.get("cache", {}) or {}
-    return int(tokens.get("input", 0) or 0) + int(tokens.get("output", 0) or 0) + int(tokens.get("reasoning", 0) or 0) + int(cache.get("read", 0) or 0) + int(cache.get("write", 0) or 0)
-
-
-def _attach_opencode_child_sessions(
-    export_jsons: dict[str, dict],
-    parsed_sessions: dict[str, Session],
-) -> set[str]:
-    """Attach exported OpenCode child sessions to their parent task ToolUse.
-
-    OpenCode stdout JSONL only shows a `task` tool result in the parent session;
-    the child conversation lives in a separate `opencode export <childSessionId>`.
-    Once we have both exports, represent the child as `ToolUse.subagent` so the
-    existing SVG flattener draws nested rows and purple sub-agent guide lines,
-    instead of rendering child sessions as unrelated top-level S1/S2/... blocks.
-    """
-    child_sids: set[str] = set()
-
-    # First pass: explicit parentID on child exports. This prevents child
-    # sessions from being rendered top-level even if the parent task part is not
-    # present yet in a live/incomplete export.
-    for sid, export_json in export_jsons.items():
-        parent_sid = _opencode_session_parent_id(export_json)
-        if parent_sid and parent_sid in parsed_sessions:
-            child_sids.add(sid)
-
-    # Second pass: connect task ToolUse -> child SubAgent using task metadata.
-    for parent_sid, export_json in export_jsons.items():
-        parent_session = parsed_sessions.get(parent_sid)
-        if parent_session is None:
-            continue
-
-        for msg in export_json.get("messages", []):
-            for part in msg.get("parts", []):
-                tool_name = str(part.get("tool", "")).lower()
-                if part.get("type") != "tool" or tool_name != "task":
-                    continue
-
-                child_sid = _opencode_task_child_session_id(part)
-                child_session = parsed_sessions.get(child_sid)
-                if not child_sid or child_session is None:
-                    continue
-
-                call_id = part.get("callID", "")
-                if not call_id:
-                    continue
-                task_tool = _find_tool_use_by_id(parent_session.conversation, call_id)
-                if task_tool is None:
-                    continue
-
-                state = part.get("state", {}) or {}
-                inp = state.get("input") or {}
-                if not isinstance(inp, dict):
-                    inp = {}
-                child_info = export_jsons.get(child_sid, {}).get("info", {}) or {}
-                task_tool.subagent = SubAgent(
-                    task_id=child_sid,
-                    tool_use_id=call_id,
-                    description=inp.get("description", "") or child_info.get("title", ""),
-                    prompt=inp.get("prompt", ""),
-                    status=state.get("status", "completed"),
-                    conversation=child_session.conversation,
-                    is_async=False,
-                    compact_events=child_session.compact_events,
-                    total_tokens=_opencode_info_token_total(child_info),
-                    total_tool_uses=sum(len(t.tool_uses) for t in child_session.conversation),
-                    duration_ms=child_session.wall_clock_ms,
-                    cost_usd=(
-                        child_session.result.total_cost_usd if child_session.result else None
-                    ),
-                )
-                child_sids.add(child_sid)
-
-    return child_sids
-
-
-def _fetch_live_opencode_exports(
-    jsonl_events: dict[str, list[tuple[int, dict]]],
-    existing_exports: dict[str, dict],
-) -> dict[str, dict]:
-    """Fetch export JSON for JSONL sessions that lack in-file export blocks.
-
-    Returns only successfully fetched exports. Failures are deliberately silent:
-    the caller will fall back to JSONL for any session that cannot be exported.
-    Child sessions discovered from task tool metadata are fetched breadth-first so
-    live visualization can show sub-agent conversations before the run finishes.
-    """
-    live_exports: dict[str, dict] = {}
-    queue = [sid for sid in jsonl_events if sid not in existing_exports]
-    queued: set[str] = set(queue)
-
-    while queue:
-        sid = queue.pop(0)
-        if sid in existing_exports or sid in live_exports:
-            continue
-
-        exported = _export_opencode_session_live(sid)
-        if exported is None:
-            continue
-
-        live_exports[sid] = exported
-
-        for child_sid in _extract_opencode_sub_session_ids(exported):
-            if (
-                child_sid not in existing_exports
-                and child_sid not in live_exports
-                and child_sid not in queued
-            ):
-                queue.append(child_sid)
-                queued.add(child_sid)
-
-    return live_exports
-
-
-_ISO_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
-
-
-# agent_runner logs one of these per agent process, e.g.
-#   Invoking OpenCode verification agent (model=..., timeout=...)
-#   Invoking Claude Code translation agent (model=..., no_plan=...)
-# The phase word is whatever AgentPhase::label() returns, so a stage added on
-# the Rust side shows up here without this script being taught about it.
-_RUNNER_INVOKE_RE = re.compile(r"Invoking .+? (\w+) agent\b")
-
-
-def _extract_runner_phase_windows(path: str) -> list[tuple[str, int, Optional[int]]]:
-    """Extract per-phase agent *process* windows from agent_runner log lines.
-
-    The benchmark trace interleaves the agent's JSON stream with agent_runner
-    tracing lines (ISO-8601 timestamps). The window from
-    "Invoking <agent> <phase> agent" to the first post-exit marker
-    ("Exporting OpenCode session" / "Appended agent trace") is the real
-    process lifetime — including any stall between the session's last
-    activity and the harness timeout kill, which is invisible in the
-    session's own data.
-
-    These lines are also the trace's only authoritative record of *which*
-    stages ran: since the stages became independently runnable, a trace may
-    hold a verify alone, a conform alone, or any combination, so position in
-    the file says nothing about which stage a session is.
-
-    Returns (phase, start_ms, end_ms) in file order. `end_ms` is None for a
-    window that never closed (the process was killed, or the run died), which
-    is kept rather than dropped so the list stays aligned with the agent
-    processes that actually started.
-    """
-    from datetime import datetime
-
-    windows: list[tuple[str, int, Optional[int]]] = []
-    open_phase: Optional[str] = None
-    open_start_ms = 0
-
-    def _iso_ms(line: str) -> Optional[int]:
-        m = _ISO_TS_RE.search(line)
-        if not m:
-            return None
-        try:
-            dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return int(dt.timestamp() * 1000)
-
-    try:
-        with open(path, "r", errors="replace") as f:
-            for line in f:
-                if line.lstrip().startswith("{"):
-                    continue  # JSON event/export content, not a runner log line
-                m = _RUNNER_INVOKE_RE.search(line)
-                if m:
-                    ts = _iso_ms(line)
-                    if ts is None:
-                        continue
-                    if open_phase is not None:
-                        windows.append((open_phase, open_start_ms, None))
-                    open_phase = m.group(1)
-                    open_start_ms = ts
-                elif open_phase is not None and (
-                    "Exporting OpenCode session" in line
-                    or "Appended agent trace" in line
-                ):
-                    ts = _iso_ms(line)
-                    end_ms = ts if ts is not None and ts >= open_start_ms else None
-                    windows.append((open_phase, open_start_ms, end_ms))
-                    open_phase = None
-    except OSError:
-        return []
-
-    if open_phase is not None:
-        windows.append((open_phase, open_start_ms, None))
-    return windows
-
-
-def _apply_runner_phases(path: str, sessions: list[Session]) -> list[Session]:
-    """Name root sessions after the stages the runner actually invoked, and
-    give them their agent-process wall time.
-
-    Pairing is by order of appearance: the Nth agent process the runner
-    started produced the Nth root session. A session with no corresponding
-    marker keeps `phase = None` and is rendered without a stage name — an
-    unnamed lane is honest, a mislabeled one is not.
-    """
-    windows = _extract_runner_phase_windows(path)
-    if not windows:
-        return sessions
-    if len(windows) != len(sessions):
-        # Something is missing on one side (a crashed export, an unparsed
-        # session). Pairing by position would start mislabeling from the first
-        # gap onwards, so name nothing.
-        return sessions
-    for session, (phase, start_ms, end_ms) in zip(sessions, windows):
-        if session.phase is None:
-            session.phase = phase
-        if session.process_wall_ms == 0 and end_ms is not None:
-            session.process_wall_ms = end_ms - start_ms
-    return sessions
-
-
-def parse_mixed_trace_file(path: str, fmt: str = "auto") -> list[Session]:
-    """Parse a trace file that may contain both JSONL events and export blocks.
-
-    Priority per session:
-      1. Export block in file -> use OpenCodeExportParser (data_source="export")
-      2. Live `opencode export <sessionID>` -> use OpenCodeExportParser (data_source="live-export")
-      3. JSONL events -> use OpenCodeParser (data_source="jsonl")
-    """
-    # Peek to determine the overall format (claude vs opencode).
-    peek_records: list[tuple[int, dict]] = []
-    with open(path, "r") as f:
-        for lineno, line in enumerate(f, 1):
-            if lineno > 200:
-                break
-            stripped = line.strip()
-            if stripped.startswith("{"):
-                try:
-                    peek_records.append((lineno, json.loads(stripped)))
-                    if len(peek_records) >= 5:
-                        break
-                except json.JSONDecodeError:
-                    pass
-
-    if fmt == "auto":
-        fmt = _detect_format(peek_records)
-
-    if fmt == "claude":
-        return _apply_runner_phases(path, TraceParser().parse_file(path))
-
-    # OpenCode path: read mixed file, prefer export blocks.
-    exports, jsonl_events = _read_mixed_trace(path)
-    live_exports = _fetch_live_opencode_exports(jsonl_events, exports)
-
-    export_parser = OpenCodeExportParser()
-    jsonl_parser = OpenCodeParser()
-    sessions: list[Session] = []
-
-    # Parse every available export first, then attach child exports beneath
-    # parent `task` tool calls. Only root exports should remain top-level.
-    export_sources: dict[str, str] = {}
-    combined_exports: dict[str, dict] = {}
-    for sid, export_json in exports.items():
-        combined_exports[sid] = export_json
-        export_sources[sid] = "export"
-    for sid, export_json in live_exports.items():
-        if sid in combined_exports:
-            continue
-        combined_exports[sid] = export_json
-        export_sources[sid] = "live-export"
-
-    parsed_exports: dict[str, Session] = {}
-    for sid, export_json in combined_exports.items():
-        session = export_parser.parse_export(export_json)
-        session.data_source = export_sources.get(sid, "export")
-        parsed_exports[sid] = session
-
-    child_export_sids = _attach_opencode_child_sessions(combined_exports, parsed_exports)
-    seen_sids: set[str] = set(parsed_exports)
-
-    # Root sessions, in file order. The export usually names its own stage
-    # (OpenCode's agent definitions are harvest-translate/-verify/-conform);
-    # anything still unnamed is resolved from the runner's markers below.
-    for sid in combined_exports:
-        if sid in child_export_sids:
-            continue
-        sessions.append(parsed_exports[sid])
-
-    # Then sessions that only exist as JSONL events (no export for that sid).
-    for sid, events in jsonl_events.items():
-        if sid in seen_sids:
-            continue
-        sessions.append(jsonl_parser._parse_session(sid, None, events))
-
-    # If we found nothing at all, fall back to the raw parsers.
-    if not sessions:
-        return OpenCodeParser().parse_file(path)
-
-    # Name the stages and attach agent-process wall time from the runner's
-    # markers, so stall time between a session's last activity and the
-    # process's death (timeout kill) becomes visible.
-    return _apply_runner_phases(path, sessions)
-
-
-def parse_trace_file(path: str, fmt: str = "auto") -> list[Session]:
-    """Top-level entry point: auto-detect format and parse.
-
-    For OpenCode traces, uses mixed-format parsing (export blocks take priority
-    over JSONL events for the same session).
-    """
-    return parse_mixed_trace_file(path, fmt)
-
 
 def _write_atomic(path: str, content: str) -> None:
     """Write via a temp file + rename so a concurrent reader (serve.bash while
@@ -3601,9 +3493,6 @@ def _write_atomic(path: str, content: str) -> None:
         raise
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -3664,11 +3553,10 @@ if __name__ == "__main__":
         print(f"Written to {out_path}  ({len(content):,} chars)")
 
     if file_io:
-        import json as _json
         out_path = path.rsplit(".", 1)[0] + "_file_io.json"
         report = generate_file_io_report(sessions)
         with open(out_path, "w") as f:
-            _json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2)
         print(f"Written to {out_path}")
 
     if not readable and not visualize and not file_io:
