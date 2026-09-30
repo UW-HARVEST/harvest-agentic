@@ -87,7 +87,7 @@ pub struct Config {
 }
 
 fn default_timeout_secs() -> u64 {
-    36000
+    agent_runner::DEFAULT_AGENT_TIMEOUT_SECS
 }
 
 impl Config {

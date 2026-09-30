@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 mod agent_env;
@@ -75,6 +76,9 @@ impl AgentPhase {
         }
     }
 }
+
+pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 48 * 60 * 60;
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 pub struct AgentInvocation<'a> {
     pub phase: AgentPhase,
@@ -702,6 +706,10 @@ fn invoke_opencode(
     // directory in `run_bash_agent` — stronger than `--pure` (hides global
     // plugins AND global config/instructions), while project-local
     // `.opencode/` still loads.
+    //
+    // One deadline covers the first run and every resume, so resumes cannot
+    // stretch the stage past `timeout_secs`.
+    let deadline = Instant::now() + Duration::from_secs(invocation.timeout_secs);
     let mut status = run_bash_agent(
         invocation,
         log_path,
@@ -727,6 +735,23 @@ fn invoke_opencode(
     // instead of being scored on it.
     let mut resumes = 0;
     loop {
+        // The stage used up its time budget, so it is not resumed.
+        if status.code() == Some(TIMEOUT_EXIT_CODE) {
+            warn!(
+                "OpenCode {} agent timed out after {}s.",
+                invocation.phase.label(),
+                invocation.timeout_secs
+            );
+            append_output_log_line(
+                invocation.output_log_path,
+                &format!(
+                    "WARNING: {} agent timed out after {}s",
+                    invocation.phase.label(),
+                    invocation.timeout_secs
+                ),
+            );
+            break;
+        }
         match assess_opencode_run(log_path) {
             OpenCodeOutcome::Healthy => break,
             OpenCodeOutcome::Fatal(error) => {
@@ -759,17 +784,35 @@ fn invoke_opencode(
                     );
                     break;
                 }
+                let remaining_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
+                if remaining_secs == 0 {
+                    warn!(
+                        "OpenCode {} session {session_id} ended abnormally (reason: {reason}) \
+                         with no time left of the {}s budget; not resuming.",
+                        invocation.phase.label(),
+                        invocation.timeout_secs
+                    );
+                    append_output_log_line(
+                        invocation.output_log_path,
+                        &format!(
+                            "WARNING: {} session {session_id} ended abnormally (reason: {reason}) \
+                             with no time left; not resumed",
+                            invocation.phase.label()
+                        ),
+                    );
+                    break;
+                }
                 resumes += 1;
                 warn!(
                     "OpenCode {} session {session_id} ended abnormally (last step reason: {reason}); \
-                     resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES})",
+                     resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES}, {remaining_secs}s left)",
                     invocation.phase.label()
                 );
                 append_output_log_line(
                     invocation.output_log_path,
                     &format!(
                         "WARNING: {} session {session_id} ended abnormally (reason: {reason}); \
-                         resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES})",
+                         resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES}, {remaining_secs}s left)",
                         invocation.phase.label()
                     ),
                 );
@@ -789,7 +832,7 @@ fn invoke_opencode(
                          {model_flag}\
                          \"$RESUME_PROMPT\" \
                          < /dev/null 2>&1 | tee -a \"$LOG\"",
-                        invocation.timeout_secs,
+                        remaining_secs,
                         invocation.phase.opencode_agent_name(),
                         session_id,
                     ),
@@ -1588,6 +1631,29 @@ mod tests {
         )
         .expect("utf8");
         assert_eq!(count.trim(), "1", "no extra commit on re-ensure");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn timed_out_pipeline_reports_timeout_exit_code() {
+        // Same pipeline shape as the agent invocation: `tee` must not hide the
+        // exit code of `timeout`, or a timeout would be resumed.
+        let status = Command::new("bash")
+            .args([
+                "-c",
+                "set -o pipefail; timeout 1 sleep 10 2>&1 | tee /dev/null",
+            ])
+            .status()
+            .expect("run bash");
+        assert_eq!(status.code(), Some(TIMEOUT_EXIT_CODE));
+        let status = Command::new("bash")
+            .args([
+                "-c",
+                "set -o pipefail; timeout 10 true 2>&1 | tee /dev/null",
+            ])
+            .status()
+            .expect("run bash");
+        assert_eq!(status.code(), Some(0));
     }
 
     #[test]

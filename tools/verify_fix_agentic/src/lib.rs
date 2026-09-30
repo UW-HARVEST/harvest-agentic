@@ -434,7 +434,7 @@ fn materialize_verify_env(
                 "FetchContent_Declare(\n  fuzztest\n  GIT_REPOSITORY https://github.com/google/fuzztest.git\n  GIT_TAG        {FUZZTEST_GIT_TAG}\n)\n"
             ),
             " fuzztest".to_string(),
-            "\n# Enable fuzzing instrumentation AFTER the frameworks are configured, so\n# gtest/fuzztest/abseil are not themselves instrumented — only what follows.\nfuzztest_setup_fuzzing_flags()\n".to_string(),
+            "\n# Enable fuzzing instrumentation AFTER the frameworks are configured, so\n# gtest/fuzztest/abseil are not themselves instrumented — only what follows.\nfuzztest_setup_fuzzing_flags()\n# The call above also defines FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION, which\n# libraries use to skip checks (checksums, magic numbers) in fuzz builds. The\n# Rust must match the production C, so undo it. Compile options come after\n# CMAKE_C_FLAGS on the compile line, so this -U wins.\nadd_compile_options(-UFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)\n".to_string(),
             "link_fuzztest(verification_tests)".to_string(),
         )
     } else {
@@ -642,7 +642,7 @@ pub struct Config {
 }
 
 fn default_timeout_secs() -> u64 {
-    36000
+    agent_runner::DEFAULT_AGENT_TIMEOUT_SECS
 }
 
 impl Config {
@@ -1073,6 +1073,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         let cml = fs::read_to_string(translated.join("verify_env/CMakeLists.txt")).unwrap();
         assert!(cml.contains("link_fuzztest(verification_tests)"));
         assert!(cml.contains("fuzztest_setup_fuzzing_flags()"));
+        assert!(cml.contains("-UFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"));
         assert!(cml.contains(FUZZTEST_GIT_TAG));
         assert!(!cml.contains("GTest::gtest_main"));
         assert!(translated.join("verify_env/build_fuzz.sh").exists());
