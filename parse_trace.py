@@ -124,6 +124,11 @@ class SubAgent:
     total_tool_uses: int = 0
     duration_ms: int = 0
 
+    # The sub-agent's own cost, excluding its nested sub-agents. Set only for
+    # OpenCode child sessions, whose cost is billed per session and is not in
+    # the parent's total. None when the trace does not give it separately.
+    cost_usd: float | None = None
+
 
 @dataclass
 class ToolUse:
@@ -972,6 +977,17 @@ def print_session_stats(sessions: list[Session]) -> None:
             print(f"    num_turns:      {r.num_turns}")
             print(f"    duration_ms:    {r.duration_ms}")
             print(f"    total_cost_usd: ${r.total_cost_usd:.4f}")
+            all_cost, sub_count = _session_total_cost(s)
+            if sub_count:
+                sub_tok = _sum_subagent_tokens(s.conversation)
+                mus = r.model_usage.values()
+                print(
+                    f"    all sessions:   ${all_cost:.4f} "
+                    f"(main + {sub_count} sub-agents), "
+                    f"input={sum(mu.input_tokens for mu in mus) + sub_tok['input']} "
+                    f"output={sum(mu.output_tokens for mu in mus) + sub_tok['output']} "
+                    f"cache_read={sum(mu.cache_read_tokens for mu in mus) + sub_tok['cache_read']}"
+                )
             for model, mu in r.model_usage.items():
                 print(f"    [{model}]")
                 print(f"      input_tokens:  {mu.input_tokens}")
@@ -1259,6 +1275,12 @@ def build_readable_history(sessions: list[Session]) -> str:
         r = s.result
         duration_s = f"{r.duration_ms / 1000:.1f}s" if r else "?"
         cost = f"${r.total_cost_usd:.4f}" if r else "?"
+        all_cost, sub_count = _session_total_cost(s)
+        header_cost = (
+            f"${all_cost:.4f} (main {cost} + {sub_count} sub-agents)"
+            if sub_count
+            else cost
+        )
 
         out.append("")
         out.append("=" * 70)
@@ -1268,7 +1290,7 @@ def build_readable_history(sessions: list[Session]) -> str:
         out.append(heading)
         out.append(
             f"  model: {s.init.model if s.init else '?'}  "
-            f"duration: {duration_s}  cost: {cost}"
+            f"duration: {duration_s}  cost: {header_cost}"
         )
         ta = _time_attribution(s)
         if ta is not None:
@@ -2010,6 +2032,48 @@ def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
     return agg
 
 
+def _sum_subagent_cost(turns: list[Turn]) -> tuple[float, int]:
+    """Recursively sum the separately billed cost of all sub-agents in a turn
+    tree. Returns (cost_usd, number of sub-agents that carry a cost)."""
+    cost = 0.0
+    count = 0
+    for turn in turns:
+        for blk in turn.content_blocks:
+            if blk.type != "tool_use" or not blk.tool_use or not blk.tool_use.subagent:
+                continue
+            sa = blk.tool_use.subagent
+            if sa.cost_usd is not None:
+                cost += sa.cost_usd
+                count += 1
+            child_cost, child_count = _sum_subagent_cost(sa.conversation)
+            cost += child_cost
+            count += child_count
+    return cost, count
+
+
+def _session_total_cost(s: Session) -> tuple[float, int]:
+    """Cost of a session including its separately billed sub-agents.
+    Returns (cost_usd, number of sub-agents added to the main cost)."""
+    main = s.result.total_cost_usd if s.result else 0.0
+    sub_cost, sub_count = _sum_subagent_cost(s.conversation)
+    return main + sub_cost, sub_count
+
+
+def _format_cost_label(s: Session, sub_tok: dict[str, int]) -> str:
+    """SVG cost label: the total over the main session and its separately
+    billed sub-agents, or the main cost marked as such when sub-agent cost is
+    not in the trace."""
+    total, sub_count = _session_total_cost(s)
+    if total <= 0:
+        return ""
+    label = f"${total:.2f}"
+    if sub_count:
+        label += f" (main + {sub_count} sub-agents)"
+    elif sub_tok["unclassified"] > 0:
+        label += " (main only)"
+    return label
+
+
 def _format_session_summary(s: Session, s_idx: int) -> str:
     parts = [f"S{s_idx} {s.phase}:" if s.phase else f"S{s_idx}:"]
     r = s.result
@@ -2067,10 +2131,8 @@ def _format_session_summary(s: Session, s_idx: int) -> str:
             )
     elif r is not None and r.duration_ms:
         parts.append(_format_duration(r.duration_ms))
-    if r is not None and r.total_cost_usd:
-        cost_label = f"${r.total_cost_usd:.2f}"
-        if sub_tok["unclassified"] > 0:
-            cost_label += " (main only)"
+    cost_label = _format_cost_label(s, sub_tok)
+    if cost_label:
         parts.append(cost_label)
     if r is not None and r.is_error:
         parts.append(f"⚠ stop={r.stop_reason}")
@@ -2579,8 +2641,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
                     grand_out += mu.output_tokens
                     grand_cache_r += mu.cache_read_tokens
                     grand_cache_c += mu.cache_creation_tokens
-            if r is not None:
-                grand_cost += r.total_cost_usd
+            grand_cost += _session_total_cost(s)[0]
             sub = _sum_subagent_tokens(s.conversation)
             grand_in += sub["input"]
             grand_out += sub["output"]
@@ -2855,6 +2916,12 @@ class OpenCodeExportParser:
                 ptype = part.get("type", "")
 
                 if ptype == "step-start":
+                    # A step with no step-finish was cut off (the agent process
+                    # was killed, then the session was resumed). Keep it, as
+                    # the trailing flush below does: its tool calls may have
+                    # launched sub-agents that are linked to it.
+                    if current_turn is not None and current_turn.content_blocks:
+                        session.conversation.append(current_turn)
                     turn_index += 1
                     current_turn = Turn(turn_index=turn_index)
                     msg_time = msg_info.get("time") or {}
@@ -3254,6 +3321,9 @@ def _attach_opencode_child_sessions(
                     total_tokens=_opencode_info_token_total(child_info),
                     total_tool_uses=sum(len(t.tool_uses) for t in child_session.conversation),
                     duration_ms=child_session.wall_clock_ms,
+                    cost_usd=(
+                        child_session.result.total_cost_usd if child_session.result else None
+                    ),
                 )
                 child_sids.add(child_sid)
 
