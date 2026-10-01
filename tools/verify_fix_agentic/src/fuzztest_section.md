@@ -21,6 +21,7 @@ under test has them:
   mode/flag, size/count, offset, or path selector that steers the function down
   different code paths. Give the parameter a domain (below) so the fuzzer varies it and
   the coverage guidance can drive each branch.
+- **Any other parameter that is fuzzable** — any additional inputs that the API consumes and that can vary in a meaningful way.
 
 Pick the mechanism per area of the API. Broad valid-path areas belong in
 `FUZZ_TEST` properties, because the fuzzer explores them far beyond what
@@ -66,6 +67,11 @@ Choosing domains — describe *what inputs are legal*, do not filter after the f
   struct and build it with `fuzztest::StructOf` / `fuzztest::FlatMap`.
 - Avoid `fuzztest::Filter` over a low-acceptance predicate — most inputs get
   discarded and the campaign wastes its budget. Generate structured values directly.
+- Seeds: a domain alone rarely produces the inputs that the code treats
+  specially. Read the C code to find them: boundary values, size thresholds,
+  extreme values, and input shapes that select a special path. Add these
+  inputs as seeds with `.WithSeeds`. The fuzzer then mutates them and
+  explores the branches near them.
 
 The above is a cheat-sheet, not the full story. The complete official FuzzTest
 reference is vendored under `verify_env/docs/` for you to read on demand — go
@@ -119,6 +125,17 @@ campaign:
   regression `TEST` when possible, and retain the file reproducer (printed
   values can be truncated). Fix the Rust, then re-run BOTH that regression
   test and the campaign.
+
+Fuzz coverage map — add a `fuzz` column to `CONFIGS.md`. For each row that
+names a mode, flag, enum value, or route, write the `Suite.Property` that
+covers it, or `none` with a reason. A property covers a row only when it
+calls the row's entry point and its domain can produce the row's value. A
+fixed `TEST` does not count.
+
+In fuzzing mode, the completion gate has one more item:
+
+- [ ] Each property in the `fuzz` column ran a fuzzing-mode campaign. The
+      review sub-agent read its code and confirmed that it covers its rows.
 
 Coverage guidance comes from the C reference (it is the instrumented side); the
 Rust translation is executed as a black box on every input, so any normalized
