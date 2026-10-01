@@ -1,9 +1,9 @@
 use harvest_core::config::AgentKind;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -118,8 +118,6 @@ pub fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
         AgentKind::Kiro => "",
         // Async sub-agents are killed when a headless `claude -p` session ends.
         AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),
-        // Upstream #29363. `run_bash_agent` also raises the cap through
-        // `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`, but a hard cap remains.
         AgentKind::OpenCode => include_str!("agent_bug_workarounds/opencode.md").trim_end(),
     }
 }
@@ -479,6 +477,8 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
         .join("logs");
     fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join(invocation.phase.log_file_name());
+    // Start the phase with an empty log; the first run and every resume append to it.
+    fs::write(&log_path, "")?;
 
     let agent_display = match invocation.agent {
         AgentKind::Kiro => "Kiro",
@@ -508,8 +508,8 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     if !status.success() {
         warn!("{} agent exited with {status}", invocation.phase.label());
         // Mirror the abnormal exit into the shared output log: the agent's
-        // own stdout/stderr are already tee'd into the per-agent log, but
-        // runner diagnostics otherwise exist only on stderr.
+        // own output is already there, but runner diagnostics otherwise
+        // exist only on stderr.
         append_output_log_line(
             invocation.output_log_path,
             &format!(
@@ -527,7 +527,7 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
                 invocation.phase.label()
             ),
         );
-        if let Err(e) = export_opencode_sessions(&log_path) {
+        if let Err(e) = export_opencode_sessions(&log_path, invocation.output_log_path) {
             warn!("OpenCode session export failed (non-fatal): {e}");
             append_output_log_line(
                 invocation.output_log_path,
@@ -536,7 +536,6 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
         }
     }
 
-    append_trace_if_requested(&log_path, invocation.output_log_path)?;
     append_output_log_line(
         invocation.output_log_path,
         &format!(
@@ -624,15 +623,17 @@ fn invoke_kiro(
         invocation.timeout_secs,
         invocation.extra_env.len()
     );
-    run_bash_agent(
+    run_agent(
         invocation,
         log_path,
-        format!(
-            "set -o pipefail; timeout {} kiro-cli chat \
-             --no-interactive --trust-all-tools \"$PROMPT\" < /dev/null 2>&1 | tee \"$LOG\"",
-            invocation.timeout_secs
-        ),
-        None,
+        invocation.timeout_secs,
+        "kiro-cli",
+        &[
+            "chat",
+            "--no-interactive",
+            "--trust-all-tools",
+            invocation.prompt,
+        ],
     )
 }
 
@@ -652,34 +653,32 @@ fn invoke_claude(
         invocation.extra_env.len()
     );
 
-    let model_flag = invocation
-        .model
-        .map(|_| "--model \"$MODEL\" ")
-        .unwrap_or_default();
-    let append_sys_flag = if invocation.plan_files_enabled() {
-        "--append-system-prompt \"$APPEND_SYS\" "
-    } else {
-        ""
-    };
-
-    let status = run_bash_agent(
+    let mut args = vec!["-p", invocation.prompt];
+    if let Some(model) = invocation.model {
+        args.extend(["--model", model]);
+    }
+    args.extend(["--allowed-tools", "Bash(*)", "Write", "Edit"]);
+    args.push("--dangerously-skip-permissions");
+    if invocation.plan_files_enabled() {
+        args.extend([
+            "--append-system-prompt",
+            invocation.phase.append_system_prompt(),
+        ]);
+    }
+    args.extend([
+        "--max-turns",
+        "1000",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ]);
+    run_agent(
         invocation,
         log_path,
-        format!(
-            "set -o pipefail; timeout {} claude -p \"$PROMPT\" \
-             {model_flag}\
-             --allowed-tools 'Bash(*)' 'Write' 'Edit' \
-             --dangerously-skip-permissions \
-             {append_sys_flag}\
-             --max-turns 1000 \
-             --output-format stream-json --verbose \
-             < /dev/null 2>&1 | tee \"$LOG\"",
-            invocation.timeout_secs
-        ),
-        Some(invocation.phase.append_system_prompt()),
-    )?;
-
-    Ok(status)
+        invocation.timeout_secs,
+        "claude",
+        &args,
+    )
 }
 
 fn invoke_opencode(
@@ -694,38 +693,24 @@ fn invoke_opencode(
         invocation.extra_env.len()
     );
 
-    let model_flag = invocation
-        .model
-        .map(|_| "--model \"$MODEL\" ")
-        .unwrap_or_default();
     // No `--pure`: its single effect (verified in the opencode source) is to
     // clear the external-plugin list, which would also disable the
     // project-local compaction-recovery plugin written by
     // `write_opencode_agent`. Isolation from the user-global config is
     // instead achieved by pointing XDG_CONFIG_HOME at a run-private empty
-    // directory in `run_bash_agent` — stronger than `--pure` (hides global
+    // directory in `run_agent` — stronger than `--pure` (hides global
     // plugins AND global config/instructions), while project-local
     // `.opencode/` still loads.
     //
     // One deadline covers the first run and every resume, so resumes cannot
     // stretch the stage past `timeout_secs`.
     let deadline = Instant::now() + Duration::from_secs(invocation.timeout_secs);
-    let mut status = run_bash_agent(
+    let mut status = run_agent(
         invocation,
         log_path,
-        format!(
-            "set -o pipefail; timeout {} opencode run \
-             --format json \
-             --thinking \
-             --dangerously-skip-permissions \
-             --agent {} \
-             {model_flag}\
-             \"$PROMPT\" \
-             < /dev/null 2>&1 | tee \"$LOG\"",
-            invocation.timeout_secs,
-            invocation.phase.opencode_agent_name()
-        ),
-        None,
+        invocation.timeout_secs,
+        "opencode",
+        &opencode_run_args(invocation, None, invocation.prompt),
     )?;
 
     // OpenCode ends the process with success when a provider stream dies
@@ -816,27 +801,15 @@ fn invoke_opencode(
                         invocation.phase.label()
                     ),
                 );
-                // `tee -a`: the resumed run must extend the log, not replace
-                // it — the first segment holds everything the agent did before
-                // the stream died, which trace analysis still needs.
-                status = run_bash_agent(
+                // The resumed run extends the log: the first segment holds
+                // everything the agent did before the stream died, which
+                // trace analysis still needs.
+                status = run_agent(
                     invocation,
                     log_path,
-                    format!(
-                        "set -o pipefail; timeout {} opencode run \
-                         --format json \
-                         --thinking \
-                         --dangerously-skip-permissions \
-                         --agent {} \
-                         --session {} \
-                         {model_flag}\
-                         \"$RESUME_PROMPT\" \
-                         < /dev/null 2>&1 | tee -a \"$LOG\"",
-                        remaining_secs,
-                        invocation.phase.opencode_agent_name(),
-                        session_id,
-                    ),
-                    None,
+                    remaining_secs,
+                    "opencode",
+                    &opencode_run_args(invocation, Some(&session_id), OPENCODE_RESUME_PROMPT),
                 )?;
             }
         }
@@ -849,38 +822,53 @@ fn invoke_opencode(
 /// model does not mistake the gap for a compaction, and points it at the plan
 /// file, which is the only state that survived intact.
 const OPENCODE_RESUME_PROMPT: &str = "\
-Your previous response was cut off by a provider failure, not by you finishing. \
-Nothing after that point ran. \
+Your previous response was cut off by a provider failure. \
 Re-read your plan file to see where you were. \
 Check the filesystem to see which files actually exist before you trust any \
 earlier claim that one was written. \
 Then continue the work from the first unfinished step.";
 
-fn run_bash_agent(
+fn opencode_run_args<'a>(
+    invocation: &AgentInvocation<'a>,
+    session_id: Option<&'a str>,
+    prompt: &'a str,
+) -> Vec<&'a str> {
+    let mut args = vec!["run", "--format", "json", "--thinking"];
+    args.extend([
+        "--dangerously-skip-permissions",
+        "--agent",
+        invocation.phase.opencode_agent_name(),
+    ]);
+    if let Some(session_id) = session_id {
+        args.extend(["--session", session_id]);
+    }
+    if let Some(model) = invocation.model {
+        args.extend(["--model", model]);
+    }
+    args.push(prompt);
+    args
+}
+
+/// Runs `program args` in the work dir under `timeout`, so the stage deadline
+/// ends it with exit code 124. Its output is copied, as it comes, to the
+/// per-agent log, the shared output log (if any) and our stdout.
+fn run_agent(
     invocation: &AgentInvocation<'_>,
     log_path: &Path,
-    script: String,
-    append_system_prompt: Option<&str>,
+    timeout_secs: u64,
+    program: &str,
+    args: &[&str],
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(script)
-        .env("PROMPT", invocation.prompt)
-        .env("RESUME_PROMPT", OPENCODE_RESUME_PROMPT)
-        .env("LOG", log_path)
+    let mut cmd = Command::new("timeout");
+    cmd.arg(timeout_secs.to_string())
+        .arg(program)
+        .args(args)
         .env("OPENSSL_DIR", openssl_dir)
-        .current_dir(invocation.work_dir);
-
-    if let Some(system_prompt) = append_system_prompt
-        && invocation.plan_files_enabled()
-    {
-        cmd.env("APPEND_SYS", system_prompt);
-    }
-
-    if let Some(model) = invocation.model {
-        cmd.env("MODEL", model);
-    }
+        .current_dir(invocation.work_dir)
+        // OpenCode takes its project directory from $PWD before the real cwd,
+        // and `current_dir` leaves the inherited $PWD pointing at ours.
+        .env("PWD", std::path::absolute(invocation.work_dir)?);
 
     if let Some(toolchain) = invocation.rust_toolchain {
         info!("Injecting RUSTUP_TOOLCHAIN={toolchain}");
@@ -940,7 +928,61 @@ fn run_bash_agent(
         cmd.env("ANTHROPIC_BASE_URL", "http://127.0.0.1:3456");
     }
 
-    Ok(cmd.status()?)
+    let mut sinks: Vec<(String, Box<dyn Write>)> = vec![(
+        log_path.display().to_string(),
+        Box::new(fs::OpenOptions::new().append(true).open(log_path)?),
+    )];
+    if let Some(output_log) = invocation.output_log_path {
+        match fs::OpenOptions::new().append(true).open(output_log) {
+            Ok(file) => sinks.push((output_log.display().to_string(), Box::new(file))),
+            Err(e) => warn!(
+                "Cannot open {} for the agent trace: {e}",
+                output_log.display()
+            ),
+        }
+    }
+    sinks.push(("stdout".into(), Box::new(std::io::stdout())));
+    Ok(run_teed(cmd, sinks)?)
+}
+
+/// Runs `cmd` with stdin closed and stdout and stderr merged into one pipe,
+/// writing everything it prints to every sink as it arrives. Returns the
+/// command's own exit status.
+fn run_teed(
+    mut cmd: Command,
+    mut sinks: Vec<(String, Box<dyn Write>)>,
+) -> std::io::Result<ExitStatus> {
+    let (mut reader, writer) = std::io::pipe()?;
+    cmd.stdin(Stdio::null())
+        .stdout(writer.try_clone()?)
+        .stderr(writer);
+    let mut child = cmd.spawn()?;
+    // `cmd` holds our copies of the pipe's write end; the read below only
+    // sees EOF once they are closed.
+    drop(cmd);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                warn!("Reading the agent output failed: {e}");
+                break;
+            }
+        };
+        sinks.retain_mut(|(name, sink)| match sink.write_all(&buf[..n]) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Writing the agent output to {name} failed: {e}");
+                false
+            }
+        });
+    }
+    for (_, sink) in &mut sinks {
+        let _ = sink.flush();
+    }
+    child.wait()
 }
 
 fn claude_uses_ccr(model: Option<&str>) -> bool {
@@ -1052,21 +1094,10 @@ fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
         return OpenCodeOutcome::Healthy;
     }
     match last_session_id {
-        // The id is interpolated into the resume shell command, so accept only
-        // the shape OpenCode actually emits (`ses_` + base62). A surprising id
-        // means the log is not what this parser thinks it is. Skip the resume
-        // rather than build a command out of it.
-        Some(session_id)
-            if !session_id.is_empty()
-                && session_id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
-        {
-            OpenCodeOutcome::Resumable {
-                session_id,
-                reason: last_finish_reason.unwrap_or_else(|| "missing".to_string()),
-            }
-        }
+        Some(session_id) if !session_id.is_empty() => OpenCodeOutcome::Resumable {
+            session_id,
+            reason: last_finish_reason.unwrap_or_else(|| "missing".to_string()),
+        },
         _ => OpenCodeOutcome::Healthy,
     }
 }
@@ -1151,12 +1182,14 @@ fn export_opencode_session(session_id: &str) -> Result<String, Box<dyn std::erro
 
     Ok(raw.to_string())
 }
-/// sub-agent sessions, appending each export block to `log_path` only.
-/// The shared output log receives exactly one copy of everything (exports
-/// included) via `append_trace_if_requested`, which copies the whole
-/// per-agent log afterwards — appending here too used to double every
-/// export block in output.log.
-fn export_opencode_sessions(log_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Exports the OpenCode sessions named in the per-agent log and their
+/// sub-agent sessions. Each export block is appended to the per-agent log,
+/// to the shared output log (if any), and to stderr, as soon as it is
+/// exported.
+fn export_opencode_sessions(
+    log_path: &Path,
+    output_log_path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let session_ids = extract_session_ids_from_log(log_path);
     if session_ids.is_empty() {
         info!("No session IDs found in OpenCode log; skipping export");
@@ -1176,17 +1209,10 @@ fn export_opencode_sessions(log_path: &Path) -> Result<(), Box<dyn std::error::E
                 let marker = format!("## opencode-export: {sid}\n");
                 let block = format!("{marker}{json}\n");
 
-                // Append to the per-agent log file. (Not to the shared output
-                // log: append_trace_if_requested copies this whole file there
-                // afterwards — a direct append here would duplicate it.)
-                fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        f.write_all(block.as_bytes())
-                    })?;
+                append_to_file(log_path, &block)?;
+                if let Some(out_path) = output_log_path {
+                    append_to_file(out_path, &block)?;
+                }
 
                 // Write the export block to stderr (same stream as tracing log
                 // messages) under a lock so the entire multi-line JSON object is
@@ -1215,37 +1241,13 @@ fn export_opencode_sessions(log_path: &Path) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn append_trace_if_requested(
-    log_path: &Path,
-    output_log_path: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(out_path) = output_log_path else {
-        return Ok(());
-    };
-    if !log_path.exists() {
-        return Ok(());
-    }
-
-    match fs::read_to_string(log_path) {
-        Ok(trace) => {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(out_path)
-            {
-                let _ = writeln!(file, "\n{}", trace);
-                info!("Appended agent trace to {}", out_path.display());
-            }
-        }
-        Err(e) => warn!(
-            "Failed to read agent trace from {}: {}",
-            log_path.display(),
-            e
-        ),
-    }
-
-    Ok(())
+fn append_to_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(text.as_bytes())
 }
 
 fn write_claude_sandbox(case_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1410,7 +1412,7 @@ fn openrouter_provider_pin(model: Option<&str>) -> Option<serde_json::Value> {
 /// The selected model's custom-provider definition, for staging into the
 /// run's project config.
 ///
-/// `run_bash_agent` points XDG_CONFIG_HOME at an empty directory, which hides
+/// `run_agent` points XDG_CONFIG_HOME at an empty directory, which hides
 /// the user's global opencode.json{,c} and every custom provider in it.
 /// auth.json keys survive (XDG data dir), so without staging the run holds a
 /// key to an endpoint it cannot name and fails with opaque provider errors.
@@ -1633,34 +1635,51 @@ mod tests {
         assert_eq!(count.trim(), "1", "no extra commit on re-ensure");
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn timed_out_pipeline_reports_timeout_exit_code() {
-        // Same pipeline shape as the agent invocation: `tee` must not hide the
-        // exit code of `timeout`, or a timeout would be resumed.
-        let status = Command::new("bash")
-            .args([
-                "-c",
-                "set -o pipefail; timeout 1 sleep 10 2>&1 | tee /dev/null",
-            ])
-            .status()
-            .expect("run bash");
-        assert_eq!(status.code(), Some(TIMEOUT_EXIT_CODE));
-        let status = Command::new("bash")
-            .args([
-                "-c",
-                "set -o pipefail; timeout 10 true 2>&1 | tee /dev/null",
-            ])
-            .status()
-            .expect("run bash");
-        assert_eq!(status.code(), Some(0));
+    fn file_sink(path: &Path) -> (String, Box<dyn Write>) {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open sink");
+        (path.display().to_string(), Box::new(file))
+    }
+
+    struct BrokenSink;
+
+    impl Write for BrokenSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("broken"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
-    fn claude_ccr_detection_requires_comma_model() {
-        assert!(claude_uses_ccr(Some("openrouter,deepseek/deepseek-v4-pro")));
-        assert!(!claude_uses_ccr(Some("sonnet")));
-        assert!(!claude_uses_ccr(None));
+    #[cfg_attr(miri, ignore)]
+    fn run_teed_streams_merged_output_to_every_sink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("agent.log");
+        let output_log = dir.path().join("output.log");
+        // "second" is printed only once "first" is in the output log, so the
+        // copy must happen while the command still runs.
+        let mut cmd = Command::new("bash");
+        cmd.args([
+            "-c",
+            "echo first; until grep -q first \"$1\"; do sleep 0.05; done; \
+             echo second >&2; exit 3",
+            "_",
+        ])
+        .arg(&output_log);
+        let sinks = vec![
+            file_sink(&log),
+            ("broken".into(), Box::new(BrokenSink) as Box<dyn Write>),
+            file_sink(&output_log),
+        ];
+        let status = run_teed(cmd, sinks).expect("run");
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(fs::read_to_string(&log).unwrap(), "first\nsecond\n");
+        assert_eq!(fs::read_to_string(&output_log).unwrap(), "first\nsecond\n");
     }
 
     /// Writes a JSONL log with the given events and assesses it.
@@ -1729,14 +1748,6 @@ mod tests {
             OpenCodeOutcome::Fatal(msg) => assert!(msg.contains("Insufficient Balance")),
             other => panic!("expected Fatal, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn a_shell_unsafe_session_id_is_not_resumed() {
-        let outcome = assess_log(&[
-            r#"{"type":"step_finish","sessionID":"ses_a; rm -rf /","part":{"reason":"unknown"}}"#,
-        ]);
-        assert_eq!(outcome, OpenCodeOutcome::Healthy);
     }
 
     #[test]
@@ -2002,17 +2013,5 @@ mod tests {
         assert!(
             extract_model_limits_from_output(sample, "other-provider", "mimo-v2.5-pro").is_none()
         );
-    }
-
-    #[test]
-    fn parse_opencode_model_strips_colon_suffix() {
-        let (provider, metadata_id) =
-            parse_opencode_model("openrouter/xiaomi/mimo-v2.5-pro:floor").unwrap();
-        assert_eq!(provider, "openrouter");
-        assert_eq!(metadata_id, "xiaomi/mimo-v2.5-pro");
-
-        let (provider, metadata_id) = parse_opencode_model("opencode-go/deepseek-v4-pro").unwrap();
-        assert_eq!(provider, "opencode-go");
-        assert_eq!(metadata_id, "deepseek-v4-pro");
     }
 }

@@ -26,7 +26,7 @@ use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
 use harvest_translate::{transpile, util::set_user_only_umask};
 use regex::Regex;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -845,7 +845,7 @@ fn main() -> HarvestResult<()> {
         Some(_) => false,
         None => guard_occupied(log_root, args.force)?,
     };
-    let log_file = File::create(log_root.join("output.log"))?;
+    let log_file = open_output_log(&log_root.join("output.log"))?;
     TeeLogger::init(log::LevelFilter::Info, log_file)?;
     log::info!("Harvest version: {}", get_version());
     if reusing_root {
@@ -855,6 +855,12 @@ fn main() -> HarvestResult<()> {
         );
     }
     run(args)
+}
+
+// Append-only
+fn open_output_log(path: &Path) -> std::io::Result<File> {
+    File::create(path)?;
+    OpenOptions::new().append(true).open(path)
 }
 
 fn apply_regex_filter(
@@ -1391,6 +1397,23 @@ mod tests {
             select_validation_harness(TestHarness::Bin, dir.path(), true).unwrap(),
             ValidationHarness::Binary
         ));
+    }
+
+    #[test]
+    fn output_log_keeps_lines_appended_through_another_handle() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.log");
+        std::fs::write(&path, "stale\n").unwrap();
+        let mut log = open_output_log(&path).unwrap();
+        writeln!(log, "benchmark 1").unwrap();
+        let mut runner = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(runner, "agent trace").unwrap();
+        writeln!(log, "benchmark 2").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "benchmark 1\nagent trace\nbenchmark 2\n"
+        );
     }
 
     #[test]

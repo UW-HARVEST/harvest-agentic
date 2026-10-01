@@ -248,8 +248,9 @@ cargo run --bin=benchmark --release -- --agentic ... ./out_foo &> ./trace_foo.tx
 
 The trace file grows while the run is in progress, and the visualizer can be
 re-run on the partial file at any time so you can watch the translation live (see the loop below). Alternatively, if you did not redirect,
-`<output_dir>/output.log` contains the same agent trace appended after each
-stage completes, and can be given to `parse_trace.py` once the run is done.
+`<output_dir>/output.log` receives the same agent trace while the agent runs,
+followed by the session exports when each stage ends, and can also be given
+to `parse_trace.py`, live or after the run.
 
 ### Using parse_trace.py
 
