@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import bisect
 import html
 import json
 import os
@@ -187,9 +188,18 @@ class ToolUse:
 
     # Local execution window (epoch ms), 0 when the source has no timing.
     # OpenCode exports carry `state.time.start/end` on every tool part; the
-    # Claude Code stream only timestamps tool results, so it leaves these 0.
+    # Claude Code stream has it from 2.1.284 on (see TraceParser).
     start_ms: int = 0
     end_ms: int = 0
+
+    # Claude Code Agent calls only: final usage of the sub-agent's last API
+    # call (its reply to the parent), from the tool_result's
+    # `tool_use_result.usage`. That call is never streamed as an assistant
+    # record, so _attach_subagents turns this into the sub-agent's last Turn.
+    # `subagent_final_text` is that reply as generated (`tool_use_result.
+    # content`; the tool_result itself wraps it in harness notes).
+    subagent_final_usage: Optional[TokenUsage] = None
+    subagent_final_text: str = ""
 
 
 @dataclass
@@ -512,6 +522,16 @@ def _extract_tool_result_content(raw_content) -> str:
     return str(raw_content)
 
 
+def _claude_ts_ms(ts) -> int:
+    """Epoch ms of a Claude Code ISO-8601 `timestamp`, 0 if absent/invalid."""
+    if not isinstance(ts, str):
+        return 0
+    try:
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
 def _parse_token_usage(raw: dict) -> TokenUsage:
     return TokenUsage(
         input_tokens=raw.get("input_tokens", 0),
@@ -809,11 +829,32 @@ class TraceParser:
         conversation, not by position: Claude Code starts running a tool as
         soon as its block streams in, so a result can land between two
         chunks of the same response, or after later chunks.
+
+        Timing (CLAUDE CODE VERSION DEPENDENCY): from 2.1.284 on (verified on
+        2.1.284; absent in 2.1.209 and earlier) every assistant record — one
+        per content block — carries a `timestamp` taken when that block
+        finished streaming, and the user tool_result record's `timestamp` is
+        when the tool finished. From these:
+          ToolUse.start_ms  its tool_use block's timestamp (execution starts
+                            as soon as the block arrives)
+          ToolUse.end_ms    its tool_result's timestamp
+          Turn.end_ms       latest block or tool_result of the turn
+          Turn.start_ms     the previous turn's end (the synchronous barrier:
+                            the next request goes out once every result is
+                            in); the first turn's start is unknown here and
+                            is set by _attach_subagents for sub-agents
+        A turn with any untimestamped assistant record keeps all its timing
+        at 0, so older traces (user timestamps only, which cannot separate
+        LLM from tool time) produce no time report instead of a wrong one.
+        A `run_in_background` Bash returns its tool_result at once, so only
+        the foreground (blocking) part is counted — by design.
         """
         turns: list[Turn] = []
         pending: dict[str, ToolUse] = {}   # tool_use_id -> ToolUse
         starts = set(_claude_turn_starts(records))
         turn: Optional[Turn] = None
+        timed: dict[int, bool] = {}        # id(turn) -> all records timestamped
+        owner: dict[str, Turn] = {}        # tool_use_id -> its Turn
 
         for idx, (_, obj) in enumerate(records):
             typ = obj.get("type")
@@ -822,6 +863,12 @@ class TraceParser:
                 if idx in starts:
                     turn = Turn(turn_index=len(turns) + 1)
                     turns.append(turn)
+                    timed[id(turn)] = True
+                ts = _claude_ts_ms(obj.get("timestamp"))
+                if ts:
+                    turn.end_ms = max(turn.end_ms, ts)
+                else:
+                    timed[id(turn)] = False
                 raw_usage = msg.get("usage")
                 if raw_usage:
                     turn.usage = _parse_token_usage(raw_usage)
@@ -841,7 +888,9 @@ class TraceParser:
                             name=block.get("name", ""),
                             input=block.get("input", {}),
                         )
+                        tu.start_ms = ts
                         pending[tu.id] = tu
+                        owner[tu.id] = turn
                         turn.content_blocks.append(ContentBlock(
                             type="tool_use", tool_use=tu,
                         ))
@@ -849,6 +898,8 @@ class TraceParser:
                 content = msg.get("content", [])
                 if not isinstance(content, list):
                     continue
+                ts = _claude_ts_ms(obj.get("timestamp"))
+                tur = obj.get("tool_use_result")
                 for block in content:
                     if block.get("type") == "tool_result":
                         tid = block.get("tool_use_id", "")
@@ -858,7 +909,28 @@ class TraceParser:
                                 content=_extract_tool_result_content(block.get("content", "")),
                                 is_error=block.get("is_error", False),
                             )
+                            # A finished sync sub-agent's result (2.1.141+
+                            # all carry these two keys).
+                            if (isinstance(tur, dict) and "totalDurationMs" in tur
+                                    and isinstance(tur.get("usage"), dict)):
+                                pending[tid].subagent_final_usage = _parse_token_usage(tur["usage"])
+                                pending[tid].subagent_final_text = _extract_tool_result_content(
+                                    tur.get("content", ""))
+                            if ts and pending[tid].start_ms:
+                                pending[tid].end_ms = ts
+                                t = owner[tid]
+                                t.end_ms = max(t.end_ms, ts)
 
+        prev_end = 0
+        for t in turns:
+            if not timed[id(t)]:
+                t.start_ms = t.end_ms = 0
+                for tu in t.tool_uses:
+                    tu.start_ms = tu.end_ms = 0
+                prev_end = 0
+                continue
+            t.start_ms = prev_end
+            prev_end = t.end_ms
         return turns
 
     def _attach_subagents(
@@ -871,6 +943,46 @@ class TraceParser:
                     tu = block.tool_use
                     if tu.name.lower() in _SUBAGENT_TOOLS and tu.id in subagent_map:
                         tu.subagent = subagent_map[tu.id]
+                        # The sub-agent's first request goes out when its
+                        # Agent call starts (timed traces only, see
+                        # _parse_conversation).
+                        conv = tu.subagent.conversation
+                        if (tu.start_ms and conv and conv[0].end_ms
+                                and not conv[0].start_ms):
+                            conv[0].start_ms = tu.start_ms
+                        self._append_final_reply_turn(tu)
+
+    @staticmethod
+    def _append_final_reply_turn(tu: ToolUse) -> None:
+        """Add a sync sub-agent's missing last Turn: its reply to the parent.
+
+        Claude Code (seen on every version from 2.1.141 to 2.1.284) streams a
+        sub-agent's API calls as parented assistant records EXCEPT the last
+        one, the final text reply: the recorded conversation always ends on a
+        tool call, and the reply only arrives as the parent's tool_result.
+        Its real usage is in `tool_use_result.usage` (with final output
+        tokens, unlike the streamed per-turn snapshots). Without this Turn the
+        sub-agent's input/cache totals miss that call (~5–10% of a session's
+        cache reads) and its generation time is missing from the LLM time.
+
+        Window: from the last recorded turn's end (its tool results are in,
+        the request goes out) to the parent's tool_result, when the timing
+        exists (2.1.284+). Content: the reply text as the model wrote it.
+        """
+        sa = tu.subagent
+        usage = tu.subagent_final_usage
+        if sa is None or usage is None or sa.is_async or not sa.conversation:
+            return
+        last = sa.conversation[-1]
+        if not last.tool_uses:
+            return  # the reply was recorded after all: nothing missing
+        turn = Turn(turn_index=len(sa.conversation) + 1, usage=usage)
+        if tu.subagent_final_text:
+            turn.content_blocks.append(ContentBlock(type="text", text=tu.subagent_final_text))
+        if last.end_ms and tu.end_ms > last.end_ms:
+            turn.start_ms = last.end_ms
+            turn.end_ms = tu.end_ms
+        sa.conversation.append(turn)
 
     def _parse_init(self, obj: dict) -> InitEvent:
         tools = obj.get("tools", [])
@@ -1397,7 +1509,15 @@ def _read_mixed_trace(
             jsonl_events[obj.get("sessionID", "unknown")].append((lineno, obj))
 
     with open(path, "r") as f:
-        lines = f.readlines()
+        text = f.read()
+    lines = text.splitlines(keepends=True)
+    # Character offset of each line in `text`, for raw_decode below.
+    offsets: list[int] = []
+    pos = 0
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line)
+    decoder = json.JSONDecoder(strict=False)
 
     i = 0
     n = len(lines)
@@ -1426,26 +1546,21 @@ def _read_mixed_trace(
                 i += 1
                 continue
 
-            # Multi-line JSON: accumulate lines until json.loads succeeds.
-            # Optimization: only attempt parsing when the line ends with '}'
-            # (likely end of a JSON object), avoiding O(n²) parse attempts.
-            buf_lines = [line]
-            j = i + 1
-            parsed_obj = None
-            while j < n:
-                buf_lines.append(lines[j])
-                if lines[j].rstrip().endswith("}"):
-                    buf = "".join(buf_lines).strip()
-                    try:
-                        parsed_obj = json.loads(buf, strict=False)
-                        break
-                    except json.JSONDecodeError:
-                        pass
-                j += 1
+            # Multi-line JSON (a pretty-printed export): decode one object
+            # straight from the text, in a single pass. Re-joining the lines
+            # and retrying json.loads at every line ending in '}' was
+            # quadratic — ~40 s on a 50 MB trace with 30 exports.
+            start = offsets[i] + (len(line) - len(line.lstrip()))
+            try:
+                parsed_obj, end = decoder.raw_decode(text, start)
+            except json.JSONDecodeError:
+                parsed_obj = None
 
             if parsed_obj is not None:
-                classify(parsed_obj, i + 1)
-                i = j + 1
+                if isinstance(parsed_obj, dict):
+                    classify(parsed_obj, i + 1)
+                # Resume after the line holding the object's last char.
+                i = bisect.bisect_right(offsets, end - 1)
                 continue
 
             # Could not parse as JSON; skip this line.
@@ -1941,12 +2056,14 @@ def _stall_gap_ms(s: Session) -> int:
 def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
     """Recursively sum token usage from all sub-agents in a turn tree.
 
-    Returns a dict with keys: input, output, cache_read, cache_write, unclassified.
+    Returns a dict with keys: input, output, cache_read, cache_write,
+    unclassified, output_partial (always 0 here; see _session_token_totals).
     - input/output/cache_read/cache_write: tokens from sub-agents that have per-turn
       breakdown (OpenCode exports).
     - unclassified: flat total_tokens from sub-agents without breakdown (Claude).
     """
-    agg = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0}
+    agg = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0,
+           "output_partial": 0}
 
     for sa in _iter_subagents(turns):
         # Prefer per-turn breakdown from the sub-agent's conversation.
@@ -1969,8 +2086,32 @@ def _sum_subagent_tokens(turns: list[Turn]) -> dict[str, int]:
 def _session_token_totals(s: Session) -> dict[str, int]:
     """Main-session tokens (from the result event) plus the classified
     sub-agent tokens; same keys as _sum_subagent_tokens, whose `unclassified`
-    passes through unchanged."""
-    tok = _sum_subagent_tokens(s.conversation)
+    passes through unchanged.
+
+    Claude Code's `result.modelUsage` is process-wide: it already includes
+    every sub-agent — sync, async and workflow alike (checked on 2.1.141,
+    2.1.209 and 2.1.284: main + sync sub-agent turns fall short of it by the
+    async/workflow share). It is the whole total; adding the sub-agents' turns
+    on top would double-count them, and their streamed per-turn output_tokens
+    are partial anyway (see _parse_conversation).
+
+    A Claude session with no result yet (live trace, or a killed process)
+    falls back to its turns: main + sub-agents. Their input/cache counts are
+    real, but the output is only the streamed snapshots (~1% of the truth),
+    so `output_partial` is set and the output must not be shown as a number."""
+    if s.agent_type == "claude" and s.result is not None:
+        tok = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0,
+               "output_partial": 0}
+    else:
+        tok = _sum_subagent_tokens(s.conversation)
+    if s.agent_type == "claude" and s.result is None:
+        for t in s.conversation:
+            if t.usage:
+                tok["input"] += t.usage.input_tokens
+                tok["output"] += t.usage.output_tokens
+                tok["cache_read"] += t.usage.cache_read_tokens
+                tok["cache_write"] += t.usage.cache_creation_tokens
+        tok["output_partial"] = 1
     if s.result is not None:
         for mu in s.result.model_usage.values():
             tok["input"] += mu.input_tokens
@@ -2026,6 +2167,13 @@ def _format_compact_int(n: int) -> str:
 
 
 def _format_token_totals(tok: dict[str, int]) -> str:
+    if tok.get("output_partial"):
+        # Output unknown until the session's result event (Claude, live).
+        return (
+            f"tok (in={_format_compact_int(tok['input'])} out=n/a until done "
+            f"cache_r={_format_compact_int(tok['cache_read'])} "
+            f"cache_c={_format_compact_int(tok['cache_write'])})"
+        )
     return (
         f"{_format_compact_int(tok['input'] + tok['output'])} new tok "
         f"(in={_format_compact_int(tok['input'])} out={_format_compact_int(tok['output'])} "
@@ -2061,8 +2209,17 @@ def _apply_patch_files(patch_text: str) -> list[str]:
 # tool is a container whose window is filled by the child's own chain, so it
 # is never counted as a leaf tool. Summing over all agents gives *work*
 # (parallel siblings count fully, like CPU time across threads); the wall
-# clock is the *span*. Only sources with per-step timestamps (OpenCode
-# exports) produce a report; otherwise the report is simply omitted.
+# clock is the *span*. Only sources with per-step timestamps produce a
+# report; otherwise the report is simply omitted (no cell is ever estimated):
+#   - OpenCode exports: message/part `time` fields.
+#   - Claude Code stream-json from 2.1.284 on (assistant records timestamped
+#     per block, see TraceParser._parse_conversation). 2.1.209 and older
+#     timestamp only user records, so they get no report. Claude does not
+#     stream per-turn output tokens or first-token times, so `decode` is
+#     never shown for it and `overall` uses the session's result totals.
+#     Workflow agents and async sub-agents leave no per-step records in the
+#     Claude stream: they are left out of every time cell, `overall` is
+#     dropped (its token total would include them), and a warning counts them.
 #
 # Abbreviations printed:
 #   wall       root session wall clock
@@ -2072,12 +2229,14 @@ def _apply_patch_files(patch_text: str) -> list[str]:
 #   llm-conc   avg: llm / union(LLM intervals) — time-weighted mean number of
 #              concurrent LLM calls while at least one is active;
 #              peak: the maximum number of concurrent LLM calls
+#   overall    Σ generated tokens / Σ LLM interval — tokens over the whole
+#              request, first-token latency included
 #   decode     Σ generated tokens / Σ decode time over all agents, where decode
 #              time runs from the first streamed part to the end of streaming
 #              (last part end, or first tool start when the step called tools);
 #              token-weighted, so long steps dominate
-#   decode+ttft Σ generated tokens / Σ LLM interval — the same tokens over the
-#              whole request (first-token latency included)
+#   ⚠ untimed  number of sub-agents with no per-step timing (Claude workflow
+#              phases / async sub-agents), excluded from all cells above
 #   sub        the three longest sub-agents: label, duration, steps, llm share
 #
 # Generated tokens = output + reasoning as reported by the provider. Their split
@@ -2099,6 +2258,8 @@ class TimeAttribution:
     coverage: dict[str, int]
     # (label, duration_ms, steps, llm_ms, tool_ms) for the longest sub-agents.
     top_subagents: list[tuple[str, int, int, int, int]]
+    # Sub-agents left out because they have no per-step timing.
+    untimed_subagents: int = 0
 
 
 def _union_ms(intervals: list[tuple[int, int]]) -> int:
@@ -2143,7 +2304,7 @@ def _collect_time_intervals(
             if tu.subagent is not None:
                 _collect_time_intervals(tu.subagent.conversation, llm_iv, tool_iv, acc)
                 continue
-            if tu.name.lower() in _AGENT_TOOLS:
+            if tu.name.lower() in _SUBAGENT_TOOLS:
                 continue  # container without a parsed child: not a leaf
             if tu.start_ms and tu.end_ms > tu.start_ms:
                 tool_iv.append((tu.start_ms, tu.end_ms))
@@ -2151,7 +2312,7 @@ def _collect_time_intervals(
 
 def _time_attribution(s: Session) -> Optional[TimeAttribution]:
     """Return the time attribution for a session, or None when the source
-    carries no per-step timing (e.g. the Claude Code stream)."""
+    carries no per-step timing (e.g. Claude Code before 2.1.284)."""
     llm_iv: list[tuple[int, int]] = []
     tool_iv: list[tuple[int, int]] = []
     acc: dict[str, int] = {}
@@ -2205,11 +2366,25 @@ def _time_attribution(s: Session) -> Optional[TimeAttribution]:
             ))
     subs.sort(key=lambda x: -x[1])
 
+    # Synthesized conversations (Claude workflow phases, async sub-agents)
+    # carry no timing.
+    untimed = sum(1 for sa in _iter_subagents(s.conversation) if sa.is_async)
+    gen_tokens = acc.get("gen_tokens", 0)
+    if s.agent_type == "claude":
+        # The streamed per-turn output_tokens are partial snapshots (≈1% of
+        # the real total on 2.1.284), so take the session total from the
+        # result event, which covers every agent. With untimed agents (or no
+        # result yet, i.e. a live trace) that total has no matching LLM time.
+        gen_tokens = 0
+        if s.result is not None and not untimed:
+            gen_tokens = sum(mu.output_tokens for mu in s.result.model_usage.values())
+
     return TimeAttribution(
         wall_ms=wall, llm_ms=llm_ms, tool_ms=tool_ms, llm_cov_ms=llm_cov,
         llm_peak=llm_peak, coverage=coverage, top_subagents=subs[:3],
-        gen_tokens=acc.get("gen_tokens", 0), decode_ms=acc.get("decode_ms", 0),
+        gen_tokens=gen_tokens, decode_ms=acc.get("decode_ms", 0),
         decode_tokens=acc.get("decode_tokens", 0),
+        untimed_subagents=untimed,
     )
 
 
@@ -2225,10 +2400,12 @@ def _format_time_report(ta: TimeAttribution) -> list[str]:
         f"work/wall={work / ta.wall_ms:.2f}x",
         f"llm-conc={ta.llm_ms / ta.llm_cov_ms:.2f}x avg, {ta.llm_peak} peak",
     ]
+    if ta.gen_tokens:
+        cells.append(f"overall={1000 * ta.gen_tokens / ta.llm_ms:.1f} tok/s")
     if ta.decode_ms and ta.decode_tokens:
         cells.append(f"decode={1000 * ta.decode_tokens / ta.decode_ms:.1f} tok/s")
-    if ta.gen_tokens:
-        cells.append(f"decode+ttft={1000 * ta.gen_tokens / ta.llm_ms:.1f} tok/s")
+    if ta.untimed_subagents:
+        cells.append(f"⚠ untimed={ta.untimed_subagents} workflow/async sub-agents")
     lines = ["time: " + " | ".join(cells)]
     if ta.top_subagents:
         subs = []
@@ -2879,6 +3056,9 @@ class _Segment:
     category: str
     size: int
     tooltip: str
+    # Unit of `size`: characters, except for synthesized ToolUses (async
+    # sub-agent / workflow steps), whose size is a context-token delta.
+    unit: str = "chars"
 
 PREVIEW_SIZE = 400  # chars of tool input/result to show in tooltip
 
@@ -2946,7 +3126,8 @@ def _segment_turn(turn: Turn) -> list[_Segment]:
             tip = f"{frozen_note}[task] {desc}\n[prompt] {prompt_preview}\n[result] {result_preview}"
         else:
             tip = f"{tu.name}: {desc_fallback}" if desc_fallback else tu.name
-        segs.append(_Segment(cat, size, tip))
+        unit = "tok" if tu.size_override is not None else "chars"
+        segs.append(_Segment(cat, size, tip, unit))
 
     return segs
 
@@ -3425,7 +3606,7 @@ def render_timeline_svg(sessions: list[Session]) -> str:
             w = max(seg.size / max_total * bar_w, 0.5)
             color = CAT_COLORS.get(seg.category, "#999")
             tooltip = _svg_escape(
-                f"{seg.category}: {seg.size:,} chars\n{seg.tooltip}"
+                f"{seg.category}: {seg.size:,} {seg.unit}\n{seg.tooltip}"
             )
             out.append(
                 f'<g><title>{tooltip}</title>'
@@ -3438,7 +3619,8 @@ def render_timeline_svg(sessions: list[Session]) -> str:
 
     # Grand total across all sessions.
     if len(sessions) > 1:
-        grand = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0}
+        grand = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "unclassified": 0,
+                 "output_partial": 0}
         grand_cost = 0.0
         for s in sessions:
             grand_cost += _session_total_cost(s)[0]

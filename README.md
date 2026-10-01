@@ -273,8 +273,9 @@ embedded session-export blocks over the raw JSONL stream, and falls back when an
 To keep visualizations up to date during long runs:
 
 ```bash
-./auto_visualize_all.bash   # re-runs parse_trace.py -v on all stale trace_* files every 10s
+./auto_visualize_all.bash   # re-renders stale trace_* files as they change
 ./serve.bash                # serves the directory at http://localhost:8000
+./visualize_all.py --force  # re-renders every SVG in
 ```
 
 Open the generated `trace_*_timeline.svg` in a browser tab and refresh to
