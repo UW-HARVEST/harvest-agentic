@@ -161,10 +161,12 @@ pub struct Args {
     #[arg(long, value_enum, requires = "agentic")]
     pub verify_harness: Option<VerifyHarness>,
 
-    /// With the gtest verify harness, also describe FuzzTest to the agent and
-    /// ship its scaffolding. Requires the verify stage.
+    /// Turn off FuzzTest in the verify stage. By default the gtest verify
+    /// harness also describes FuzzTest to the agent and ships its
+    /// scaffolding; with this flag the agent gets plain GoogleTest only.
+    /// Requires the verify stage.
     #[arg(long, requires = "agentic")]
-    pub fuzz: bool,
+    pub no_fuzz: bool,
 
     /// Set a configuration value; format $NAME=$VALUE.
     #[arg(long, short)]
@@ -225,7 +227,7 @@ impl Args {
             return Err("--agentic requires at least one stage".to_owned());
         }
         let verify_only_flags = [
-            (self.fuzz, "--fuzz"),
+            (self.no_fuzz, "--no-fuzz"),
             (self.verify_harness.is_some(), "--verify-harness"),
         ];
         for (set, flag) in verify_only_flags {
@@ -293,10 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_requires_verify_stage() {
-        let args = parse(&["bench", "--agentic=t", "--fuzz", "in", "out"]).unwrap();
+    fn no_fuzz_requires_verify_stage() {
+        let args = parse(&["bench", "--agentic=t", "--no-fuzz", "in", "out"]).unwrap();
         let err = args.validate_stages(&args.stages()).unwrap_err();
-        assert!(err.contains("--fuzz"), "{err}");
+        assert!(err.contains("--no-fuzz"), "{err}");
     }
 
     #[test]

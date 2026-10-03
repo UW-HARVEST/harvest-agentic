@@ -39,8 +39,8 @@ later stage can resume from an earlier run's output directory.
    until `cargo build --release` passes for every feature combination.
 2. **Verify & fix** (`tools/verify_fix_agentic`, stage `verify`/`v`). A second
    agent receives the Rust translation together with the C source. It builds a
-   comparison environment using the C as the oracle (GoogleTest by default,
-   optionally with FuzzTest; libloading as the legacy method), compares C and
+   comparison environment using the C as the oracle (GoogleTest with FuzzTest
+   by default; `--no-fuzz` drops FuzzTest; libloading as the legacy method), compares C and
    Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
 3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). Experimental,
    research use only: not part of the standard translation pipeline, and bare
@@ -148,7 +148,7 @@ harness build would otherwise report every test as a failure.
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
-| `--fuzz` | With the gtest verify harness, also ship FuzzTest scaffolding and guidance |
+| `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--no-plan-file` | Sub-agent guidance kept, plan files never mentioned |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
@@ -158,7 +158,7 @@ harness build would otherwise report every test as a failure.
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
 
 `--timeout`, `--test-harness`, `--filter`, and `--exclude` work as in
-non-agentic benchmark runs. Flags scoped to a stage (e.g. `--fuzz` to verify)
+non-agentic benchmark runs. Flags scoped to a stage (e.g. `--no-fuzz` to verify)
 are rejected when that stage is not part of the run.
 
 ## Examples

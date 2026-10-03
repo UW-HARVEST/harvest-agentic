@@ -152,7 +152,7 @@ pub struct RunOptions {
     pub workflow: bool,
     pub test_harness: TestHarness,
     pub verify_harness: crate::cli::VerifyHarness,
-    pub fuzz: bool,
+    pub no_fuzz: bool,
     pub force: bool,
 }
 
@@ -650,8 +650,8 @@ fn benchmark_single_program(
         if opts.verify_harness == crate::cli::VerifyHarness::Gtest {
             effective_overrides.push("tools.verify_fix_agentic.verify_harness=gtest".to_owned());
         }
-        if opts.fuzz {
-            effective_overrides.push("tools.verify_fix_agentic.fuzz=true".to_owned());
+        if opts.no_fuzz {
+            effective_overrides.push("tools.verify_fix_agentic.fuzz=false".to_owned());
         }
     }
     if opts.has(Stage::Conform) {
@@ -1308,7 +1308,7 @@ fn run(args: Args) -> HarvestResult<()> {
         workflow: args.workflow,
         test_harness: args.test_harness,
         verify_harness: args.verify_harness.unwrap_or_default(),
-        fuzz: args.fuzz,
+        no_fuzz: args.no_fuzz,
         force: args.force,
     };
     let results = run_all_benchmarks(&program_runs, output_dir, &opts)?;

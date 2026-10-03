@@ -600,9 +600,10 @@ pub struct Config {
     pub verify_harness: VerifyHarness,
 
     /// When `verify_harness = gtest`, also describe FuzzTest as an
-    /// available capability and ship its scaffolding.
+    /// available capability and ship its scaffolding. On by default; set
+    /// `fuzz = false` to verify with plain GoogleTest only.
     /// No effect under the libloading harness.
-    #[serde(default)]
+    #[serde(default = "default_fuzz")]
     pub fuzz: bool,
 
     /// Extra environment variables to inject into the agent process.
@@ -645,14 +646,13 @@ fn default_timeout_secs() -> u64 {
     agent_runner::DEFAULT_AGENT_TIMEOUT_SECS
 }
 
+fn default_fuzz() -> bool {
+    true
+}
+
 impl Config {
     fn validate(&self) {
         unknown_field_warning("tools.verify_fix_agentic", &self.unknown);
-        if self.fuzz && self.verify_harness != VerifyHarness::Gtest {
-            warn!(
-                "tools.verify_fix_agentic: fuzz has no effect without verify_harness = gtest; ignoring"
-            );
-        }
         if self.verify_harness == VerifyHarness::Gtest && (self.no_plan || self.no_plan_file) {
             warn!(
                 "tools.verify_fix_agentic: verify_harness = gtest is not applied under no_plan/no_plan_file (those prompts are libloading-only); using libloading"
@@ -1080,6 +1080,13 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(translated.join("verify_env/run_fuzz.sh").exists());
         assert!(translated.join("verify_env/run_tests.sh").exists());
         assert!(translated.join("verify_env/memory_scope.sh").exists());
+    }
+
+    #[test]
+    fn fuzz_is_enabled_by_default() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.fuzz);
+        assert!(build_method_section(&config).contains("FuzzTest"));
     }
 
     #[test]
