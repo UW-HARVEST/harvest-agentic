@@ -46,10 +46,6 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub stage_input: Option<PathBuf>,
 
-    /// Provide the agent with pre-built analysis tools (requires --agentic).
-    #[arg(long, requires = "agentic")]
-    pub agent_tools: bool,
-
     /// Which agent to use for agentic translation: kiro, claude, or opencode (requires --agentic).
     #[arg(long = "agent", requires = "agentic", value_parser = parse_agent_kind)]
     pub agentic_agent: Option<harvest_core::config::AgentKind>,
@@ -158,12 +154,6 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
         let stages: Vec<String> = stages.iter().map(ToString::to_string).collect();
         settings = settings
             .set_override("stages", stages)
-            .expect("settings override failed");
-    }
-
-    if args.agent_tools {
-        settings = settings
-            .set_override("agent_tools", "true")
             .expect("settings override failed");
     }
 

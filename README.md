@@ -115,10 +115,6 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
 - **`--no-plan`**: the original minimal prompts. No plan files, no sub-agent
   guidance. For controlled experiments measuring the impact of the
   anti-compaction mechanism.
-- **`--no-plan-file`**: ablation between the two. Keeps the sub-agent
-  delegation and context-management guidance, but the prompt never mentions
-  plan files or persisting anything to disk. Mutually exclusive with
-  `--no-plan`.
 - **`--workflow`** (requires `--no-plan`, Claude only): injects a hint asking
   Claude Code to orchestrate the run with its dynamic multi-agent workflow
   feature.
@@ -148,11 +144,10 @@ harness build would otherwise report every test as a failure.
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
+| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or `--agent kiro` |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
-| `--no-plan-file` | Sub-agent guidance kept, plan files never mentioned |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
-| `--agent-tools` | Provide the agent with pre-built tools |
 | `--test <PATH>` | Re-validate an already-translated output directory without running any stage |
 | `--force` | Erase an output program directory that already holds results (otherwise a populated directory is an error) |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
@@ -203,11 +198,6 @@ cargo run --bin=benchmark --release -- \
   --agentic --agent claude --model sonnet \
   --no-plan --workflow \
   ./harvest-bench/tests/lz4/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
-
-# no-plan-file
-cargo run --bin=benchmark --release -- \
-  --agentic --agent claude --model sonnet --no-plan-file \
-  ./harvest-bench/tests/lz4/ ./out_lz4_4_cs_npf &> ./trace_lz4_4_cs_npf.txt
 ```
 
 Re-run only the test-vector validation on an existing output:
@@ -226,7 +216,7 @@ cargo run --bin=translate --release -- --agentic \
 ```
 
 The `out_*` / `trace_*` naming used above is just a convention:
-`<project>_<run#>_<model shorthand>[_np|_npf][_wf]`, plus a stage suffix
+`<project>_<run#>_<model shorthand>[_np][_wf]`, plus a stage suffix
 (`_t`, `_tv`, `_tvc`) when a run freezes a partial-stage snapshot.
 
 ## Trace capture and visualization

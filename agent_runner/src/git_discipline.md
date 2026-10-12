@@ -8,6 +8,9 @@
   the same short name: `git worktree add wt/<name> -b <name>`. Give the
   sub-agent the worktree path as its working directory, and copy these rules
   into the sub-agent prompt.
+- Worktrees let sub-agents work at the same time. Send the sub-agents of
+  independent subtasks in one message. A subtask waits for another one only
+  when it needs code that the other one writes.
 - A sub-agent works only inside its worktree. It commits its own steps with
   short messages on its own branch. It does not merge, it does not touch the
   `main` branch, and it does not delete its worktree when it finishes.

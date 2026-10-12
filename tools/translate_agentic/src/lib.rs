@@ -18,8 +18,11 @@ use harvest_core::{Id, Representation};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, read_dir};
+use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+mod skills;
 
 /// Guard that preserves a temp directory when a run fails, but removes it on success.
 struct TempDirGuard {
@@ -67,7 +70,11 @@ const PROMPT_KIRO_LIBRARY: &str = include_str!("prompt_kiro_library.md");
 const PROMPT_KIRO_CONFIGURABLE: &str = include_str!("prompt_kiro_configurable.md");
 const PROMPT_TRANSLATE: &str = include_str!("prompt_translate.md");
 const PROMPT_TRANSLATE_NO_PLAN: &str = include_str!("prompt_translate_no_plan.md");
-const PROMPT_TRANSLATE_NO_PLAN_FILE: &str = include_str!("prompt_translate_no_plan_file.md");
+
+const SCOUT: &str = include_str!("scout.md");
+const SCOUT_TAB2RUST: &str = include_str!("scout_tab2rust.md");
+const TAB2RUST_TRANSLATOR: &str = include_str!("tab2rust_translator.md");
+const TAB2RUST_INVARIANT: &str = include_str!("tab2rust_invariant.md");
 
 pub struct TranslateAgentic;
 
@@ -101,12 +108,7 @@ impl Tool for TranslateAgentic {
             .ok_or("No ProjectSpec representation found in IR")?;
 
         let agent = context.config.agentic_agent;
-        if config.no_plan && config.no_plan_file {
-            return Err(
-                "tools.translate_agentic: no_plan and no_plan_file are mutually exclusive".into(),
-            );
-        }
-        let translate_prompt = load_prompt(&config, &project_spec.kind, agent)?;
+        let translate_prompt = load_prompt(&config, &project_spec.kind, agent);
         let no_plan = config.no_plan;
 
         // Set up a working directory that mirrors the layout the agent expects:
@@ -128,25 +130,13 @@ impl Tool for TranslateAgentic {
         // c_src/ is a read-only input.
         let reference_guard = ReferenceGuard::capture(&translated, &["c_src"])?;
 
-        // Materialize agent tools if enabled and build the prompt section.
-        // When disabled, {AGENT_TOOLS_SECTION} is replaced with an empty string so
-        // the entire "Available Tools" block is absent from the prompt the agent sees.
-        let agent_tools_section = if context.config.agent_tools {
-            let dir = translated.join("agent_tools");
-            agent_tools_embed::materialize_to(&dir)?;
-            let docs = agent_tools_embed::collect_docs()
-                .replace("{AGENT_TOOLS_DIR}", &dir.to_string_lossy());
-            format!(
-                "### Available Tools\n\n\
-                 The following tools are pre-installed in `{}/`. Use them when you\n\
-                 need a precise answer about C behavior rather than reasoning from first principles.\n\n\
-                 {}\n",
-                dir.display(),
-                docs
-            )
-        } else {
-            String::new()
-        };
+        // Scouts explore c_src/ for the main agent. Their task, and with tab2rust the skill and
+        // the rules for its users, go into the working directory. scout/ also keeps the reports.
+        let scouts = sends_scouts(&config, agent);
+        let tab2rust = scouts && config.tab2rust;
+        if scouts {
+            write_scout_files(&translated, tab2rust)?;
+        }
 
         // The wishlist file lives inside the agent's working directory so the agent
         // can write to it without any special permissions. We inject the absolute
@@ -161,14 +151,13 @@ impl Tool for TranslateAgentic {
         } else {
             String::new()
         };
-        let translate_prompt = translate_prompt
+        let translate_prompt = fill_tab2rust(translate_prompt, tab2rust, &translated)
             .replace(
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
             )
             .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
             .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
-            .replace("{AGENT_TOOLS_SECTION}", &agent_tools_section)
             .replace(
                 "{RUST_TOOLCHAIN_CONTEXT}",
                 &rust_toolchain_context.prompt_block,
@@ -197,7 +186,6 @@ impl Tool for TranslateAgentic {
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             no_plan,
-            no_plan_file: config.no_plan_file,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: Some(&rust_toolchain_context.required_version),
@@ -220,8 +208,8 @@ impl Tool for TranslateAgentic {
 
         // Copy PLAN.md out before the tempdir is dropped. Translate-phase PLAN.md
         // is preserved under a dedicated name so it survives any verify-phase
-        // rewrite of the CargoPackage. PLAN.md only exists if the agent decided
-        // it was in the Medium/Large regime; absence is normal for small projects.
+        // rewrite of the CargoPackage. The plan prompt always asks for PLAN.md;
+        // the no-plan and Kiro prompts never do.
         let local_plan = translated.join("PLAN.md");
         if local_plan.exists() {
             if let Some(out_path) = &config.plan_output_path {
@@ -231,8 +219,8 @@ impl Tool for TranslateAgentic {
                     info!("Translation PLAN.md written to {}", out_path.display());
                 }
             }
-        } else {
-            info!("Agent did not produce a PLAN.md (likely small-regime project)");
+        } else if scouts {
+            warn!("Agent did not produce a PLAN.md, although the prompt asks for one");
         }
 
         if !translated.join("Cargo.toml").exists() {
@@ -286,9 +274,10 @@ fn post_process(
     match project_kind {
         ProjectKind::Library => {
             cargo.remove_bin();
-            // Read the package name from the in-memory doc before overwriting [lib].
-            if let Some(name) = cargo.package_name() {
-                cargo.set_lib(&name);
+            // Keep the agent's [lib].name; without one, use the name that Cargo would derive
+            // from the package name ('-' becomes '_': a lib target name cannot contain '-').
+            if let Some(name) = cargo.lib_name() {
+                cargo.set_lib(&name.replace('-', "_"));
             }
             cargo.save()?;
             strip_for_lib(translated)?;
@@ -307,53 +296,62 @@ fn post_process(
 }
 
 /// Loads the translate prompt, selecting between Kiro (per-kind) and Claude (unified) variants.
-fn load_prompt(
-    config: &Config,
-    kind: &ProjectKind,
-    agent: AgentKind,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn load_prompt(config: &Config, kind: &ProjectKind, agent: AgentKind) -> &'static str {
     match agent {
-        AgentKind::Claude | AgentKind::OpenCode => match &config.prompt_translate {
-            Some(p) => Ok(fs::read_to_string(p)?),
-            None if config.no_plan => Ok(PROMPT_TRANSLATE_NO_PLAN.to_owned()),
-            None if config.no_plan_file => Ok(PROMPT_TRANSLATE_NO_PLAN_FILE.to_owned()),
-            None => Ok(PROMPT_TRANSLATE.to_owned()),
+        AgentKind::Claude | AgentKind::OpenCode if config.no_plan => PROMPT_TRANSLATE_NO_PLAN,
+        AgentKind::Claude | AgentKind::OpenCode => PROMPT_TRANSLATE,
+        AgentKind::Kiro => match kind {
+            ProjectKind::Executable => PROMPT_KIRO_EXECUTABLE,
+            ProjectKind::Library => PROMPT_KIRO_LIBRARY,
+            ProjectKind::Configurable => PROMPT_KIRO_CONFIGURABLE,
         },
-        AgentKind::Kiro => {
-            let (config_path, builtin) = match kind {
-                ProjectKind::Executable => (&config.prompt_kiro_executable, PROMPT_KIRO_EXECUTABLE),
-                ProjectKind::Library => (&config.prompt_kiro_library, PROMPT_KIRO_LIBRARY),
-                ProjectKind::Configurable => {
-                    (&config.prompt_kiro_configurable, PROMPT_KIRO_CONFIGURABLE)
-                }
-            };
-            match config_path {
-                Some(p) => Ok(fs::read_to_string(p)?),
-                None => Ok(builtin.to_owned()),
-            }
-        }
     }
+}
+
+/// Whether the prompt sends scouts: the plan prompt of Claude and OpenCode.
+fn sends_scouts(config: &Config, agent: AgentKind) -> bool {
+    agent != AgentKind::Kiro && !config.no_plan
+}
+
+/// The scout task, with the tab2rust part when tab2rust is on.
+fn render_scout(tab2rust: bool, work_dir: &Path) -> String {
+    let scout = SCOUT.replace(
+        "{TAB2RUST_SCOUT}",
+        if tab2rust { SCOUT_TAB2RUST } else { "" },
+    );
+    fill_tab2rust(&scout, tab2rust, work_dir)
+}
+
+/// Fills the tab2rust placeholder of a prompt: the data-table rule, or nothing.
+/// `{WORK_DIR}` becomes the absolute working directory: sub-agents that work in a git worktree
+/// reach the build in `scout/tab2rust/c-build/` (untracked) only by an absolute path.
+fn fill_tab2rust(prompt: &str, tab2rust: bool, work_dir: &Path) -> String {
+    let invariant = if tab2rust { TAB2RUST_INVARIANT } else { "" };
+    prompt
+        .replace("{TAB2RUST_INVARIANT}", invariant)
+        .replace("{WORK_DIR}", &work_dir.to_string_lossy())
+}
+
+/// Writes `scout/SCOUT.md` and, with tab2rust, the skill (`agent_skills/tab2rust/`) and
+/// `scout/tab2rust/TRANSLATOR.md`.
+fn write_scout_files(translated: &Path, tab2rust: bool) -> io::Result<()> {
+    let scout = translated.join("scout");
+    fs::create_dir_all(&scout)?;
+    fs::write(scout.join("SCOUT.md"), render_scout(tab2rust, translated))?;
+    if tab2rust {
+        skills::materialize("tab2rust", &translated.join("agent_skills/tab2rust"))?;
+        fs::create_dir_all(scout.join("tab2rust"))?;
+        fs::write(
+            scout.join("tab2rust/TRANSLATOR.md"),
+            fill_tab2rust(TAB2RUST_TRANSLATOR, true, translated),
+        )?;
+    }
+    Ok(())
 }
 
 /// Tool-specific configuration, read from `[tools.translate_agentic]` in the HARVEST config.
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Override path for the Kiro executable translation prompt.
-    #[serde(alias = "prompt_executable")]
-    pub prompt_kiro_executable: Option<PathBuf>,
-
-    /// Override path for the Kiro library translation prompt.
-    #[serde(alias = "prompt_library")]
-    pub prompt_kiro_library: Option<PathBuf>,
-
-    /// Override path for the Kiro configurable translation prompt.
-    #[serde(alias = "prompt_configurable")]
-    pub prompt_kiro_configurable: Option<PathBuf>,
-
-    /// Override path for the standard unified translation prompt.
-    #[serde(alias = "prompt_claude_translate")]
-    pub prompt_translate: Option<PathBuf>,
-
     /// Agent timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -371,18 +369,17 @@ pub struct Config {
     #[serde(default)]
     pub no_plan: bool,
 
-    /// If true, use the ablation prompt that keeps the sub-agent push and
-    /// context-management guidance but never mentions PLAN.md or writing
-    /// plans to disk (the agent may still do so spontaneously), and skip the
-    /// `--append-system-prompt` flag. Isolates the effect of plan-file
-    /// persistence from sub-agent usage. Mutually exclusive with `no_plan`.
-    #[serde(default)]
-    pub no_plan_file: bool,
-
     /// Inject a prompt hint encouraging the agent to use dynamic workflows
     /// (Claude Code's multi-agent orchestration). Only meaningful with no_plan.
     #[serde(default)]
     pub workflow: bool,
+
+    /// Give the scouts and the translation sub-agents the tab2rust skill
+    /// (`agent_skills/tab2rust/`): scout 1 finds the C data tables, and the sub-agents generate
+    /// them as Rust. On by default; the benchmark flag `--no-tab2rust` turns it off. Only the
+    /// prompts that send scouts use it.
+    #[serde(default = "default_tab2rust")]
+    pub tab2rust: bool,
 
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
@@ -421,6 +418,10 @@ pub struct Config {
 
     #[serde(flatten)]
     unknown: HashMap<String, serde_json::Value>,
+}
+
+fn default_tab2rust() -> bool {
+    true
 }
 
 fn default_timeout_secs() -> u64 {

@@ -82,9 +82,7 @@ pub struct Args {
             "agent",
             "model",
             "no_plan",
-            "no_plan_file",
             "workflow",
-            "agent_tools",
             "config",
             "test_case",
             "input_dir",
@@ -137,29 +135,24 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub no_plan: bool,
 
-    /// Ablation mode: keep the sub-agent push and context-management guidance
-    /// from the standard prompts, but never mention PLAN.md / HYPOTHESES.md or
-    /// writing plans to disk (the agent may still do so spontaneously), and
-    /// skip the `--append-system-prompt` compaction-recovery hint. Isolates
-    /// the effect of plan-file persistence from sub-agent usage. Applies to
-    /// the translate/verify stages of this run.
-    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
-    pub no_plan_file: bool,
-
     /// Inject a prompt hint encouraging the agent to use dynamic workflows
     /// (Claude Code's multi-agent orchestration feature). Only meaningful with
     /// --no-plan; requires --agent claude.
     #[arg(long, requires = "no_plan")]
     pub workflow: bool,
 
-    /// Provide the agent with pre-built analysis tools (c_sandbox, symbol_diff).
-    #[arg(long, requires = "agentic")]
-    pub agent_tools: bool,
-
     /// Comparison mechanism the in-loop verification agent is given
     /// (default: gtest). Requires the verify stage.
     #[arg(long, value_enum, requires = "agentic")]
     pub verify_harness: Option<VerifyHarness>,
+
+    /// Do not give the translate stage the tab2rust skill. By default the
+    /// scouts find the C data tables with tab2rust and the translation
+    /// sub-agents generate them. Requires the translate stage. Only the plan
+    /// prompt of Claude and OpenCode uses tab2rust, so the flag is an error
+    /// with --no-plan or --agent kiro.
+    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
+    pub no_tab2rust: bool,
 
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
     /// harness also describes FuzzTest to the agent and ships its
@@ -226,6 +219,17 @@ impl Args {
         if self.agentic.is_some() && stages.is_empty() {
             return Err("--agentic requires at least one stage".to_owned());
         }
+        if self.no_tab2rust && !has(Stage::Translate) {
+            return Err(format!(
+                "--no-tab2rust requires the translate stage (got --agentic={})",
+                stages_str()
+            ));
+        }
+        if self.no_tab2rust && self.agent == Some(AgentKind::Kiro) {
+            return Err("--no-tab2rust has no effect with --agent kiro: \
+                        the Kiro prompts do not use tab2rust"
+                .to_owned());
+        }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
             (self.verify_harness.is_some(), "--verify-harness"),
@@ -238,12 +242,8 @@ impl Args {
                 ));
             }
         }
-        let translate_or_verify_flags = [
-            (self.no_plan, "--no-plan"),
-            (self.no_plan_file, "--no-plan-file"),
-            (self.workflow, "--workflow"),
-            (self.agent_tools, "--agent-tools"),
-        ];
+        let translate_or_verify_flags =
+            [(self.no_plan, "--no-plan"), (self.workflow, "--workflow")];
         for (set, flag) in translate_or_verify_flags {
             if set && !has(Stage::Translate) && !has(Stage::Verify) {
                 return Err(format!(
@@ -299,6 +299,40 @@ mod tests {
         let args = parse(&["bench", "--agentic=t", "--no-fuzz", "in", "out"]).unwrap();
         let err = args.validate_stages(&args.stages()).unwrap_err();
         assert!(err.contains("--no-fuzz"), "{err}");
+    }
+
+    #[test]
+    fn no_tab2rust_requires_translate_stage() {
+        let args = parse(&["bench", "--agentic=v", "--no-tab2rust", "in", "out"]).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(err.contains("--no-tab2rust"), "{err}");
+        let args = parse(&["bench", "--agentic=t,v", "--no-tab2rust", "in", "out"]).unwrap();
+        args.validate_stages(&args.stages()).unwrap();
+    }
+
+    #[test]
+    fn no_tab2rust_needs_a_prompt_that_uses_tab2rust() {
+        assert!(parse(&[
+            "bench",
+            "--agentic=t",
+            "--no-plan",
+            "--no-tab2rust",
+            "in",
+            "out"
+        ])
+        .is_err());
+        let args = parse(&[
+            "bench",
+            "--agentic=t",
+            "--agent",
+            "kiro",
+            "--no-tab2rust",
+            "in",
+            "out",
+        ])
+        .unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(err.contains("kiro"), "{err}");
     }
 
     #[test]

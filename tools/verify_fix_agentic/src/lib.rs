@@ -24,7 +24,6 @@ use tracing::{info, warn};
 const PROMPT_KIRO_VERIFY: &str = include_str!("prompt_kiro_verify.md");
 const PROMPT_VERIFY: &str = include_str!("prompt_verify.md");
 const PROMPT_VERIFY_NO_PLAN: &str = include_str!("prompt_verify_no_plan.md");
-const PROMPT_VERIFY_NO_PLAN_FILE: &str = include_str!("prompt_verify_no_plan_file.md");
 
 /// Verification-method sections spliced into the standard prompt's
 /// `{VERIFICATION_METHOD}` slot (see `load_verify_prompt`).
@@ -103,12 +102,6 @@ impl Tool for VerifyFixAgentic {
         config.validate();
 
         let agent = context.config.agentic_agent;
-        if config.no_plan && config.no_plan_file {
-            return Err(
-                "tools.verify_fix_agentic: no_plan and no_plan_file are mutually exclusive".into(),
-            );
-        }
-
         let cargo_package = context
             .ir_snapshot
             .get::<CargoPackage>(inputs[0])
@@ -134,26 +127,6 @@ impl Tool for VerifyFixAgentic {
 
         info!("Working directory: {}", case_dir.display());
 
-        // Materialize agent tools if enabled and build the prompt section.
-        // When disabled, {AGENT_TOOLS_SECTION} is replaced with an empty string so
-        // the entire "Available Tools" block is absent from the prompt the agent sees.
-        let agent_tools_section = if context.config.agent_tools {
-            let dir = translated.join("agent_tools");
-            agent_tools_embed::materialize_to(&dir)?;
-            let docs = agent_tools_embed::collect_docs()
-                .replace("{AGENT_TOOLS_DIR}", &dir.to_string_lossy());
-            format!(
-                "---\n\n## Available Tools\n\n\
-                 The following tools are pre-installed in `{}/`. Use them when you\n\
-                 need a precise answer about C behavior rather than reasoning from first principles.\n\n\
-                 {}\n\n",
-                dir.display(),
-                docs
-            )
-        } else {
-            String::new()
-        };
-
         // The wishlist file lives inside translated_rust/ so the agent can write to it
         // without any special permissions. The absolute path is injected into the prompt.
         let local_wishlist = translated.join("tool_wishlist.json");
@@ -170,7 +143,7 @@ impl Tool for VerifyFixAgentic {
         } else {
             String::new()
         };
-        let prompt = load_verify_prompt(&config, agent)?
+        let prompt = load_verify_prompt(&config, agent)
             .replace(
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
@@ -179,7 +152,6 @@ impl Tool for VerifyFixAgentic {
             .replace("{CMAKE_BUILD_FLAGS}", &test_config.cmake_flags)
             .replace("{ALL_CONFIGURATIONS}", &render_configurations(&test_config))
             .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
-            .replace("{AGENT_TOOLS_SECTION}", &agent_tools_section)
             .replace(
                 "{RUST_TOOLCHAIN_CONTEXT}",
                 &rust_toolchain_context.prompt_block,
@@ -202,10 +174,9 @@ impl Tool for VerifyFixAgentic {
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
-        // no-plan ablation prompts are libloading-only, so skip it there.
+        // no-plan ablation prompt is libloading-only, so skip it there.
         let gtest_harness_active = config.verify_harness == VerifyHarness::Gtest
             && !config.no_plan
-            && !config.no_plan_file
             && matches!(agent, AgentKind::Claude | AgentKind::OpenCode);
         if gtest_harness_active {
             materialize_verify_env(&translated, &c_src_dir, config.fuzz)?;
@@ -233,7 +204,6 @@ impl Tool for VerifyFixAgentic {
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             no_plan: config.no_plan,
-            no_plan_file: config.no_plan_file,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: Some(&rust_toolchain_context.required_version),
@@ -509,26 +479,18 @@ fn write_script(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn load_verify_prompt(
-    config: &Config,
-    agent: AgentKind,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn load_verify_prompt(config: &Config, agent: AgentKind) -> String {
     match agent {
-        AgentKind::Claude | AgentKind::OpenCode => match &config.prompt_verify {
-            Some(p) => Ok(fs::read_to_string(p)?),
-            // The no-plan ablation prompts are libloading-only by construction
-            // (they predate the harness split); the harness/fuzz switch applies
-            // to the standard prompt.
-            None if config.no_plan => Ok(PROMPT_VERIFY_NO_PLAN.to_owned()),
-            None if config.no_plan_file => Ok(PROMPT_VERIFY_NO_PLAN_FILE.to_owned()),
-            None => {
-                Ok(PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config)))
-            }
-        },
-        AgentKind::Kiro => match &config.prompt_kiro_verify {
-            Some(p) => Ok(fs::read_to_string(p)?),
-            None => Ok(PROMPT_KIRO_VERIFY.to_owned()),
-        },
+        // The no-plan ablation prompt is libloading-only by construction (it
+        // predates the harness split); the harness/fuzz switch applies to the
+        // standard prompt.
+        AgentKind::Claude | AgentKind::OpenCode if config.no_plan => {
+            PROMPT_VERIFY_NO_PLAN.to_owned()
+        }
+        AgentKind::Claude | AgentKind::OpenCode => {
+            PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config))
+        }
+        AgentKind::Kiro => PROMPT_KIRO_VERIFY.to_owned(),
     }
 }
 
@@ -558,13 +520,6 @@ pub enum VerifyHarness {
 /// Tool-specific configuration, read from `[tools.verify_fix_agentic]` in the HARVEST config.
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Override path for the Kiro verification prompt.
-    pub prompt_kiro_verify: Option<PathBuf>,
-
-    /// Override path for the standard verification prompt.
-    #[serde(alias = "prompt_claude_verify")]
-    pub prompt_verify: Option<PathBuf>,
-
     /// Agent timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -580,15 +535,6 @@ pub struct Config {
     /// mechanism added in 883e2e2.
     #[serde(default)]
     pub no_plan: bool,
-
-    /// If true, use the ablation prompt that keeps the sub-agent push and
-    /// context-management guidance but never mentions HYPOTHESES.md/PLAN.md
-    /// or writing logs to disk (the agent may still do so spontaneously),
-    /// and skip the `--append-system-prompt` flag. Isolates the effect of
-    /// plan-file persistence from sub-agent usage. Mutually exclusive with
-    /// `no_plan`.
-    #[serde(default)]
-    pub no_plan_file: bool,
 
     /// Inject a prompt hint encouraging the agent to use dynamic workflows.
     /// Only meaningful with no_plan.
@@ -653,9 +599,9 @@ fn default_fuzz() -> bool {
 impl Config {
     fn validate(&self) {
         unknown_field_warning("tools.verify_fix_agentic", &self.unknown);
-        if self.verify_harness == VerifyHarness::Gtest && (self.no_plan || self.no_plan_file) {
+        if self.verify_harness == VerifyHarness::Gtest && self.no_plan {
             warn!(
-                "tools.verify_fix_agentic: verify_harness = gtest is not applied under no_plan/no_plan_file (those prompts are libloading-only); using libloading"
+                "tools.verify_fix_agentic: verify_harness = gtest is not applied under no_plan (that prompt is libloading-only); using libloading"
             );
         }
     }
@@ -1083,6 +1029,13 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     }
 
     #[test]
+    fn claude_and_opencode_prompts_carry_bug_workarounds() {
+        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
+            assert!(prompt.contains("{AGENT_BUG_WORKAROUNDS}"));
+        }
+    }
+
+    #[test]
     fn fuzz_is_enabled_by_default() {
         let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(config.fuzz);
@@ -1093,16 +1046,13 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     fn disabled_fuzz_is_not_disclosed_in_builtin_prompts() {
         for agent in [AgentKind::Claude, AgentKind::OpenCode, AgentKind::Kiro] {
             for harness in ["gtest", "libloading"] {
-                for mode in ["standard", "no_plan", "no_plan_file"] {
+                for mode in ["standard", "no_plan"] {
                     let config: Config = serde_json::from_value(serde_json::json!({
                         "fuzz": false, "verify_harness": harness,
                         "no_plan": mode == "no_plan",
-                        "no_plan_file": mode == "no_plan_file",
                     }))
                     .unwrap();
-                    let prompt = load_verify_prompt(&config, agent)
-                        .unwrap()
-                        .to_ascii_lowercase();
+                    let prompt = load_verify_prompt(&config, agent).to_ascii_lowercase();
                     for hint in ["fuzz", "coverage-guided", "property-based"] {
                         assert!(
                             !prompt.contains(hint),

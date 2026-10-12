@@ -301,8 +301,6 @@ list after your last fix.
       unchecked-row note carries evidence. You resolved what it reported
       before finishing.
 
-{AGENT_TOOLS_SECTION}
-
 ## Static Analysis Tool Wishlist
 
 As you work through verification and fixing, pay attention to moments where you think:

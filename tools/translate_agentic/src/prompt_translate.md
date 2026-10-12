@@ -34,60 +34,41 @@ Self-assessment:
    This limit caps how much Rust code a single sub-agent call can write.)
 ```
 
-### 0.2 Cheap codebase reconnaissance (NO bulk reading)
+### 0.2 Send scouts to explore the C code
 
-Estimate the codebase size **without reading file contents**. Prefer cheap
-shell-level operations:
+Scout sub-agents explore `c_src/` for you and propose the subtasks. Do not explore the C code
+yourself: your context is for the plan and the build.
 
-```
-ls -la c_src/                                  # what files exist
-find c_src/ -name '*.c' -o -name '*.h' | xargs wc -l    # line counts
-du -sh c_src/                                  # total size
-```
+1. Measure the code. Do not read it:
 
-From line counts and file sizes, decide which regime you are in:
+   ```
+   find c_src/ -name '*.c' -o -name '*.h' | xargs wc -l
+   ```
 
-- **Small (total source < 30% of your window)**: safe to read everything once and
-  translate top-down. Skip the rest of Step 0 and proceed to Step 1.
-- **Large (> 30% of window)**: full read is impossible. You MUST segment before
-  reading anything substantial. Use targeted exploration (Step 0.3) to build a
-  picture of the codebase from outlines, not full contents.
+2. One scout can explore code of about 50% of its context window. Scouts use your model. If the
+   code is larger, divide the files into groups of that size, one group for each scout.
+3. Send all scouts in one message. Give each scout this prompt:
 
-Write your decision into your first response so it is auditable.
+   ```
+   Read scout/SCOUT.md and do the task in it.
+   Scout <n> of <N>. File group: <directories or files of c_src/, or "all">.
+   Context window: <from 0.1>. Output token limit: <from 0.1>.
+   ```
 
-### 0.3 Lightweight exploration tools — use these instead of reading whole files
+4. Each scout writes `scout/REPORT_<n>.md` and replies with a codebase summary, proposed subtasks,
+   and risks.
 
-You have a lot of cheap, surgical tools at your disposal. Prefer them over
-opening entire files when you only need a fact, a name, or a signature:
+### 0.3 Write a persistent plan to `PLAN.md` BEFORE context fills up
 
-- **`grep` / `rg`**: search for `struct foo`, `typedef`, `^[a-z_]+(`, `#define`,
-  function definitions, etc. Scope it (`grep -rn 'struct sphincs_ctx' c_src/`).
-- **`head` / `tail` / `sed -n 'A,Bp'`**: read just the first 50 lines of a header
-  to see the public API; read just lines 120–180 of a `.c` file to see one
-  function. You do NOT have to use Read on a whole file.
-- **`ls`, `find`, `wc -l`, `du`**: file inventory, sizes, line counts.
-- **`callgraph`** (see "Available Tools" below if present): for any C project
-  with `compile_commands.json`, this gives you the whole-program call graph
-  without reading a single source file. Use `list` for a flat overview, `from`
-  to drill into one function's transitive callees, optionally with `--depth N`.
-- **`symscan`** (see "Available Tools" below if present): for finding all
-  definitions/uses of a symbol across the project.
-
-Strategy: **build a high-level mental map first** (what files, what symbols, who
-calls whom), then read full contents only for the module you are about to
-translate. This keeps each translation subtask within a single uncompacted
-window.
-
-### 0.4 Write a persistent plan to `PLAN.md` BEFORE context fills up
-
-If you decided you are in the Medium or Large regime, immediately create a file
-`PLAN.md` in the current directory (the Rust project root, NOT inside `c_src/`).
-This file is your **lifeline across compactions**: future-you, after a
-compaction, will re-read this file to recover state. It is **not** a tool's TODO
+When the scouts reply, immediately create a file `PLAN.md` in the current directory (the Rust
+project root, NOT inside `c_src/`). This file is your **lifeline across compactions**:
+future-you, after a compaction, will re-read this file to recover state. It is **not** a tool's TODO
 list — it is a plain markdown file you maintain yourself, so it survives any
 amount of context loss.
 
-`PLAN.md` MUST contain (and you MUST keep up to date):
+`PLAN.md` MUST contain the sections below, and you MUST keep it up to date. Fill the Codebase
+summary and the subtasks from the scout replies: merge the replies of all scouts, number the
+subtasks T1, T2, ..., and change what you disagree with. The plan is yours.
 
 ```markdown
 # Translation Plan
@@ -96,7 +77,6 @@ amount of context loss.
 - Model: ...
 - Window: ...
 - Output token limit: ... (unknown → use 16k as conservative default)
-- Regime: small | medium | large
 
 ## Invariants (do not drift across compactions)
 
@@ -188,7 +168,7 @@ When in doubt, re-read this section.
 ### Git discipline
 {GIT_DISCIPLINE}
 
-{AGENT_TOOLS_SECTION}
+{TAB2RUST_INVARIANT}
 
 ## Codebase summary
 - Files: <one line per .c/.h with line count + 1-line role>
@@ -219,11 +199,11 @@ can be split into multiple subtasks by function group (e.g. "translate
 LZ4_compress_default and its callees" vs "translate LZ4_compress_HC and its
 callees"), as long as each subtask has well-defined inputs and outputs.
 
-Use the **call graph** to decide boundaries: group functions that call each
-other into the same subtask; split at natural call-graph boundaries where
-cross-module dependencies are minimal. Functions in different C files that
-call each other can still belong to the same subtask if that reduces
-cross-subtask coordination.
+To choose the function groups, use the **call groups** in the scout reports: sets of functions
+that call each other. Keep a
+call group in one subtask when it fits the two constraints above, also when its functions are in
+different C files. When a call group is too large, split it where few calls cross the cut, and
+give the subtasks on both sides the signatures of the functions at the cut.
 
 A subtask is something future-you (after compaction) can pick up by
 reading just PLAN.md plus the listed C files/functions.
@@ -249,8 +229,8 @@ point that is not part of the original library, plan to translate it early.
 2. **The `## Invariants` section is verbatim.** When you create PLAN.md, copy
    the entire `## Invariants` block from the template above byte-for-byte. Do
    not paraphrase, do not omit a rule, do not reorder. The other sections
-   (Self-assessment, Codebase summary, subtasks, Notes) you fill in based on
-   your analysis — but Invariants is fixed text. Reason: anything outside
+   (Self-assessment, Codebase summary, subtasks, Notes) you fill in from the
+   scout replies and your own analysis — but Invariants is fixed text. Reason: anything outside
    PLAN.md drifts after compaction; only PLAN.md content reliably comes back.
    Invariants must be byte-stable across the whole run.
 3. **Update the checkboxes and "Notes for future-me" IMMEDIATELY after any
@@ -296,8 +276,8 @@ point that is not part of the original library, plan to translate it early.
    - Pre-inject dependencies into the sub-agent prompt. Before launching
      a sub-agent, think about what types, constants, or function signatures
      it will need from other modules. Either include the relevant type definitions directly in the
-     sub-agent's prompt, or instruct it to search with specific `grep` commands
-     rather than reading entire files. Every sub-agent that independently reads
+     sub-agent's prompt, or give it the section of `scout/REPORT_<n>.md` that it needs, or instruct
+     it to search with specific `grep` commands rather than reading entire files. Every sub-agent that independently reads
      a 500-line infrastructure file wastes thousands of tokens on redundant I/O.
 
    Rule of thumb: if a subtask would require reading more than ~200 lines
@@ -326,26 +306,24 @@ than to be compacted mid-write or hit the output cap mid-file.
 
 ## Step 1: Analyze BEFORE writing any code
 
-You have already done your reconnaissance in Step 0. Now, **for the subtask you
-are about to start** (or for the whole project if you decided you are in the
-Small regime):
+The scouts explored the project in Step 0. Their reports are in `scout/`. Now, **for the subtask
+you are about to start**:
 
 1. Read only the C files this subtask actually needs. For headers, prefer
    reading just the public-API portion (e.g. `head -100 c_src/foo.h`) unless
    you need the macros below.
-2. Read `c_src/CMakeLists.txt` to understand source file selection and
-   build-time configurability (cache variables, options, conditional
-   compilation). If your subtask only touches a small slice, scoped grep
-   (`grep -n 'option(' c_src/CMakeLists.txt`) is often enough.
+2. Source file selection and build-time configurability (cache variables,
+   options, conditional compilation) are in the scout reports. Check a detail
+   with a scoped grep (`grep -n 'option(' c_src/CMakeLists.txt`).
 3. Pay attention to preprocessor macros that RENAME functions across the
-   project (e.g. `#define foo NAMESPACE(foo)`). These affect the linker symbol
-   you will emit in Rust.
+   project (e.g. `#define foo NAMESPACE(foo)`). The scout reports list them.
+   These affect the linker symbol you will emit in Rust.
 4. Determine the project type (record this in `PLAN.md` if not already there):
    - Has `main()` → needs `[[bin]]` with `name = "driver"`
    - Exports library functions → needs `[lib]` with `crate-type = ["cdylib"]`
    - Both → include both `[lib]` and `[[bin]]` sections
 5. Identify ALL backends/variants if the project has build-time configurability
-   (this is project-wide; do it once, in Step 0).
+   (this is project-wide; the scout reports list them).
 
 ## Step 2: Plan the translation
 
@@ -355,11 +333,11 @@ features. Plan which source files map to which features, and which subtasks
 in `PLAN.md` will own each feature gate, before writing code.
 
 The exact naming contract for those features lives in the `## Invariants`
-section of your `PLAN.md` template above (and, after Step 0.4, in `PLAN.md`
+section of your `PLAN.md` template above (and, after Step 0.3, in `PLAN.md`
 itself). Do not restate the rule from memory — re-read it from PLAN.md
 whenever you touch `[features]` in Cargo.toml.
 
-For large projects, break the work into phases: shared/core code first, then
+Break the work into phases: shared/core code first, then
 each backend or variant, then wire up feature gates. These phases should
 already be the subtasks in your `PLAN.md` — do not re-plan here, just execute
 the next unchecked subtask.

@@ -116,7 +116,7 @@ pub struct StageManifest {
     pub model: Option<String>,
 
     /// How the most recent run produced the crate: an agentic prompt mode
-    /// ("plan", "no_plan", "no_plan_file", "workflow") or, for the non-agentic
+    /// ("plan", "no_plan", "workflow") or, for the non-agentic
     /// translators, which one ran ("modular", "one_shot").
     pub prompt_mode: String,
 

@@ -104,10 +104,6 @@ pub struct Config {
     #[serde(default)]
     pub stage_input: Option<PathBuf>,
 
-    /// If true, provide the agent with pre-built analysis tools (c_sandbox, symbol_diff).
-    #[serde(default)]
-    pub agent_tools: bool,
-
     /// Which external agent to use for agentic translation (requires `agentic = true`).
     #[serde(default)]
     pub agentic_agent: AgentKind,
@@ -138,7 +134,6 @@ impl Config {
             modular: false,
             stages: Vec::new(),
             stage_input: None,
-            agent_tools: false,
             agentic_agent: AgentKind::default(),
             log_filter: "off".to_owned(),
             tools: Default::default(),

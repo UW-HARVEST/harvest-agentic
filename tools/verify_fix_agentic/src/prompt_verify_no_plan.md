@@ -52,9 +52,9 @@ on any single step.
 
 {RUST_TOOLCHAIN_CONTEXT}
 
-{WORKDIR_BOUNDARY}
+{AGENT_BUG_WORKAROUNDS}
 
-{AGENT_TOOLS_SECTION}
+{WORKDIR_BOUNDARY}
 
 ## Static Analysis Tool Wishlist
 

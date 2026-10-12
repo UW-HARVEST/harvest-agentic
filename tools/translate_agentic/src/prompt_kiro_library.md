@@ -24,8 +24,6 @@ Do NOT modify anything in c_src/.
 
 {RUST_TOOLCHAIN_CONTEXT}
 
-{AGENT_TOOLS_SECTION}
-
 ## Static Analysis Tool Wishlist
 
 As you work through this translation, pay attention to moments where you think:

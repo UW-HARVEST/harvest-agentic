@@ -1,0 +1,142 @@
+"""translate: write a Rust file for named arrays, with values from the debug binary."""
+import json
+import os
+import re
+import sys
+
+from . import VERSION, die, findings, gdbrun, records
+from .emit import Emitter, TranslateError, upper_snake
+from .rustcheck import check_rust
+
+
+def classified(a):
+    """(records to translate, refused [(key, message)]). The class comes from the same rules as detect."""
+    src = findings.Source(a.src)
+    dumped = records.dump(a.binary, [gdbrun.parse_key(k) for k in a.symbol])
+    recs = [r for r in dumped if 'error' not in r]
+    if recs:
+        src.check_paths([f for r in recs for f in [r['file']] + r['units']], a.binary)
+    src.attach(recs)
+    cand = {id(r): c for c in src.cands for r in c['recs']}
+    ok, refused = [], []
+    for r in dumped:
+        if 'error' in r:
+            choices = f'. Choices: {", ".join(r["choices"])}' if r.get('choices') else ''
+            dead = ' (not in this binary: DEAD, or a wrong key)' if not r.get('choices') else ''
+            refused.append((r['key'], r['error'] + dead + choices))
+            continue
+        c = cand.get(id(r))
+        f = findings.finding(src, c, r, recs, None)  # the row of detect
+        r.update(cls=f['cls'], reasons=f['reasons'], notes=f['notes'], facts=c['facts'] if c else None)
+        if r['cls'] == 'TAINTED':
+            refused.append((r['key'], 'TAINTED: ' + '; '.join(x['text'] for x in r['reasons'])))
+        else:
+            ok.append(r)
+    return ok, refused
+
+
+def print_refused(refused):
+    for k, msg in refused:
+        print(f'  REFUSED {k}: {msg}')
+    if any(msg.startswith('TAINTED') for _, msg in refused):
+        print('          A TAINTED array is in the build. Translate it by hand. Your translation must have it.')
+
+
+def prefix_collisions(recs):
+    """Two arrays of one command with the same default Rust name (for example the same C name in two
+    files) get the name of their C file in front. A name from the spec or --name stays."""
+    count = {}
+    for r in recs:
+        count[r['rust_name']] = count.get(r['rust_name'], 0) + 1
+    changed = []
+    for r in recs:
+        if count[r['rust_name']] > 1 and not r['opts']['name']:
+            stem = os.path.splitext(os.path.basename(r['file'] or ''))[0]
+            r['rust_name'] = upper_snake(stem) + '_' + r['rust_name']
+            changed.append(r['rust_name'])
+    return changed
+
+
+def load_spec(path):
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        die(f'cannot read spec {path}: {e}')
+
+
+def run(a):
+    spec = load_spec(a.spec)
+    names = dict(n.split('=', 1) for n in a.name or [])
+    notes = []
+    ok, refused = classified(a)
+    try:
+        em = Emitter(spec, notes)
+    except TranslateError as e:
+        die(str(e))
+    for r in ok:
+        opts = dict(spec.get('defaults', {}))
+        for k in (r['name'], r['key']):
+            opts.update(spec.get('symbols', {}).get(k, {}))
+        opts['name'] = names.get(r['key'], names.get(r['name'], opts.get('name')))
+        r['rust_name'] = opts['name'] or upper_snake((r['func'] + '_' if r['func'] else '') + r['name'])
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', r['rust_name']):
+            die(f'bad Rust name "{r["rust_name"]}" for {r["key"]}')
+        r['opts'] = opts
+    prefixed = prefix_collisions(ok)
+    if prefixed:
+        notes.append('equal default Rust names: the file name is added in front: ' + ', '.join(prefixed))
+    for r in ok:
+        em.batch[r['name']] = (r['rust_name'], r['desc'])
+    for r in ok:  # the type of each pointer target, for &TABLE[i]
+        stack = [r['value']]
+        while stack:
+            v = stack.pop()
+            if isinstance(v, list):
+                stack += v
+            elif isinstance(v, dict) and 'sym' in v:
+                v['target'] = r['targets'].get(v['sym'])
+    items = []
+    for r in ok:
+        radix = r['opts'].get('radix', 'auto')
+        if radix == 'auto':
+            radix = 'hex' if r['facts'] and r['facts']['hex'] > r['facts']['dec'] else 'dec'
+        try:
+            r['rust_type'], text = em.item(r, r['rust_name'], r['opts'], radix)
+            r['preview'] = em.preview(r, r['rust_name'], radix)
+        except TranslateError as e:
+            refused.append((r['key'], str(e)))
+            continue
+        head = f'// {r["key"]}: C `{r["ctype"]}` at {os.path.basename(r["file"] or "?")}:{r["line"]}, {r["leaves"]} values.\n'
+        head += ''.join(f'// NOTE: {x["text"]}\n' for x in r['notes'])
+        items.append((r, head + text))
+    notes += [f'spec "structs" key "{k}": no array of this command has this struct. This is not an error if '
+              'the spec file is also for other commands.' for k in em.unused_structs()]
+    if not items:
+        print_refused(refused)
+        die('nothing translated')
+    keys = ' '.join(f'--symbol {r["key"]}' for r, _ in items)
+    text = (f'// Generated by tab2rust {VERSION} from the debug binary {os.path.basename(a.binary)}.'
+            ' Do not edit by hand.\n// Values are the compiled C values for this build configuration.\n'
+            f'// Regenerate: tab2rust.py translate --src <src> --binary <bin> {keys}\n\n'
+            + em.definitions() + '\n'.join(t for _, t in items))
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with open(a.out, 'w') as f:
+        f.write(text)
+    print(f'wrote {a.out} ({len(text)} bytes)')
+    for r, _ in items:
+        print(f'  OK      {r["key"]} -> {r["rust_name"]}: {r["rust_type"]} ({r["leaves"]} values, C {r["ctype"]})')
+        print(f'          = {r["preview"]}')
+        if r['notes']:
+            print('          notes: ' + '; '.join(x['text'] for x in r['notes']))
+    for name, d in em.defs.items():
+        if d:
+            print(f'  STRUCT  {name} (defined in the output file)')
+    print_refused(refused)
+    for n in dict.fromkeys(notes):
+        print(f'  NOTE    {n}')
+    good = a.no_check or check_rust(a.out)
+    if refused or not good:
+        sys.exit(1)

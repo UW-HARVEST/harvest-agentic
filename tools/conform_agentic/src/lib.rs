@@ -48,9 +48,6 @@ const CONFORM_REPORT: &str = "CONFORM_REPORT.md";
 /// Tool-specific configuration, read from `[tools.conform_agentic]`.
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    /// Override path for the conform prompt.
-    pub prompt_conform: Option<PathBuf>,
-
     /// Agent timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -171,11 +168,7 @@ impl Tool for ConformAgentic {
             }
             _ => String::new(),
         };
-        let prompt_template = match &config.prompt_conform {
-            Some(path) => fs::read_to_string(path)?,
-            None => PROMPT_CONFORM.to_owned(),
-        };
-        let prompt = prompt_template
+        let prompt = PROMPT_CONFORM
             .replace(
                 "{AGENT_BUG_WORKAROUNDS}",
                 agent_runner::agent_bug_workarounds(agent),
@@ -204,7 +197,6 @@ impl Tool for ConformAgentic {
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             no_plan: false,
-            no_plan_file: false,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: Some(&rust_toolchain_context.required_version),

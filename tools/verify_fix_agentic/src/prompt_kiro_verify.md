@@ -70,8 +70,6 @@ on any single step.
 
 {RUST_TOOLCHAIN_CONTEXT}
 
-{AGENT_TOOLS_SECTION}
-
 ## Static Analysis Tool Wishlist
 
 As you work through verification and fixing, pay attention to moments where you think:

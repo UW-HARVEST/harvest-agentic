@@ -88,7 +88,6 @@ pub struct AgentInvocation<'a> {
     pub timeout_secs: u64,
     pub model: Option<&'a str>,
     pub no_plan: bool,
-    pub no_plan_file: bool,
     pub extra_env: &'a HashMap<String, String>,
     pub output_log_path: Option<&'a Path>,
     pub rust_toolchain: Option<&'a str>,
@@ -96,12 +95,11 @@ pub struct AgentInvocation<'a> {
 
 impl AgentInvocation<'_> {
     /// Whether the prompt instructs the agent to maintain persistent plan
-    /// files (PLAN.md / HYPOTHESES.md). Both `no_plan` (no plan, no sub-agent
-    /// push) and `no_plan_file` (sub-agent push kept, plan files never
-    /// mentioned) drop that instruction, so the per-turn "read PLAN.md after
-    /// compaction" system prompt must not be injected in either mode.
+    /// files (PLAN.md / HYPOTHESES.md). `no_plan` (no plan, no sub-agent push)
+    /// drops that instruction, so the per-turn "read PLAN.md after compaction"
+    /// system prompt must not be injected then.
     fn plan_files_enabled(&self) -> bool {
-        !self.no_plan && !self.no_plan_file
+        !self.no_plan
     }
 }
 
@@ -643,11 +641,10 @@ fn invoke_claude(
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let use_ccr = claude_uses_ccr(invocation.model);
     info!(
-        "Invoking Claude Code {} agent (model={}, no_plan={}, no_plan_file={}, timeout={}s, ccr={}, extra_env={} vars)",
+        "Invoking Claude Code {} agent (model={}, no_plan={}, timeout={}s, ccr={}, extra_env={} vars)",
         invocation.phase.label(),
         invocation.model.unwrap_or("(cli default)"),
         invocation.no_plan,
-        invocation.no_plan_file,
         invocation.timeout_secs,
         use_ccr,
         invocation.extra_env.len()

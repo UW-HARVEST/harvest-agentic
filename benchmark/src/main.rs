@@ -89,7 +89,6 @@ pub fn translate_c_directory_to_rust_project(
     stages: &[Stage],
     stage_input: Option<&Path>,
     agentic_agent: Option<AgentKind>,
-    agent_tools: bool,
 ) -> TranspilationResult {
     let args: Arc<harvest_translate::cli::Args> = harvest_translate::cli::Args {
         input: Some(input_dir.to_path_buf()),
@@ -101,7 +100,6 @@ pub fn translate_c_directory_to_rust_project(
         agentic: (!stages.is_empty()).then(|| stages.to_vec()),
         stage_input: stage_input.map(Path::to_path_buf),
         agentic_agent,
-        agent_tools,
     }
     .into();
     let mut config = harvest_translate::cli::initialize(args).expect("Failed to generate config");
@@ -145,13 +143,12 @@ pub struct RunOptions {
     /// Agentic stages of this run, in pipeline order. Empty = non-agentic.
     pub stages: Vec<Stage>,
     pub agent: Option<AgentKind>,
-    pub agent_tools: bool,
     pub model: Option<String>,
     pub no_plan: bool,
-    pub no_plan_file: bool,
     pub workflow: bool,
     pub test_harness: TestHarness,
     pub verify_harness: crate::cli::VerifyHarness,
+    pub no_tab2rust: bool,
     pub no_fuzz: bool,
     pub force: bool,
 }
@@ -171,8 +168,6 @@ impl RunOptions {
             "workflow"
         } else if self.no_plan {
             "no_plan"
-        } else if self.no_plan_file {
-            "no_plan_file"
         } else {
             "plan"
         }
@@ -617,9 +612,6 @@ fn benchmark_single_program(
         if opts.no_plan {
             overrides.push(format!("tools.{tool}.no_plan=true"));
         }
-        if opts.no_plan_file {
-            overrides.push(format!("tools.{tool}.no_plan_file=true"));
-        }
         if opts.workflow {
             overrides.push(format!("tools.{tool}.workflow=true"));
         }
@@ -635,6 +627,9 @@ fn benchmark_single_program(
             "tools.translate_agentic.plan_output_path={}",
             plan_translate_path.display()
         ));
+        if opts.no_tab2rust {
+            effective_overrides.push("tools.translate_agentic.tab2rust=false".to_owned());
+        }
     }
     if opts.has(Stage::Verify) {
         stage_overrides(
@@ -676,7 +671,6 @@ fn benchmark_single_program(
         &opts.stages,
         stage_input,
         opts.agent,
-        opts.agent_tools,
     );
 
     result.translation_success = translation_result.translation_success;
@@ -1301,13 +1295,12 @@ fn run(args: Args) -> HarvestResult<()> {
         modular: args.modular,
         stages,
         agent: args.agent,
-        agent_tools: args.agent_tools,
         model: args.model.clone(),
         no_plan: args.no_plan,
-        no_plan_file: args.no_plan_file,
         workflow: args.workflow,
         test_harness: args.test_harness,
         verify_harness: args.verify_harness.unwrap_or_default(),
+        no_tab2rust: args.no_tab2rust,
         no_fuzz: args.no_fuzz,
         force: args.force,
     };
