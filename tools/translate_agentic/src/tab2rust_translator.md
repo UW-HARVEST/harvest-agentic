@@ -1,7 +1,8 @@
 # Data tables in your subtask
 
 Your subtask owns C data tables. Use the tab2rust skill in `{WORK_DIR}/agent_skills/tab2rust/`.
-Obey the "Rules" section of its `SKILL.md`. Paths that start with `scout/` are under `{WORK_DIR}`.
+In its `SKILL.md`, obey the "Array classes" section and steps 4 to 9 of the "Recommended workflow".
+Paths that start with `scout/` are under `{WORK_DIR}`.
 
 1. Scout 1 already made the debug build and ran `detect`. Thus, skip steps 1 to 3 of the workflow in
    `SKILL.md`. The notes that your task names (in `scout/tab2rust/files/`) list your tables and give
