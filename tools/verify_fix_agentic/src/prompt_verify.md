@@ -2,7 +2,7 @@
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
-- `c_src/` contains the original C source code
+- `inputs/c_src` contains the original C source code
 - `src/` contains the Rust translation
 
 The concrete mechanism you use to compare C against Rust — how you build each
@@ -54,7 +54,7 @@ These rules govern verification. They must survive every compaction unchanged.
 
 {RUST_TOOLCHAIN_CONTEXT}
 
-{WORKDIR_BOUNDARY}
+{CASE_LAYOUT}
 
 ### AFTER ANY COMPACTION: read `PLAN.md` and `HYPOTHESES.md` is your first action before anything.
 
@@ -75,7 +75,7 @@ These rules govern verification. They must survive every compaction unchanged.
   Hyphens cause manifest parse failure. Fix Cargo.toml if you see them.
 
 ### Boundaries
-- Do NOT modify anything in `c_src/`.
+- Do NOT modify anything in `inputs/c_src`.
 
 ### Configuration coverage
 - Every configuration listed under "Configurations to verify" in this task
@@ -191,7 +191,7 @@ turn looks like a summary rather than concrete work. In that case:
 Before you write any test, produce four files in the working directory.
 Together they are the test plan: tests cover their rows, and the completion
 gate checks them. Build the C reference and the Rust `.so` first. Generate
-each file with a separate sub-agent. Each sub-agent reads `c_src/` and the
+each file with a separate sub-agent. Each sub-agent reads `inputs/c_src` and the
 built artifacts, writes exactly one file, and gets the working-directory
 boundary rules from the Invariants section.
 
@@ -209,7 +209,7 @@ parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
    missing symbol to empty the diff. A stub that claims behavior is worse
    than a missing symbol.
 2. `CONDITIONALS.md`: the conditional-compilation surface. Collect every
-   macro that `#if`, `#else` and other variants reference in `c_src/`, deduplicated. Skip
+   macro that `#if`, `#else` and other variants reference in `inputs/c_src`, deduplicated. Skip
    macros used only in system headers. Classify each macro:
    - feature: the user sets it at build time, with `-D` or a CMake option.
    - sys: the environment fixes it. A direct flag comes from the toolchain
@@ -281,7 +281,7 @@ from reading alone is not evidence.
 
 {VERIFICATION_METHOD}
 
-All operational rules (the c_src boundary, per-configuration re-verification,
+All operational rules (the read-only inputs, per-configuration re-verification,
 the 600-second timeout cap) live in the `## Invariants` section of your
 `HYPOTHESES.md` template above. Re-read them from `HYPOTHESES.md` whenever you
 are unsure — do not work from memory of this prompt.
@@ -308,7 +308,7 @@ As you work through verification and fixing, pay attention to moments where you 
 - "If I had a tool that could do Y, I would have much higher confidence in this fix."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:

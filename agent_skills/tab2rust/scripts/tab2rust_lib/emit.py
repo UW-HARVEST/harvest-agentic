@@ -12,10 +12,14 @@ INT_BITS = {'u8': (8, False), 'i8': (8, True), 'u16': (16, False), 'i16': (16, T
             'core::ffi::c_int': (32, True), 'core::ffi::c_uint': (32, False), 'core::ffi::c_long': (64, True),
             'core::ffi::c_ulong': (64, False), 'core::ffi::c_short': (16, True), 'core::ffi::c_ushort': (16, False),
             'core::ffi::c_uchar': (8, False), 'core::ffi::c_schar': (8, True)}
-RUST_KEYWORDS = {'as', 'break', 'const', 'continue', 'crate', 'else', 'enum', 'extern', 'fn', 'for', 'if', 'impl',
-                 'in', 'let', 'loop', 'match', 'mod', 'move', 'mut', 'pub', 'ref', 'return', 'self', 'Self',
-                 'static', 'struct', 'super', 'trait', 'type', 'unsafe', 'use', 'where', 'while', 'async',
-                 'await', 'dyn', 'gen'}
+# Strict and reserved keywords (Rust 2024): a field or constant with such a name gets the r# prefix.
+RUST_KEYWORDS = {'as', 'async', 'await', 'break', 'const', 'continue', 'dyn', 'else', 'enum', 'extern', 'false', 'fn',
+                 'for', 'gen', 'if', 'impl', 'in', 'let', 'loop', 'match', 'mod', 'move', 'mut', 'pub', 'ref',
+                 'return', 'static', 'struct', 'trait', 'true', 'type', 'unsafe', 'use', 'where', 'while',
+                 'abstract', 'become', 'box', 'do', 'final', 'macro', 'override', 'priv', 'try', 'typeof', 'unsized',
+                 'virtual', 'yield'}
+# Names that cannot be raw identifiers: they get a "_" suffix.
+NOT_RAW = {'crate', 'self', 'Self', 'super', '_'}
 STRING_TYPES = {'cstr': "&'static core::ffi::CStr", 'bytes': "&'static [u8]", 'bytes_nul': "&'static [u8]",
                 'str': "&'static str"}
 SCALARS = ('int', 'float', 'bool', 'enum')
@@ -35,6 +39,8 @@ def is_char(d):
 
 
 def field_ident(name):
+    if name in NOT_RAW:
+        return name + '_'
     return 'r#' + name if name in RUST_KEYWORDS else name
 
 
@@ -118,7 +124,7 @@ def shorten(text, width):
 def struct_row_name(d, ctx):
     """Default Rust name of a C struct type: its C name, or '<array>_row' for an anonymous struct
     ('<struct>_<field>_row' for an anonymous struct in a field)."""
-    return d['names'][0] if d['names'] else re.sub(r'\W', '_', ctx.split('[')[0]).lower() + '_row'
+    return field_ident(d['names'][0]) if d['names'] else re.sub(r'\W', '_', ctx.split('[')[0]).lower() + '_row'
 
 
 def index_path(td, off, to):
@@ -229,6 +235,8 @@ class Emitter:
         return self.scalar(d)
 
     def pointee_type(self, t, ctx):
+        if is_char(t) and self.char_arrays == 'bytes' and not self._spec(self.types, t):
+            return 'u8'  # a char pointer into a char array: the array is a byte string ([u8; N])
         if t['kind'] in SCALARS:
             return self.scalar(t)
         if t['kind'] == 'array':
@@ -238,7 +246,7 @@ class Emitter:
             if s.get('rust'):
                 return s['rust']
             if t['names']:
-                return t['names'][0]
+                return field_ident(t['names'][0])
             raise TranslateError('pointer to an anonymous struct is not supported')
         raise TranslateError(f'pointer to {t["kind"]} is not supported')
 
@@ -253,9 +261,13 @@ class Emitter:
             self.notes += [f'spec "fields" of struct {local}: "{k}" is not a field of the C struct'
                            f' (fields: {", ".join(c_fields)})' for k in s.get('fields', {}) if k not in c_fields]
         if s.get('define', not s.get('rust')) and local not in self.defs:
-            self.defs[local] = None
-            fields = [f'    pub {field_name(s, f["name"])}: {self.rtype(f["type"], local + "." + f["name"])},'
-                      for f in d['fields']]
+            self.defs[local] = None  # a pointer field to this struct does not define it again
+            try:
+                fields = [f'    pub {field_name(s, f["name"])}: {self.rtype(f["type"], local + "." + f["name"])},'
+                          for f in d['fields']]
+            except TranslateError:
+                del self.defs[local]  # each array of this struct gets the refusal, not a missing definition
+                raise
             self.defs[local] = ('#[repr(C)]\n#[derive(Clone, Copy, Debug, PartialEq)]\n'
                                 '#[allow(non_camel_case_types, non_snake_case, dead_code)]\n'
                                 f'pub struct {local} {{\n' + '\n'.join(fields) + '\n}\n')
@@ -290,7 +302,21 @@ class Emitter:
         idx = index_path(td, off, to) if td else ([] if off == 0 else None)
         if idx is None:
             raise TranslateError(f'pointer to {sym}+{off} does not point at a whole element of {sym}')
+        if td and to['kind'] in SCALARS:
+            want, have = self.pointee_type(to, ''), self.element_type(td, idx)
+            if have != want:
+                raise TranslateError(f'pointer to {sym}+{off}: the pointer is to {want}, the element of {sym} is {have}'
+                                     ' (a cast in C). Translate this table by hand.')
         return f'&{path}' + ''.join(f'[{i}]' for i in idx)
+
+    def element_type(self, td, idx):
+        """Rust type of the scalar element td[idx...] as the emitter writes it (a char of a byte string is u8)."""
+        parent, d = None, td
+        for _ in idx:
+            parent, d = d, d['of']
+        if parent is not None and self.is_text(parent):
+            return 'u8'
+        return self.scalar(d) if d['kind'] in SCALARS else None
 
     def value(self, d, v, ctx, radix, indent, per_line, brief=False):
         """Rust text of value v of type d. brief (for the command output): one line. An array of numbers,
@@ -350,13 +376,17 @@ class Emitter:
         element is complete. Only arrays inside it are short."""
         return self.value(rec['desc'], rec['value'], rust_name, radix, 0, 0, True)
 
-    def item(self, rec, rust_name, opts, radix):
-        """Rust type and complete Rust item (attributes, declaration, value) for one array."""
+    def scan(self, rec, rust_name):
+        """Collect the facts of one array that the shared struct definitions need. Call it for all
+        arrays of the batch before the first item(): arrays of one struct type share one definition."""
         ctx, d = rust_name, rec['desc']
         while d['kind'] == 'array':
             ctx, d = ctx + '[]', d['of']
         self.row_keys[ctx] = [rec['key'] + '[]', rec['name'] + '[]']
         self.find_nullable(rec['desc'], rec['value'], rust_name)
+
+    def item(self, rec, rust_name, opts, radix):
+        """Rust type and complete Rust item (attributes, declaration, value) for one array."""
         rt = self.rtype(rec['desc'], rust_name)
         body = self.value(rec['desc'], rec['value'], rust_name, radix, 0, opts.get('per_line', 0))
         kind = opts.get('kind', 'static')

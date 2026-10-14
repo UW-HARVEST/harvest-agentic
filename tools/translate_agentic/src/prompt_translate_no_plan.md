@@ -1,13 +1,13 @@
 <!-- markdownlint-disable MD041 -->
-Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
-Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
+Translate the C code in inputs/c_src to Rust that produces **byte-identical output** for the same inputs.
+Write Cargo.toml and src/ files in the current directory (NOT in inputs/c_src).
 
 {WORKFLOW_HINT}
 **CRITICAL CONSTRAINT: Pure Rust Translation Only**
 
 You MUST faithfully translate ALL C source files to **pure Rust**. Do NOT use
 the `cc` crate (or any equivalent) in `build.rs` to compile or link the original
-C source code. The C source files in `c_src/` will NOT exist in the final test
+C source code. The C source files in `inputs/c_src` will NOT exist in the final test
 environment — the only code available at test time is the Rust you write. Any
 `extern "C"` FFI declarations must resolve to Rust implementations you provide,
 not to compiled C object files.
@@ -20,7 +20,7 @@ not crates that compile the library you are meant to translate.
 
 A `build.rs` is allowed for legitimate build-time needs (code generation,
 feature detection, etc.), but it must NOT reference, compile, or link any
-file under `c_src/`.
+file under `inputs/c_src`.
 
 If the codebase is large, you must still translate all of it. No stubs, no
 placeholders, no shortcuts. Never refuse or abort a translation because the codebase seems too big.
@@ -28,7 +28,7 @@ placeholders, no shortcuts. Never refuse or abort a translation because the code
 ## Step 1: Analyze BEFORE writing any code
 
 Before writing a single line of Rust, you MUST:
-1. Read `c_src/CMakeLists.txt` to understand the build system, source file selection,
+1. Read `inputs/c_src/CMakeLists.txt` to understand the build system, source file selection,
    and any build-time configurability (cache variables, options, conditional compilation)
 2. Read all header files to understand the public API, preprocessor macros, and
    namespace/symbol renaming patterns
@@ -77,7 +77,7 @@ Run `cargo build --release` and fix any errors until it compiles.
 If the project has Cargo features, verify ALL feature combinations compile:
 run `cargo build --release --features <feature>` for each one.
 
-Do NOT modify anything in c_src/.
+Do NOT modify anything in inputs/c_src.
 
 {MODEL_LIMITS}
 
@@ -85,7 +85,7 @@ Do NOT modify anything in c_src/.
 
 {AGENT_BUG_WORKAROUNDS}
 
-{WORKDIR_BOUNDARY}
+{CASE_LAYOUT}
 
 ## Static Analysis Tool Wishlist
 
@@ -94,7 +94,7 @@ As you work through this translation, pay attention to moments where you think:
 - "If I had a tool that could do Y, I would have much higher confidence in this translation step."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:

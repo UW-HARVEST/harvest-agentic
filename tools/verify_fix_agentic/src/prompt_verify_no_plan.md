@@ -3,16 +3,16 @@
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
-- `c_src/` contains the original C source code
+- `inputs/c_src` contains the original C source code
 - `src/` contains the Rust translation
-- The C code can be compiled as a shared library. Look at c_src/CMakeLists.txt
+- The C code can be compiled as a shared library. Look at inputs/c_src/CMakeLists.txt
   to understand the build system. Build it with:
   ```
-  cd c_src && mkdir -p build && cd build && \
-  cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
-  cmake --build .
+  cmake -S inputs/c_src -B scratch/c-build \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
+  cmake --build scratch/c-build
   ```
-- Find the resulting .so files in the build output
+- Find the resulting .so files in scratch/c-build
 
 Your task:
 1. Build the C code as a shared library
@@ -34,7 +34,7 @@ Your task:
    the Rust .so must export it — no exceptions. Add missing exports.
 
 Add `libloading = "0.8"` to [dev-dependencies] in Cargo.toml.
-Do NOT modify anything in c_src/.
+Do NOT modify anything in inputs/c_src.
 
 If configurations are listed below, you MUST verify each one:
 - Clean and rebuild C with the listed cmake flags
@@ -54,7 +54,7 @@ on any single step.
 
 {AGENT_BUG_WORKAROUNDS}
 
-{WORKDIR_BOUNDARY}
+{CASE_LAYOUT}
 
 ## Static Analysis Tool Wishlist
 
@@ -63,7 +63,7 @@ As you work through verification and fixing, pay attention to moments where you 
 - "If I had a tool that could do Y, I would have much higher confidence in this fix."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:

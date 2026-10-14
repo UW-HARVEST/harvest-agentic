@@ -32,20 +32,23 @@ include(GoogleTest)
 # C reference under test, compiled INTO the test binary. The translated Rust
 # is a black box loaded via dlopen at run time (see rust_lib.h) — never linked
 # here, so the two sides' same-named exports do not collide.
+# The C source: inputs/c_src of the checkout. To build elsewhere, pass
+# -DHARVEST_C_SRC=<directory> (for example a snapshot's .harvest/c_src).
+set(HARVEST_C_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../inputs/c_src" CACHE PATH "C source directory")
 file(GLOB C_UNDER_TEST_SOURCES CONFIGURE_DEPENDS
-     "${CMAKE_CURRENT_SOURCE_DIR}/../c_src/src/*.c")
+     "${HARVEST_C_SRC}/src/*.c")
 add_library(c_under_test STATIC ${C_UNDER_TEST_SOURCES})
 target_include_directories(c_under_test PUBLIC
-     "${CMAKE_CURRENT_SOURCE_DIR}/../c_src/include")
-# Project-specific C build flags, pre-filled from c_src/CMakeLists.txt where it
+     "${HARVEST_C_SRC}/include")
+# Project-specific C build flags, pre-filled from the C CMakeLists.txt where it
 # could be parsed. If the C reference needs more (or these are wrong), check
-# c_src/CMakeLists.txt `target_compile_definitions` and edit this line.
+# ${HARVEST_C_SRC}/CMakeLists.txt `target_compile_definitions` and edit this line.
 target_compile_definitions(c_under_test PRIVATE {C_COMPILE_DEFS})
 target_compile_options(c_under_test PRIVATE -w)
 
 add_executable(verification_tests verification_tests.cc)
 target_include_directories(verification_tests PRIVATE
-     "${CMAKE_CURRENT_SOURCE_DIR}/../c_src/include")
+     "${HARVEST_C_SRC}/include")
 target_link_libraries(verification_tests PRIVATE c_under_test ${CMAKE_DL_LIBS})
 {TEST_LINK}
 gtest_discover_tests(verification_tests)

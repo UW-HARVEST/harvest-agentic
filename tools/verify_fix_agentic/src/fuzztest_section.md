@@ -145,7 +145,7 @@ misbuilt C reference is especially damaging here: it will happily "find" a flood
 of failing inputs that are really the oracle's fault, not the translation's.
 Before starting a campaign, make sure the C side is compiled correctly (see the
 compile-definitions check in Step 3) — the instrumented, statically linked C in
-`c_under_test` must match how `c_src` is actually built.
+`c_under_test` must match how `inputs/c_src` is actually built.
 
 Crash handling: fuzzing runs in-process, so a segfault or abort on either side
 ends the run. Treat the cases distinctly — if the **C reference** itself crashes

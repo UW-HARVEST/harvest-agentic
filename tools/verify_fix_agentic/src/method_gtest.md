@@ -9,7 +9,7 @@ compares the observable result with GoogleTest assertions.
 `verify_env/` already handles the infrastructure so you can focus on the API
 behavior:
 
-- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `c_src/` into the test
+- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `inputs/c_src` into the test
   binary, links everything, and registers the tests. You normally do not edit it.
 - `verification_tests.cc` — the test file you write and extend.
 - `harvest_diff.h` — helpers for differential comparison: `FilledBuffer` (0xA5
@@ -64,14 +64,14 @@ Then do the actual verification:
    `verify_env/run_tests.sh`.
 
    Before you trust any comparison, confirm the C reference is built correctly:
-   the CMakeLists compiled `c_src/` into the test binary with compile
-   definitions best-effort extracted from `c_src/CMakeLists.txt`, but that parse
+   the CMakeLists compiled `inputs/c_src` into the test binary with compile
+   definitions best-effort extracted from `inputs/c_src/CMakeLists.txt`, but that parse
    can miss flags (namespace macros like `XXH_NAMESPACE=...`, behavior switches,
    defs added via `add_definitions`/subdirectories). The C reference is your
    ground truth — if it is misbuilt, every "mismatch" is a false one and you
    will waste effort changing correct Rust. Cross-check the
    `target_compile_definitions(c_under_test ...)` line in `verify_env/CMakeLists.txt`
-   against how `c_src` is actually built and fix it if it differs. Tell-tale
+   against how `inputs/c_src` is actually built and fix it if it differs. Tell-tale
    symptoms of a misbuilt oracle: a symbol you expect is missing, or every test
    fails together in lock-step.
 2. Write GoogleTest cases in `verify_env/verification_tests.cc` that call both the

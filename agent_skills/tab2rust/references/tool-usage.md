@@ -293,7 +293,7 @@ forms for an anonymous struct, because it has no C name.
 | `enums.CTYPE.variants` | object | C enumerator name to Rust variant name. Default: the C name. |
 | `pointers.CSYMBOL` | Rust path | Rust path of an array that is not in this command. |
 | `strings` | `cstr`, `bytes`, `bytes_nul`, `str` | Type of `char *` items: `&CStr` (default), `&[u8]` without or with the final NUL, or `&str`. With `str`, a string that is not UTF-8 stops the translation of its table with a message. |
-| `char_arrays` | `bytes`, `numbers` | `char` arrays as a byte string, or as numbers. |
+| `char_arrays` | `bytes`, `numbers` | `char` arrays as a byte string, or as numbers. With `bytes`, a `char *` that points into a `char` array is `&u8`. |
 
 ### Example: rename a struct and its fields
 

@@ -1,6 +1,6 @@
 <!-- markdownlint-disable MD041 -->
-Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
-Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
+Translate the C code in inputs/c_src to Rust that produces **byte-identical output** for the same inputs.
+Write Cargo.toml and src/ files in the current directory (NOT in inputs/c_src).
 
 ## Step 0: Know yourself and plan for context limits
 
@@ -36,13 +36,13 @@ Self-assessment:
 
 ### 0.2 Send scouts to explore the C code
 
-Scout sub-agents explore `c_src/` for you and propose the subtasks. Do not explore the C code
+Scout sub-agents explore `inputs/c_src` for you and propose the subtasks. Do not explore the C code
 yourself: your context is for the plan and the build.
 
 1. Measure the code. Do not read it:
 
    ```
-   find c_src/ -name '*.c' -o -name '*.h' | xargs wc -l
+   find inputs/c_src -name '*.c' -o -name '*.h' | xargs wc -l
    ```
 
 2. One scout can explore code of about 50% of its context window. Scouts use your model. If the
@@ -50,8 +50,8 @@ yourself: your context is for the plan and the build.
 3. Send all scouts in one message. Give each scout this prompt:
 
    ```
-   Read scout/SCOUT.md and do the task in it.
-   Scout <n> of <N>. File group: <directories or files of c_src/, or "all">.
+   Read inputs/prompts/SCOUT.md and do the task in it.
+   Scout <n> of <N>. File group: <directories or files of inputs/c_src, or "all">.
    Context window: <from 0.1>. Output token limit: <from 0.1>.
    ```
 
@@ -61,7 +61,7 @@ yourself: your context is for the plan and the build.
 ### 0.3 Write a persistent plan to `PLAN.md` BEFORE context fills up
 
 When the scouts reply, immediately create a file `PLAN.md` in the current directory (the Rust
-project root, NOT inside `c_src/`). This file is your **lifeline across compactions**:
+project root, NOT inside `inputs/c_src`). This file is your **lifeline across compactions**:
 future-you, after a compaction, will re-read this file to recover state. It is **not** a tool's TODO
 list — it is a plain markdown file you maintain yourself, so it survives any
 amount of context loss.
@@ -87,7 +87,7 @@ When in doubt, re-read this section.
 
 {RUST_TOOLCHAIN_CONTEXT}
 
-{WORKDIR_BOUNDARY}
+{CASE_LAYOUT}
 
 ### AFTER ANY COMPACTION: `cat PLAN.md` is your FIRST action before anything.
 
@@ -141,12 +141,12 @@ When in doubt, re-read this section.
 - Prefer safe Rust internally; do not relax the C ABI on exports.
 
 ### Boundaries
-- Do NOT modify anything in `c_src/`.
+- Do NOT modify anything in `inputs/c_src`.
 
 ### Translation fidelity
 - You MUST faithfully translate ALL C source files to **pure Rust**. Do NOT use
   the `cc` crate (or any equivalent) in `build.rs` to compile or link the
-  original C source code. The C source files in `c_src/` will NOT exist in
+  original C source code. The C source files in `inputs/c_src` will NOT exist in
   the final test environment — the only code available at test time is the
   Rust you write. Any attempt to wrap C via a compiled static archive or
   object file will fail at test time because the C files simply won't be
@@ -158,7 +158,7 @@ When in doubt, re-read this section.
   not crates that compile the library you are meant to translate.
 - A `build.rs` is allowed for legitimate build-time needs (code generation,
   feature detection, etc.), but it must NOT reference, compile, or link any
-  file under `c_src/`.
+  file under `inputs/c_src`.
 - No shortcuts: every function, every struct, every constant, every macro in
   the C source must become a corresponding Rust implementation. Stub
   functions that return 0 or a hardcoded value are NOT acceptable unless the
@@ -310,11 +310,11 @@ The scouts explored the project in Step 0. Their reports are in `scout/`. Now, *
 you are about to start**:
 
 1. Read only the C files this subtask actually needs. For headers, prefer
-   reading just the public-API portion (e.g. `head -100 c_src/foo.h`) unless
+   reading just the public-API portion (e.g. `head -100 inputs/c_src/foo.h`) unless
    you need the macros below.
 2. Source file selection and build-time configurability (cache variables,
    options, conditional compilation) are in the scout reports. Check a detail
-   with a scoped grep (`grep -n 'option(' c_src/CMakeLists.txt`).
+   with a scoped grep (`grep -n 'option(' inputs/c_src/CMakeLists.txt`).
 3. Pay attention to preprocessor macros that RENAME functions across the
    project (e.g. `#define foo NAMESPACE(foo)`). The scout reports list them.
    These affect the linker symbol you will emit in Rust.
@@ -351,8 +351,8 @@ each subtask completes:
 2. Append any relevant decision/pitfall to "Notes for future-me" in `PLAN.md`.
 3. Then start more subtasks.
 
-The translation rules (C ABI, behavioral fidelity, crate constraints, c_src/
-boundary) are in the `## Invariants` section of `PLAN.md`. They are the
+The translation rules (C ABI, behavioral fidelity, crate constraints,
+read-only inputs) are in the `## Invariants` section of `PLAN.md`. They are the
 authoritative source — if you are unsure about a rule, `cat PLAN.md` and
 re-read Invariants. Do not work from memory of this prompt, because this
 prompt drifts after compaction; PLAN.md does not.
@@ -390,7 +390,7 @@ As you work through this translation, pay attention to moments where you think:
 - "If I had a tool that could do Y, I would have much higher confidence in this translation step."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:

@@ -10,15 +10,15 @@
 //!
 //! ```text
 //! out_x/<prog>/
-//!   Cargo.toml  Cargo.lock  src/  tests/  …   the crate; == the frozen CargoPackage
+//!   Cargo.toml  Cargo.lock  src/  tests/  …   the crate; == the frozen CargoPackage,
+//!                                             with the agents' reports (PLAN.md, ...)
 //!   target/                                   cargo build output
 //!   .harvest/
 //!     stage.json                              this manifest
 //!     c_src/                                  C source (RawSource), rewritten every stage
 //!     suite/                                  external tests, rewritten every stage
-//!     rejected/<stage>/<name>/                reference dirs an agent modified (audit)
-//!     plan_translate.md  hypotheses_verify.md  conform_notes.md  conform_report.md
-//!     tool_wishlist.json  results.err
+//!     reference_modified/<stage>/<name>       read-only inputs an agent changed (audit)
+//!     results.err
 //! ```
 //!
 //! The layout *is* the protocol: the package is everything at the top level
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AgentKind, Stage};
+use crate::config::Stage;
 
 /// Directory under a snapshot program directory holding everything the
 /// framework owns. Excluded from the frozen package.
@@ -52,8 +52,9 @@ pub const C_SOURCE_DIR: &str = "c_src";
 /// are the suite directories (`gtest_suite/`, or `runner/` + `test_vectors/`).
 pub const SUITE_DIR: &str = "suite";
 
-/// Quarantine for reference directories an agent modified.
-pub const REJECTED_DIR: &str = "rejected";
+/// Audit record of the read-only inputs an agent changed: one file per input, under a directory
+/// per stage.
+pub const REFERENCE_MODIFIED_DIR: &str = "reference_modified";
 
 /// Every directory name that can constitute an external test suite. The
 /// authoritative copy lives under `.harvest/suite/`, but the cando2 grader
@@ -98,30 +99,17 @@ pub fn is_reserved_toplevel(name: &std::ffi::OsStr) -> bool {
 /// snapshot — the layout carries that — but `test_corpus_root` is used when
 /// present, to spare a resumed run from re-deriving the toolchain contract
 /// from a C source that no longer lives in the corpus.
+///
+/// The lineage fields describe where the snapshot's reference material came
+/// from and are carried forward. `runs` is the history: one record for each
+/// benchmark invocation that produced this snapshot, oldest first. A record
+/// stores what that invocation ran with (command line, harvest build,
+/// resolved tool configuration), so a new flag or a changed default needs
+/// no new field here.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StageManifest {
     /// Manifest schema version, bumped on incompatible changes.
     pub schema_version: u32,
-
-    /// All agentic stages that produced this snapshot, in pipeline order,
-    /// accumulated across runs.
-    pub stages: Vec<Stage>,
-
-    /// Agent backend used for the most recent run. `None` for the non-agentic
-    /// translators, which have no agent.
-    #[serde(default)]
-    pub agent: Option<AgentKind>,
-
-    /// Model used for the most recent run, if one was set explicitly.
-    pub model: Option<String>,
-
-    /// How the most recent run produced the crate: an agentic prompt mode
-    /// ("plan", "no_plan", "workflow") or, for the non-agentic
-    /// translators, which one ran ("modular", "one_shot").
-    pub prompt_mode: String,
-
-    /// Harvest version string (from `get_version()`) of the most recent run.
-    pub harvest_version: String,
 
     /// Name of the bench test case this lineage came from. Provenance only —
     /// a snapshot's own directory name carries it too.
@@ -142,23 +130,57 @@ pub struct StageManifest {
     #[serde(default)]
     pub test_corpus_root: Option<PathBuf>,
 
-    /// Revision of that checkout as of *this* run, re-read every time rather
-    /// than carried, since the checkout can move under a resumed run.
+    /// The benchmark invocations that produced this snapshot, oldest first.
+    #[serde(default)]
+    pub runs: Vec<RunRecord>,
+}
+
+/// One benchmark invocation in a snapshot's history.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RunRecord {
+    /// The agentic stages this invocation ran, in pipeline order. Empty for
+    /// the non-agentic translators.
+    pub stages: Vec<Stage>,
+
+    /// The command line, as given, and the directory it ran in. For people and
+    /// for running it again; the effective settings are in `config`.
+    pub argv: Vec<String>,
+    pub cwd: PathBuf,
+
+    /// Harvest build: `<sha>[*] (<date>)`, and for a build from a changed
+    /// working tree (`*`) also `diff <hash of git diff HEAD>`.
+    pub harvest_version: String,
+
+    /// Revision of the Test-Corpus checkout as of this invocation, re-read
+    /// every time rather than carried, since the checkout can move.
     #[serde(default)]
     pub test_corpus_revision: Option<String>,
 
-    /// Read-only reference directories an agent modified during the most
-    /// recent run. The modification was discarded; a copy is preserved under
-    /// `.harvest/rejected/`. A non-empty list means the run's results deserve
-    /// scrutiny — an agent that edits `c_src/` is editing its own oracle.
+    /// Read-only reference directories an agent modified during this
+    /// invocation (see [`REFERENCE_MODIFIED_DIR`]). The change does not reach
+    /// the output, but a non-empty list means the results deserve scrutiny — an
+    /// agent that edits the C source is editing its own oracle.
     #[serde(default)]
     pub reference_modified: Vec<String>,
 
-    /// Unix timestamp of the run that wrote this manifest.
+    /// Unix timestamp of the invocation.
     pub created_unix: u64,
+
+    /// The settings the invocation ran with: the agent, and the resolved
+    /// configuration of each tool that ran (the tool's defaults filled in,
+    /// secrets left out). `null` if it could not be resolved.
+    pub config: serde_json::Value,
 }
 
 impl StageManifest {
+    /// The stages of all runs, in run order (a stage run twice appears twice).
+    pub fn stages(&self) -> Vec<Stage> {
+        self.runs
+            .iter()
+            .flat_map(|r| r.stages.iter().copied())
+            .collect()
+    }
+
     /// Reads the manifest from a snapshot program directory.
     pub fn read_from_dir(program_dir: &Path) -> std::io::Result<Self> {
         let path = meta_dir(program_dir).join(STAGE_MANIFEST_FILE);
@@ -181,20 +203,30 @@ impl StageManifest {
 mod tests {
     use super::*;
 
-    fn manifest() -> StageManifest {
-        StageManifest {
-            schema_version: 1,
-            stages: vec![Stage::Translate, Stage::Verify],
-            agent: Some(AgentKind::Claude),
-            model: Some("sonnet".to_owned()),
-            prompt_mode: "plan".to_owned(),
+    fn run(stages: Vec<Stage>) -> RunRecord {
+        RunRecord {
+            stages,
+            argv: vec!["benchmark".to_owned()],
+            cwd: PathBuf::from("/repo"),
             harvest_version: "test".to_owned(),
-            bench_program: "lz4".to_owned(),
-            bench_revision: Some("abc1234".to_owned()),
-            test_corpus_root: Some(PathBuf::from("/repo/Test-Corpus")),
             test_corpus_revision: Some("def5678*".to_owned()),
             reference_modified: vec!["c_src".to_owned()],
             created_unix: 0,
+            config: serde_json::json!({"agentic_agent": "opencode"}),
+        }
+    }
+
+    fn manifest() -> StageManifest {
+        StageManifest {
+            schema_version: 2,
+            bench_program: "lz4".to_owned(),
+            bench_revision: Some("abc1234".to_owned()),
+            test_corpus_root: Some(PathBuf::from("/repo/Test-Corpus")),
+            runs: vec![
+                run(vec![Stage::Translate]),
+                run(vec![Stage::Verify]),
+                run(vec![Stage::Verify]),
+            ],
         }
     }
 
@@ -205,11 +237,14 @@ mod tests {
         manifest().write_to_dir(dir.path()).unwrap();
         assert!(is_snapshot(dir.path()));
         let read = StageManifest::read_from_dir(dir.path()).unwrap();
-        assert_eq!(read.stages, manifest().stages);
+        assert_eq!(
+            read.stages(),
+            [Stage::Translate, Stage::Verify, Stage::Verify]
+        );
         assert_eq!(read.test_corpus_root, manifest().test_corpus_root);
         assert_eq!(read.bench_program, "lz4");
         assert_eq!(read.bench_revision.as_deref(), Some("abc1234"));
-        assert_eq!(read.reference_modified, ["c_src"]);
+        assert_eq!(read.runs[0].reference_modified, ["c_src"]);
     }
 
     #[test]

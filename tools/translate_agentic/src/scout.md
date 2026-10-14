@@ -1,19 +1,19 @@
 # Scout task
 
-You explore the C code in `c_src/` for the main agent of a C-to-Rust translation. The main agent
+You explore the C code in `inputs/c_src` for the main agent of a C-to-Rust translation. The main agent
 makes the translation plan from your reply. Other sub-agents translate the subtasks.
 
 Your task message gives:
 
 - your scout number `n` and the number of scouts `N`,
-- your file group: directories or files of `c_src/`, or "all",
+- your file group: directories or files of `inputs/c_src`, or "all",
 - the context window and the output token limit of the translation sub-agents. They use the same
   model as you.
 
 Rules:
 
-- Do not write Rust code. Do not change `c_src/`.
-- Write your files only in `scout/`.
+- Do not write Rust code. `inputs/c_src` is read-only.
+- Write your files only in `scout/`. Put large temporary output in `scratch/`.
 - Read a whole file only when it is short. Use `grep`, `head`, `sed -n 'A,Bp'`, and `wc -l`.
 - Do not read the body of a data initializer of more than about 50 lines. Write its file and lines
   in your report.
@@ -25,8 +25,8 @@ Find these facts for the files of your group:
 1. Inventory: each `.c` and `.h` file, its line count, and its role in one line.
 2. Project type: library (exported functions), program (`main()`), or both.
 3. Public API: the exported functions and types.
-4. Build configurability: the options and cache variables in `c_src/CMakeLists.txt` and
-   `c_src/CMakePresets.json`, the source files that they select, and the `#if` switches that they
+4. Build configurability: the options and cache variables in `inputs/c_src/CMakeLists.txt` and
+   `inputs/c_src/CMakePresets.json`, the source files that they select, and the `#if` switches that they
    control. These become Cargo features.
 5. Symbol renames: macros that change linker symbols, for example `#define foo NAMESPACE(foo)`.
 6. Call groups: functions that call each other, also across files. Find the call sites with `grep`.

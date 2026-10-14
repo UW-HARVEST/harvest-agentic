@@ -231,7 +231,7 @@ mod tests {
     use super::super::test_util::dir_has_entries;
     use super::*;
     use std::fs::{create_dir, create_dir_all, read_link, set_permissions, write};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::ptr;
 
     impl<'s, 'p> DirectVerified<'s, 'p> {
@@ -350,7 +350,7 @@ mod tests {
         // 1. For a/b/inner_file, we make the file writable again, then verify that it is still
         //    writable after freezing a/b.
         // 2. For a/b/dir_link, we verify the returned path has the same address as the first copy.
-        inner_file_perms.set_readonly(false);
+        inner_file_perms.set_mode(inner_file_perms.mode() | 0o200);
         set_permissions(&a_b_inner_file, inner_file_perms).unwrap();
         // Freeze a/b
         let a_b_dir = freezer.freeze("a/b").unwrap().dir().unwrap();
@@ -379,8 +379,8 @@ mod tests {
         ));
         // Repeat the previous readonly trick to verify that freezing a/ does not re-freeze
         // anything under b/.
-        a_b_perms.set_readonly(false);
-        a_b_c_perms.set_readonly(false);
+        a_b_perms.set_mode(a_b_perms.mode() | 0o200);
+        a_b_c_perms.set_mode(a_b_c_perms.mode() | 0o200);
         set_permissions(&a_b, a_b_perms).unwrap();
         set_permissions(&a_b_c, a_b_c_perms).unwrap();
         // Freeze a/

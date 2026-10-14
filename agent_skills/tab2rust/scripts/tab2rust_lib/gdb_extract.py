@@ -15,6 +15,7 @@ targets if the tool can read the values.
 Values are decoded from the raw bytes in the file, so the result is exact.
 """
 import bisect
+import functools
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import sys
 
 import gdb
 
+sys.dont_write_bytecode = True  # no __pycache__ in the skill directory (it is embedded and copied to agents)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tab2rust_lib import elfinfo, keys  # noqa: E402
 
@@ -295,9 +297,10 @@ def inventory():
     """(records, live lines): all variables with static storage (file scope, and every block of
     every function), and the arrays on the stack. live: {file: set of lines} with code or variables."""
     recs, seen, live = [], {}, {}
+    real = functools.lru_cache(maxsize=None)(os.path.realpath)  # one call per line-table entry: cache it
 
     def mark(path, line):
-        live.setdefault(os.path.realpath(path), set()).add(line)
+        live.setdefault(real(path), set()).add(line)
 
     def add(sym, func, storage):
         """One record for each variable. The copies of a header table in several units are one
@@ -312,7 +315,7 @@ def inventory():
         if not r:
             return
         mark(r['file'], r['line'])
-        k = (os.path.realpath(r['file']), sym.line, sym.name, func)
+        k = (real(r['file']), sym.line, sym.name, func)
         for old in seen.get(k, []):
             if same_data(old, r):
                 old['units'] = sorted(set(old['units'] + r['units']))

@@ -14,6 +14,7 @@ import argparse
 import os
 import sys
 
+sys.dont_write_bytecode = True  # no __pycache__ in the skill directory (it is embedded and copied to agents)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tab2rust_lib import build, consts, detect, dump, probe, translate  # noqa: E402

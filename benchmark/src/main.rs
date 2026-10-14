@@ -21,7 +21,7 @@ use crate::stats::{ProgramEvalStats, SummaryStats, TestResult};
 use build_project_spec::{detect_project_kind, ProjectKind};
 use clap::Parser;
 use harvest_core::config::{AgentKind, Stage};
-use harvest_core::stage_manifest::{self, StageManifest};
+use harvest_core::stage_manifest::{self, RunRecord, StageManifest};
 use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
 use harvest_translate::{transpile, util::set_user_only_umask};
@@ -36,11 +36,14 @@ pub struct TranspilationResult {
     build_success: bool,
     rust_binary_path: Option<PathBuf>,
     build_error: Option<String>,
+    /// The resolved settings of the run (see [`harvest_translate::effective_config`]), for the
+    /// stage manifest.
+    run_config: serde_json::Value,
 }
 
 impl TranspilationResult {
     /// Extract relevant info from HarvestIR
-    pub fn from_ir(ir: &HarvestIR) -> Self {
+    pub fn from_ir(ir: &HarvestIR, run_config: serde_json::Value) -> Self {
         let translation_success = raw_cargo_package(ir).is_ok();
         let (build_success, rust_binary_path, build_error) = match cargo_build_result(ir) {
             Ok(artifacts) => {
@@ -75,6 +78,7 @@ impl TranspilationResult {
             build_success,
             rust_binary_path,
             build_error,
+            run_config,
         }
     }
 }
@@ -103,6 +107,10 @@ pub fn translate_c_directory_to_rust_project(
     }
     .into();
     let mut config = harvest_translate::cli::initialize(args).expect("Failed to generate config");
+    let run_config = harvest_translate::effective_config(&config).unwrap_or_else(|e| {
+        log::warn!("Cannot resolve the tool configuration for the stage manifest: {e}");
+        serde_json::Value::Null
+    });
     if config.log_filter.is_empty() {
         config.log_filter = "off".to_owned(); // Disable console logging in harvest_translate
     }
@@ -121,7 +129,7 @@ pub fn translate_c_directory_to_rust_project(
             // Re-emit the read-only reference inputs, so this output stands on
             // its own as the next stage's (and the grader's) input.
             write_snapshot_references(output_dir, &ir);
-            TranspilationResult::from_ir(&ir)
+            TranspilationResult::from_ir(&ir, run_config)
         }
         Err(e) => {
             log::error!("Failed to transpile (full error): {:#?}", e);
@@ -130,6 +138,7 @@ pub fn translate_c_directory_to_rust_project(
                 build_success: false,
                 rust_binary_path: None,
                 build_error: Some(format!("Failed to transpile: {}", e)),
+                run_config,
             }
         }
     }
@@ -157,21 +166,6 @@ impl RunOptions {
     fn has(&self, stage: Stage) -> bool {
         self.stages.contains(&stage)
     }
-
-    /// How this run produces the crate, for the manifest: the agentic prompt
-    /// mode, or which non-agentic translator ran.
-    fn prompt_mode(&self) -> &'static str {
-        if self.stages.is_empty() {
-            return if self.modular { "modular" } else { "one_shot" };
-        }
-        if self.workflow {
-            "workflow"
-        } else if self.no_plan {
-            "no_plan"
-        } else {
-            "plan"
-        }
-    }
 }
 
 /// One program's work item, with every input already resolved to a concrete
@@ -190,8 +184,8 @@ pub struct ProgramRun {
     pub suite_root: Option<PathBuf>,
     /// The snapshot the first stage loads its `CargoPackage` from, if resuming.
     pub stage_input: Option<PathBuf>,
-    /// Stage history carried over from the input snapshot.
-    pub prior_stages: Vec<Stage>,
+    /// Run history carried over from the input snapshot.
+    pub prior_runs: Vec<RunRecord>,
     /// Bench test case this lineage came from, and the revision of the bench
     /// checkout it was taken at. Provenance only, carried forward unchanged.
     pub bench_program: String,
@@ -283,60 +277,63 @@ fn write_snapshot_references(output_dir: &Path, ir: &HarvestIR) {
 /// Stamps the output program directory with a stage manifest. The manifest is
 /// provenance, not protocol — the layout is what a later run reads — so a
 /// failure here is logged rather than fatal.
-fn write_stage_manifest(output_dir: &Path, run: &ProgramRun, opts: &RunOptions) {
-    // Accumulate stages across runs: resuming appends to the input snapshot's
-    // history.
-    let mut stages = run.prior_stages.clone();
-    stages.extend(opts.stages.iter().copied());
-    stages.sort();
-    stages.dedup();
-
-    // Any reference directory an agent modified was quarantined here by the
-    // stage that caught it.
-    let reference_modified =
-        std::fs::read_dir(stage_manifest::meta_dir(output_dir).join(stage_manifest::REJECTED_DIR))
-            .map(|entries| {
-                let mut names: Vec<String> = entries
-                    .flatten()
-                    .flat_map(|stage| std::fs::read_dir(stage.path()).ok())
-                    .flat_map(|refs| refs.flatten())
-                    .map(|r| r.file_name().to_string_lossy().into_owned())
-                    .collect();
-                names.sort();
-                names.dedup();
-                names
-            })
-            .unwrap_or_default();
+fn write_stage_manifest(
+    output_dir: &Path,
+    run: &ProgramRun,
+    opts: &RunOptions,
+    translation: &TranspilationResult,
+) {
+    // Each stage records here the read-only inputs that its agent changed.
+    let reference_modified = std::fs::read_dir(
+        stage_manifest::meta_dir(output_dir).join(stage_manifest::REFERENCE_MODIFIED_DIR),
+    )
+    .map(|entries| {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .flat_map(|stage| std::fs::read_dir(stage.path()).ok())
+            .flat_map(|refs| refs.flatten())
+            .map(|r| r.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    })
+    .unwrap_or_default();
     if !reference_modified.is_empty() {
         log::warn!(
-            "An agent modified read-only reference input(s): {}. The change was discarded; \
-             copies are preserved under {}/{}/. Treat this run's results with suspicion.",
+            "An agent changed read-only input(s): {}. The change does not reach the output \
+             (see {}/{}/). Treat this run's results with suspicion.",
             reference_modified.join(", "),
             stage_manifest::HARVEST_META_DIR,
-            stage_manifest::REJECTED_DIR
+            stage_manifest::REFERENCE_MODIFIED_DIR
         );
     }
 
-    let manifest = StageManifest {
-        schema_version: 1,
-        stages,
-        agent: opts.agent,
-        model: opts.model.clone(),
-        prompt_mode: opts.prompt_mode().to_owned(),
+    // Resuming appends this invocation to the input snapshot's history.
+    let mut runs = run.prior_runs.clone();
+    runs.push(RunRecord {
+        stages: opts.stages.clone(),
+        argv: std::env::args().collect(),
+        cwd: std::env::current_dir().unwrap_or_default(),
         harvest_version: get_version().to_owned(),
-        bench_program: run.bench_program.clone(),
-        bench_revision: run.bench_revision.clone(),
         // Re-read rather than carried: the checkout can move under a resumed run.
         test_corpus_revision: run
             .test_corpus_root
             .as_ref()
             .and_then(harvest_core::utils::git_revision),
-        test_corpus_root: run.test_corpus_root.clone(),
         reference_modified,
         created_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        config: translation.run_config.clone(),
+    });
+    let manifest = StageManifest {
+        schema_version: 2,
+        bench_program: run.bench_program.clone(),
+        bench_revision: run.bench_revision.clone(),
+        test_corpus_root: run.test_corpus_root.clone(),
+        runs,
     };
     match manifest.write_to_dir(output_dir) {
         Ok(()) => log::info!(
@@ -556,23 +553,16 @@ fn benchmark_single_program(
     }
 
     // Inject per-stage tool config for the agentic stages that actually run
-    // in this invocation. Both agents share the wishlist file; the verify
-    // phase appends to whatever the translate phase wrote. Everything the
-    // framework owns lives under the snapshot's meta directory.
+    // in this invocation. The agents' reports (PLAN.md, HYPOTHESES.md,
+    // tool_wishlist.json, ...) stay in the crate. The framework's own records
+    // live under the snapshot's meta directory.
     let meta_dir = stage_manifest::meta_dir(&output_dir);
     std::fs::create_dir_all(&meta_dir).ok();
 
-    let wishlist_path = meta_dir.join("tool_wishlist.json");
-    // Translate-phase PLAN.md is dumped under a dedicated name so a later verify
-    // rewrite of the CargoPackage cannot overwrite or delete it.
-    let plan_translate_path = meta_dir.join("plan_translate.md");
-    // Verify-phase HYPOTHESES.md captures the agent's hypothesis log across
-    // compactions, for post-hoc analysis of how it approached debugging.
-    let hypotheses_verify_path = meta_dir.join("hypotheses_verify.md");
     // The output.log path lets each tool append the agent's full JSON trace
     // to the same log file as benchmark messages.
     let output_log_path = output_root_dir.join("output.log");
-    let rejected_dir = meta_dir.join(stage_manifest::REJECTED_DIR);
+    let reference_modified_dir = meta_dir.join(stage_manifest::REFERENCE_MODIFIED_DIR);
     let mut effective_overrides = opts.config_overrides.clone();
     // Stage-uniform settings apply to every agentic stage running in this
     // invocation; use -c tools.<tool>.<key>=... for per-stage overrides.
@@ -582,8 +572,8 @@ fn benchmark_single_program(
             output_log_path.display()
         ));
         overrides.push(format!(
-            "tools.{tool}.rejected_output_dir={}",
-            rejected_dir.join(stage.to_string()).display()
+            "tools.{tool}.reference_audit_dir={}",
+            reference_modified_dir.join(stage.to_string()).display()
         ));
         if let Some(root) = &program_run.test_corpus_root {
             overrides.push(format!("tools.{tool}.test_corpus_root={}", root.display()));
@@ -605,10 +595,6 @@ fn benchmark_single_program(
         }
     }
     let prompt_mode_overrides = |overrides: &mut Vec<String>, tool: &str| {
-        overrides.push(format!(
-            "tools.{tool}.wishlist_output_path={}",
-            wishlist_path.display()
-        ));
         if opts.no_plan {
             overrides.push(format!("tools.{tool}.no_plan=true"));
         }
@@ -623,10 +609,6 @@ fn benchmark_single_program(
             Stage::Translate,
         );
         prompt_mode_overrides(&mut effective_overrides, "translate_agentic");
-        effective_overrides.push(format!(
-            "tools.translate_agentic.plan_output_path={}",
-            plan_translate_path.display()
-        ));
         if opts.no_tab2rust {
             effective_overrides.push("tools.translate_agentic.tab2rust=false".to_owned());
         }
@@ -638,10 +620,6 @@ fn benchmark_single_program(
             Stage::Verify,
         );
         prompt_mode_overrides(&mut effective_overrides, "verify_fix_agentic");
-        effective_overrides.push(format!(
-            "tools.verify_fix_agentic.hypotheses_output_path={}",
-            hypotheses_verify_path.display()
-        ));
         if opts.verify_harness == crate::cli::VerifyHarness::Gtest {
             effective_overrides.push("tools.verify_fix_agentic.verify_harness=gtest".to_owned());
         }
@@ -651,14 +629,6 @@ fn benchmark_single_program(
     }
     if opts.has(Stage::Conform) {
         stage_overrides(&mut effective_overrides, "conform_agentic", Stage::Conform);
-        effective_overrides.push(format!(
-            "tools.conform_agentic.notes_output_path={}",
-            meta_dir.join("conform_notes.md").display()
-        ));
-        effective_overrides.push(format!(
-            "tools.conform_agentic.report_output_path={}",
-            meta_dir.join("conform_report.md").display()
-        ));
     }
 
     // Run the stage pipeline (translate/verify/conform, or the non-agentic
@@ -695,7 +665,7 @@ fn benchmark_single_program(
     // same terms (a one-shot translation can be handed to the verify stage).
     // Build failure does not gate it either: a snapshot whose build is broken
     // is exactly the kind a verify run should be able to pick up.
-    write_stage_manifest(&output_dir, program_run, opts);
+    write_stage_manifest(&output_dir, program_run, opts, &translation_result);
 
     if translation_result.build_success {
         log::info!("✅ Rust build completed successfully!");
@@ -824,6 +794,9 @@ fn benchmark_single_program(
 fn main() -> HarvestResult<()> {
     set_user_only_umask();
     let args = Args::parse();
+    // Check the arguments before anything is created on disk: an invalid command leaves no
+    // output directory and no output.log behind.
+    args.validate_stages(&args.stages())?;
 
     let log_root = args
         .test
@@ -1108,7 +1081,7 @@ fn start_from_bench(bench_program_dir: &Path, name: String) -> HarvestResult<Pro
         c_source_dir,
         suite_root,
         stage_input: None,
-        prior_stages: Vec::new(),
+        prior_runs: Vec::new(),
         bench_revision: harvest_core::utils::git_revision(bench_program_dir),
         bench_program: name.clone(),
         name,
@@ -1181,7 +1154,7 @@ fn resume_from(
         c_source_dir,
         suite_root,
         stage_input: Some(snapshot_dir.to_path_buf()),
-        prior_stages: manifest.stages,
+        prior_runs: manifest.runs,
         bench_program: manifest.bench_program,
         bench_revision,
         test_corpus_root: manifest.test_corpus_root,
@@ -1192,7 +1165,6 @@ fn run(args: Args) -> HarvestResult<()> {
     log::info!("Running Benchmarks");
 
     let stages = args.stages();
-    args.validate_stages(&stages)?;
 
     if let Some(test_path) = &args.test {
         log::info!("Test-only mode: {}", test_path.display());

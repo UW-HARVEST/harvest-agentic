@@ -53,16 +53,14 @@ impl TestConfig {
 /// Search for a `CMakePresets.json` in `start_dir` and a few common
 /// neighbouring locations, then read it.
 ///
-/// HARVEST tools see different "input" paths: `try_cargo_build` is given the
-/// `test_case/` subdirectory, while `verify_fix_agentic` works in a tempdir
-/// containing `translated_rust/c_src/`. The presets file lives at the test
-/// case root in either case. This helper papers over those layout
-/// differences by trying the obvious candidates in order.
+/// HARVEST tools see different "input" paths: the bench `test_case/` subdirectory,
+/// or a snapshot's `.harvest/c_src/`. The presets file lives at the test case
+/// root or in the C source. This helper papers over those layout differences by
+/// trying the obvious candidates in order.
 pub fn find_test_config(start_dir: &Path) -> TestConfig {
     let candidates = [
         start_dir.join("CMakePresets.json"),
         start_dir.join("..").join("CMakePresets.json"),
-        start_dir.join("translated_rust/c_src/CMakePresets.json"),
         start_dir.join("c_src/CMakePresets.json"),
     ];
     for c in &candidates {

@@ -2712,8 +2712,14 @@ def build_readable_history(sessions: list[Session]) -> str:
 # ---------------------------------------------------------------------------
 
 def _normalize_io_path(path: str) -> str:
-    """Normalize /tmp/.tmpXXX/translated_rust/... to relative form."""
-    path = re.sub(r'^/tmp/\.tmp\w+/translated_rust/', '', path)
+    """Normalize the run's temp directory paths to a relative form: the working directory
+    (/tmp/.tmpXXX/workspace/, before 2026-10 translated_rust/) to nothing, and the directories
+    that its links inputs/ and shared/ point to (/tmp/.tmpXXX/inputs/, /tmp/.tmpXXX/shared/) to
+    inputs/ and shared/. Traces of mid-October 2026 have /tmp/.tmpXXX/read_only/c_src/ (to c_src/)
+    and /tmp/.tmpXXX/{read_only,scratch}/."""
+    path = re.sub(r'^/tmp/\.tmp\w+/(?:translated_rust|workspace)/', '', path)
+    path = re.sub(r'^/tmp/\.tmp\w+/read_only/c_src/', 'c_src/', path)
+    path = re.sub(r'^/tmp/\.tmp\w+/(inputs|shared|read_only|scratch)/', r'\1/', path)
     path = re.sub(r'^\./', '', path)
     return path.strip()
 
@@ -2723,7 +2729,7 @@ def _extract_bash_files(cmd: str) -> list[str]:
     files = set()
     for m in re.finditer(r'(?:c_src|src)/[\w./-]+\.(?:c|h|rs|toml)', cmd):
         files.add(m.group(0))
-    for m in re.finditer(r'/tmp/\.tmp\w+/translated_rust/([\w./-]+\.(?:c|h|rs|toml))', cmd):
+    for m in re.finditer(r'/tmp/\.tmp\w+/(?:translated_rust|workspace)/([\w./-]+\.(?:c|h|rs|toml))', cmd):
         files.add(m.group(1))
     return list(files)
 

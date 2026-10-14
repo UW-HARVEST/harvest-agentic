@@ -19,5 +19,5 @@
   Do not fast-forward merge, so that the history shows who changed what.
 - A sub-agent that only reads or investigates needs no worktree.
 - The framework maintains `.gitignore` for you. Build outputs (`target/`,
-  `build*/`, `cbuild/`) and worktrees (`wt/`) stay untracked. Do not commit
-  them.
+  `build*/`, `cbuild/`), `scratch/` and worktrees (`wt/`) stay untracked. Do
+  not commit them.

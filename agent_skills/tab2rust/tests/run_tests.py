@@ -17,9 +17,11 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True  # no __pycache__ in the skill directory (it is embedded and copied to agents)
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, '..', 'scripts', 'tab2rust.py')
 FIXTURE = os.path.join(HERE, 'fixture')
+sys.path.insert(0, os.path.join(HERE, '..', 'scripts'))  # tab2rust_lib, for the unit checks
 
 # CMakeLists.txt compiles tables.c and tables_unit2.c. tables_unused.c, tables_feature.c, tables_guard.h are not compiled.
 COPY_KEYS = ('tables_copy.h:copy_tab@tables.c', 'tables_copy.h:copy_tab@tables_unit2.c')
@@ -32,6 +34,7 @@ PURE = {  # key -> note tags
     'gptr_tab': ('exported',), 'bptr_tab': ('exported',), 'mixed_tab': ('exported',), 'addr_tab': ('exported',),
     'line_tab': (), 'zero_tab': ('zero fill',), 'cond_tab': ('#if',), 'macro_tab': ('macro items',),
     'incl_tab': ('body',), 'writable_tab': ('writable',), 'macro_init_tab': ('not in text',),
+    'kv_a_tab': (), 'kv_b_tab': (), 'kv_c_tab': (), 'kw_tab': (), 'ucast_tab': (), 'scast_tab': (),
     COPY_KEYS[0]: (), COPY_KEYS[1]: (),
 }
 SMALL = ('text_tab', 'short_tab')  # fewer than 30 text items (more binary values): not findings, but PURE
@@ -45,7 +48,11 @@ TAINTED = {  # key -> reason tags
 STACK_TEXT = {'param_stack': 'initializer element is not constant', 'extern_stack': 'stack (pointers into other files)',
               'hdr_stack': 'stack (not in a compiled .c file)'}
 # translate refuses these PURE arrays (the emitter cannot write them): key -> message part
-EMIT_REFUSED = {'mixed_tab': 'string literals and pointers into arrays', 'addr_tab': 'a number holds an address'}
+EMIT_REFUSED = {'mixed_tab': 'string literals and pointers into arrays', 'addr_tab': 'a number holds an address',
+                'scast_tab': 'the pointer is to u8, the element of fx_sbytes is i8 (a cast in C)'}
+# arrays of one struct type share one definition: kv_c_tab (pointers into an array) cannot share it with
+# kv_a_tab (string literals). kv_b_tab (a NULL name) makes the shared field an Option.
+SHARED_MIXED = ('kv_a_tab', 'kv_c_tab')
 # values of the stack copies and of pointers, as Rust {:?} prints them (from the C text)
 STACK_VALUES = {'c::FX_STACK_LIVE_STACK[31]': '32', 'c::FX_LOCAL_COPY_ROWS[0].b': '225', 'c::FX_LOCAL_COPY_ROWS[2].b': '7',
                 'c::FX_LOCAL_COPY_ROWS[15].b': '2', 'c::FX_LOCAL_STR_STACK[30]': 'Some("s30")',
@@ -230,7 +237,8 @@ def check_mismatch(td, lib, check):
 
 def check_translate(td, lib, check):
     """translate output, values, struct rename, refusals, header copies."""
-    keys = [k for k in PURE if k not in COPY_KEYS and k not in EMIT_REFUSED] + list(SMALL) + ['fx_gdata', 'fx_bytes']
+    keys = ([k for k in PURE if k not in COPY_KEYS and k not in EMIT_REFUSED and k != 'kv_c_tab'] + list(SMALL)
+            + ['fx_gdata', 'fx_bytes'])
     out = os.path.join(td, 'tables.rs')
     base = [TOOL, 'translate', '--src', FIXTURE, '--binary', lib]
     p = run(*base, *sum((['--symbol', k] for k in keys), []), '--out', out)
@@ -242,11 +250,15 @@ def check_translate(td, lib, check):
     with open(out) as f:
         text = f.read()
     for lit in ('1.0e-300, 0.30000000000000004, -0.0, 1.0,', '60.0, 3600.0, 5373485.0, 4.6427e14,',
-                'r_limit: 4.6427e14, r_xform: 1.0 }', 'pub struct span_tab_row_r_row {'):
+                'r_limit: 4.6427e14, r_xform: 1.0 }', 'pub struct span_tab_row_r_row {',
+                "pub struct fx_kv {\n    pub name: Option<&'static core::ffi::CStr>,",
+                'pub struct r#match {\n    pub self_: i32,\n    pub r#priv: i32,', 'r#match { self_: 0, r#priv: -1 }'):
         check(lit in text, f'translate: "{lit}" not in the output')
     pairs = sum((['--pair', f'{k}={RUST_NAMES.get(k, k.upper())}'] for k in keys), [])
     p = run(os.path.join(HERE, 'verify_values.py'), '--binary', lib, '--rs', out, *pairs, ok=False)
     check(p.returncode == 0, 'verify_values:\n' + p.stdout)
+
+    check_shared_struct(td, base, lib, check)
 
     copies = os.path.join(td, 'copies.rs')
     names = sum((['--symbol', k, '--name', f'{k}={RUST_NAMES[k]}'] for k in COPY_KEYS), [])
@@ -296,6 +308,19 @@ def check_translate(td, lib, check):
     check(p.returncode == 0, 'verify_values (prefixed names):\n' + p.stdout)
 
 
+def check_shared_struct(td, base, lib, check):
+    """Arrays of one struct type whose char pointer fields cannot share one type: both are refused, no
+    file that does not compile. kv_c_tab alone translates (kv_a_tab is in the main batch)."""
+    rs = os.path.join(td, 'kv.rs')
+    p = run(*base, *sum((['--symbol', k] for k in SHARED_MIXED), []), '--out', rs, ok=False)
+    check(p.returncode != 0 and all(f'REFUSED {k}: ' in p.stdout for k in SHARED_MIXED)
+          and 'string literals and pointers into arrays' in p.stdout,
+          'translate kv_a_tab + kv_c_tab: not both refused:\n' + p.stdout)
+    run(*base, '--symbol', 'kv_c_tab', '--symbol', 'fx_chars', '--out', rs)
+    p = run(os.path.join(HERE, 'verify_values.py'), '--binary', lib, '--rs', rs, '--pair', 'kv_c_tab=KV_C_TAB', ok=False)
+    check(p.returncode == 0, 'verify_values (kv_c_tab alone):\n' + p.stdout)
+
+
 def check_anon_spec(td, base, lib, check):
     """An anonymous struct: rename it by "KEY[]" and by its default Rust name. A spec key that
     matches no struct gives a NOTE."""
@@ -317,9 +342,20 @@ def check_anon_spec(td, base, lib, check):
         check(p.returncode == 0, f'verify_values (xform_tab, "{key}"):\n' + p.stdout)
 
 
+def check_compdb(check):
+    """compdb.flags keeps the flags that change the preprocessor and the types, and drops the others."""
+    from tab2rust_lib import compdb
+    argv = ['gcc', '-Ia', '-I', 'b', '-iquote', 'q', '-idirafter', 'd', '-isystem', 's', '-include', 'i.h',
+            '-imacros', 'm.h', '-DX=1', '-U', 'Y', '-std=c99', '-fno-common', '-m32', '-O2', '-Wall', '-g',
+            '-o', 'x.o', '-c', 'x.c']
+    got = compdb.flags({'arguments': argv})
+    want = ['-Ia', '-I', 'b', '-iquote', 'q', '-idirafter', 'd', '-isystem', 's', '-include', 'i.h', '-imacros',
+            'm.h', '-DX=1', '-U', 'Y', '-std=c99', '-fno-common', '-m32']
+    check(got == want, f'compdb.flags: {got}')
+
+
 def check_floats(check):
     """float_literal gives the expected text and the same bits."""
-    sys.path.insert(0, os.path.join(HERE, '..', 'scripts'))
     from tab2rust_lib.emit import float_bits, float_literal
     for (v, size), want in FLOATS.items():
         got = float_literal(float_bits(repr(v), size), size)
@@ -346,6 +382,7 @@ def main():
         check_mismatch(td, lib, check)
         check_translate(td, lib, check)
         check_floats(check)
+        check_compdb(check)
         check_probe(build, check)
     for f in failures:
         print('FAIL', f)

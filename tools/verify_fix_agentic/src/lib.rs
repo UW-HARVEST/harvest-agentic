@@ -6,18 +6,15 @@
 //! compares their outputs, and iteratively fixes the Rust code until the two agree (or the agent
 //! gives up). This is dynamic, execution-based verification, not a static or formal analysis.
 
-use agent_runner::{AgentInvocation, AgentPhase};
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cmake_presets::{TestConfig, find_test_config};
-use harvest_core::config::{AgentKind, unknown_field_warning};
-use harvest_core::fs::{
-    RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
-};
+use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, read_dir};
+use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -33,7 +30,7 @@ const METHOD_GTEST: &str = include_str!("method_gtest.md");
 /// fuzzing is enabled.
 const FUZZTEST_SECTION: &str = include_str!("fuzztest_section.md");
 
-/// Directory (inside translated_rust/) holding the gtest/fuzztest verification
+/// Directory (inside the workspace) holding the gtest/fuzztest verification
 /// environment. Materialized for the gtest harness and stripped before freeze.
 const VERIFY_ENV_DIR: &str = "verify_env";
 
@@ -41,7 +38,7 @@ const VERIFY_ENV_DIR: &str = "verify_env";
 /// GoogleTest v1.17.0 (matching the pin in the template CMakeLists).
 const FUZZTEST_GIT_TAG: &str = "2026-06-29";
 
-// verify_env scaffold templates (materialized into translated_rust/verify_env/).
+// verify_env scaffold templates (materialized into workspace/verify_env/).
 const VE_CMAKELISTS: &str = include_str!("verify_env_template/CMakeLists.txt");
 const VE_TESTS_CC: &str = include_str!("verify_env_template/verification_tests.cc");
 const VE_DIFF_H: &str = include_str!("verify_env_template/harvest_diff.h");
@@ -91,14 +88,7 @@ impl Tool for VerifyFixAgentic {
         context: RunContext,
         inputs: Vec<Id>,
     ) -> Result<Box<dyn Representation>, Box<dyn std::error::Error>> {
-        let default_config = serde_json::Value::Object(Default::default());
-        let config = Config::deserialize(
-            context
-                .config
-                .tools
-                .get("verify_fix_agentic")
-                .unwrap_or(&default_config),
-        )?;
+        let config: Config = context.config.tool()?;
         config.validate();
 
         let agent = context.config.agentic_agent;
@@ -111,25 +101,14 @@ impl Tool for VerifyFixAgentic {
             .get::<RawSource>(inputs[1])
             .ok_or("No RawSource representation found in IR")?;
 
-        // case_dir/
-        //   translated_rust/          <- materialized CargoPackage
-        //     c_src/                  <- materialized RawSource (for agent reference)
-        let work_dir = tempfile::tempdir()?;
-        let case_dir = work_dir.path();
-        let translated = case_dir.join("translated_rust");
-        cargo_package.dir.materialize(&translated)?;
+        // The agent works in case_dir/workspace/, the materialized CargoPackage. The C source is
+        // this stage's oracle, a read-only input in case_dir/inputs/ (see agent_runner::CaseDir).
+        let case = CaseDir::new()?;
+        let workspace = case.workspace();
+        cargo_package.dir.materialize(&workspace)?;
+        raw_source.dir.materialize(case.c_src())?;
+        info!("Working directory: {}", workspace.display());
 
-        let c_src_dir = translated.join("c_src");
-        fs::create_dir_all(&c_src_dir)?;
-        raw_source.dir.materialize(&c_src_dir)?;
-        // c_src/ is this stage's oracle. It is a read-only input.
-        let reference_guard = ReferenceGuard::capture(&translated, &["c_src"])?;
-
-        info!("Working directory: {}", case_dir.display());
-
-        // The wishlist file lives inside translated_rust/ so the agent can write to it
-        // without any special permissions. The absolute path is injected into the prompt.
-        let local_wishlist = translated.join("tool_wishlist.json");
         let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
             &context.config.input,
             config.test_corpus_root.as_deref(),
@@ -139,38 +118,14 @@ impl Tool for VerifyFixAgentic {
         // CMakePresets.json because raw_source only mirrors `test_case/` content.
         let test_config = find_test_config(&context.config.input);
         let workflow_hint = if config.workflow && agent == AgentKind::Claude {
-            "You must use a workflow.\n\n".to_owned()
+            "You must use a workflow.\n\n"
         } else {
-            String::new()
+            ""
         };
         let prompt = load_verify_prompt(&config, agent)
-            .replace(
-                "{AGENT_BUG_WORKAROUNDS}",
-                agent_runner::agent_bug_workarounds(agent),
-            )
-            .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
             .replace("{CMAKE_BUILD_FLAGS}", &test_config.cmake_flags)
             .replace("{ALL_CONFIGURATIONS}", &render_configurations(&test_config))
-            .replace("{WISHLIST_PATH}", &local_wishlist.to_string_lossy())
-            .replace(
-                "{RUST_TOOLCHAIN_CONTEXT}",
-                &rust_toolchain_context.prompt_block,
-            )
-            .replace(
-                "{WORKDIR_BOUNDARY}",
-                &agent_runner::render_workdir_boundary(agent, &translated),
-            )
-            .replace("{WORKFLOW_HINT}", &workflow_hint)
-            .replace(
-                "{MODEL_LIMITS}",
-                &match (agent, &config.model) {
-                    (AgentKind::OpenCode, Some(model)) => {
-                        let limits = agent_runner::load_opencode_model_limits(model)?;
-                        agent_runner::render_model_limits_block(&limits)
-                    }
-                    _ => String::new(),
-                },
-            );
+            .replace("{WORKFLOW_HINT}", workflow_hint);
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
@@ -179,135 +134,38 @@ impl Tool for VerifyFixAgentic {
             && !config.no_plan
             && matches!(agent, AgentKind::Claude | AgentKind::OpenCode);
         if gtest_harness_active {
-            materialize_verify_env(&translated, &c_src_dir, config.fuzz)?;
+            materialize_verify_env(&case, config.fuzz)?;
             info!(
                 "Materialized gtest verification environment (fuzz={})",
                 config.fuzz
             );
         }
 
-        // Kiro runs in case_dir (references translated_rust/ in prompt paths).
-        // Claude and OpenCode run in translated_rust/ directly (references c_src/ and src/).
-        let kiro_prompt;
-        let (agent_work_dir, agent_prompt) = match agent {
-            AgentKind::Kiro => {
-                kiro_prompt = prompt.replace("{CASE_DIR}", &case_dir.to_string_lossy());
-                (case_dir, kiro_prompt.as_str())
-            }
-            AgentKind::Claude | AgentKind::OpenCode => (translated.as_path(), prompt.as_str()),
-        };
+        let reference_guard = case.lock_inputs()?;
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Verify,
             agent,
-            work_dir: agent_work_dir,
-            prompt: agent_prompt,
+            case: &case,
+            prompt: &prompt,
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             no_plan: config.no_plan,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
-            rust_toolchain: Some(&rust_toolchain_context.required_version),
+            rust_toolchain: &rust_toolchain_context,
         })?;
         info!("Verification complete");
-
-        // Append verify-phase wishlist entries to the translate-phase file (if any),
-        // so the final output contains wishes from both phases in chronological order.
-        if local_wishlist.exists()
-            && let Some(out_path) = &config.wishlist_output_path
-        {
-            match (
-                fs::read_to_string(&local_wishlist),
-                fs::read_to_string(out_path),
-            ) {
-                (Ok(new_entries), Ok(existing)) => {
-                    let merged = format!("{}{}", existing, new_entries);
-                    if let Err(e) = fs::write(out_path, merged) {
-                        warn!(
-                            "Failed to append verify wishlist to {}: {}",
-                            out_path.display(),
-                            e
-                        );
-                    } else {
-                        info!(
-                            "Tool wishlist (verify phase) appended to {}",
-                            out_path.display()
-                        );
-                    }
-                }
-                (Ok(new_entries), Err(_)) => {
-                    // No translate-phase file yet — write fresh.
-                    if let Err(e) = fs::write(out_path, new_entries) {
-                        warn!(
-                            "Failed to write verify wishlist to {}: {}",
-                            out_path.display(),
-                            e
-                        );
-                    } else {
-                        info!("Tool wishlist written to {}", out_path.display());
-                    }
-                }
-                (Err(e), _) => {
-                    warn!(
-                        "Failed to read local wishlist {}: {}",
-                        local_wishlist.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        // Copy verify-phase HYPOTHESES.md out before the tempdir is dropped.
-        // The agent maintains this as an append-only log of bug hypotheses across
-        // its own compactions; absence is normal if no bugs needed investigation.
-        let local_hypotheses = translated.join("HYPOTHESES.md");
-        if local_hypotheses.exists() {
-            if let Some(out_path) = &config.hypotheses_output_path {
-                if let Err(e) = fs::copy(&local_hypotheses, out_path) {
-                    warn!(
-                        "Failed to copy HYPOTHESES.md to {}: {}",
-                        out_path.display(),
-                        e
-                    );
-                } else {
-                    info!(
-                        "Verification HYPOTHESES.md written to {}",
-                        out_path.display()
-                    );
-                }
-            }
-        } else {
+        if !workspace.join("HYPOTHESES.md").exists() {
             info!(
                 "Agent did not produce a HYPOTHESES.md (no bugs investigated, or skipped step 1)"
             );
         }
 
-        // Sanitize translated_rust/ before freezing it into the IR.
-        // 1) Remove hidden directories/files that leaked in from the agent runtime.
-        // 2) Remove known intermediate build/source artifacts.
-        // 3) Surface any remaining symlinks for diagnostics.
-        remove_hidden_entries(&translated)?;
-        reference_guard.strip(&translated, config.rejected_output_dir.as_deref())?;
-
-        let target_out = translated.join("target");
-        if target_out.exists()
-            && let Err(e) = fs::remove_dir_all(&target_out)
-        {
-            warn!(
-                "Failed to remove target output dir {}: {}",
-                target_out.display(),
-                e
-            );
-        }
-
-        if let Err(e) = remove_worktree_dir(&translated) {
-            warn!("Failed to remove leftover worktree dir: {e}");
-        }
-        // Keep the gtest/fuzztest verification environment in the frozen output
-        // (like the libloading tests/ dir) so it is available for inspection,
-        // but strip its build directories (build-*), which hold the fetched
-        // GoogleTest/FuzzTest/Abseil sources plus symlinks that would otherwise
-        // bloat the output and break the symlink-free freeze.
-        let verify_env_out = translated.join(VERIFY_ENV_DIR);
+        // Keep the gtest/fuzztest verification environment in the frozen output (like the
+        // libloading tests/ dir) so it is available for inspection, but strip its build directories
+        // (build-*), which hold the fetched GoogleTest/FuzzTest/Abseil sources plus symlinks that
+        // would otherwise bloat the output and break the symlink-free freeze.
+        let verify_env_out = workspace.join(VERIFY_ENV_DIR);
         if verify_env_out.is_dir() {
             match strip_build_dirs(&verify_env_out) {
                 Ok(n) if n > 0 => info!("Stripped {n} build dir(s) from verify_env/"),
@@ -319,14 +177,7 @@ impl Tool for VerifyFixAgentic {
                 ),
             }
         }
-
-        for entry in collect_symlinks(&translated) {
-            warn!("translated_rust contains symlink: {}", entry);
-        }
-
-        let (dir, directories, files) = RawDir::populate_from(read_dir(&translated)?)?;
-        info!("Produced CargoPackage with {directories} directories and {files} files");
-
+        let dir = case.freeze(&reference_guard, config.reference_audit_dir.as_deref())?;
         Ok(Box::new(CargoPackage { dir }))
     }
 }
@@ -384,15 +235,14 @@ fn parse_c_compile_defs(cmakelists: &str) -> String {
 }
 
 /// Materializes the gtest/fuzztest verification environment into
-/// `<translated>/verify_env/`, filling the CMake template for the requested mode
-/// and pre-seeding the C compile definitions parsed from `c_src/CMakeLists.txt`.
-fn materialize_verify_env(
-    translated: &Path,
-    c_src_dir: &Path,
-    fuzz: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let env_dir = translated.join(VERIFY_ENV_DIR);
+/// `workspace/verify_env/`, filling the CMake template for the requested mode
+/// and pre-seeding the C compile definitions parsed from the C `CMakeLists.txt`.
+/// The CMake variable `HARVEST_C_SRC` names the C source, by default `inputs/c_src` of the
+/// checkout. The scripts build in `verify_env/build-*`, which the freeze strips.
+fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let env_dir = case.workspace().join(VERIFY_ENV_DIR);
     fs::create_dir_all(&env_dir)?;
+    let c_src_dir = case.c_src();
 
     let c_defs = fs::read_to_string(c_src_dir.join("CMakeLists.txt"))
         .map(|s| parse_c_compile_defs(&s))
@@ -423,20 +273,30 @@ fn materialize_verify_env(
         .replace("{TEST_LINK}", &test_link)
         .replace("{C_COMPILE_DEFS}", &c_defs);
 
-    fs::write(env_dir.join("CMakeLists.txt"), cmakelists)?;
-    fs::write(env_dir.join("verification_tests.cc"), VE_TESTS_CC)?;
-    fs::write(env_dir.join("harvest_diff.h"), VE_DIFF_H)?;
-    fs::write(env_dir.join("rust_lib.h"), VE_RUST_LIB_H)?;
-    fs::write(
-        env_dir.join("README.md"),
-        VE_README.replace("{FUZZTEST_README}", if fuzz { VE_README_FUZZ } else { "" }),
-    )?;
-    write_script(&env_dir.join("build.sh"), VE_BUILD_SH)?;
-    write_script(&env_dir.join("run_tests.sh"), VE_RUN_TESTS_SH)?;
-    fs::write(env_dir.join("memory_scope.sh"), VE_MEMORY_SCOPE_SH)?;
+    let readme = VE_README.replace("{FUZZTEST_README}", if fuzz { VE_README_FUZZ } else { "" });
+    // (file name, content, executable)
+    let mut files: Vec<(&str, &str, bool)> = vec![
+        ("CMakeLists.txt", &cmakelists, false),
+        ("verification_tests.cc", VE_TESTS_CC, false),
+        ("harvest_diff.h", VE_DIFF_H, false),
+        ("rust_lib.h", VE_RUST_LIB_H, false),
+        ("README.md", &readme, false),
+        ("build.sh", VE_BUILD_SH, true),
+        ("run_tests.sh", VE_RUN_TESTS_SH, true),
+        ("memory_scope.sh", VE_MEMORY_SCOPE_SH, false),
+    ];
     if fuzz {
-        write_script(&env_dir.join("build_fuzz.sh"), VE_BUILD_FUZZ_SH)?;
-        write_script(&env_dir.join("run_fuzz.sh"), VE_RUN_FUZZ_SH)?;
+        files.push(("build_fuzz.sh", VE_BUILD_FUZZ_SH, true));
+        files.push(("run_fuzz.sh", VE_RUN_FUZZ_SH, true));
+    }
+    for (name, text, executable) in files {
+        if executable {
+            write_script(&env_dir.join(name), text)?;
+        } else {
+            fs::write(env_dir.join(name), text)?;
+        }
+    }
+    if fuzz {
         // Vendored FuzzTest reference docs for on-demand reading (fuzz only).
         let docs_dir = env_dir.join("docs");
         fs::create_dir_all(&docs_dir)?;
@@ -506,7 +366,7 @@ fn render_configurations(cfg: &TestConfig) -> String {
 }
 
 /// Comparison mechanism the verification prompt describes.
-#[derive(Debug, Deserialize, Default, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyHarness {
     /// C++ GoogleTest environment with the C reference linked in and the Rust
@@ -518,7 +378,7 @@ pub enum VerifyHarness {
 }
 
 /// Tool-specific configuration, read from `[tools.verify_fix_agentic]` in the HARVEST config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     /// Agent timeout in seconds.
     #[serde(default = "default_timeout_secs")]
@@ -555,29 +415,17 @@ pub struct Config {
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
     /// Defined as a TOML table under `[tools.verify_fix_agentic.env]`.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub env: HashMap<String, String>,
-
-    /// Destination path for the agent's tool wishlist file.
-    /// Injected by the benchmark at runtime (set to <output_dir>/tool_wishlist.json).
-    /// Verify-phase entries are appended to any existing translate-phase entries at this path.
-    /// If absent, any wishlist the agent writes is silently discarded with the tempdir.
-    pub wishlist_output_path: Option<PathBuf>,
-
-    /// Destination path for the agent's verify-phase HYPOTHESES.md.
-    /// Injected by the benchmark at runtime (set to <output_dir>/hypotheses_verify.md).
-    /// If absent, any hypotheses log the agent writes is preserved only inside the
-    /// CargoPackage and may be lost in downstream tooling.
-    pub hypotheses_output_path: Option<PathBuf>,
 
     /// Destination path for the benchmark's output.log file.
     /// Injected by the benchmark at runtime so the agent's full trace
     /// (JSON stream) is appended to the same log file as benchmark messages.
     pub output_log_path: Option<PathBuf>,
 
-    /// Directory where a read-only reference the agent modified is preserved
-    /// for review (`.harvest/rejected/<stage>/`). Injected by the benchmark.
-    pub rejected_output_dir: Option<PathBuf>,
+    /// Directory that records the read-only inputs the agent changed, one file each
+    /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
+    pub reference_audit_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
     /// Injected from the stage manifest when resuming from a snapshot, whose
@@ -596,9 +444,13 @@ fn default_fuzz() -> bool {
     true
 }
 
+impl ToolConfig for Config {
+    const KEY: &'static str = "verify_fix_agentic";
+}
+
 impl Config {
     fn validate(&self) {
-        unknown_field_warning("tools.verify_fix_agentic", &self.unknown);
+        unknown_field_warning(&format!("tools.{}", Self::KEY), &self.unknown);
         if self.verify_harness == VerifyHarness::Gtest && self.no_plan {
             warn!(
                 "tools.verify_fix_agentic: verify_harness = gtest is not applied under no_plan (that prompt is libloading-only); using libloading"
@@ -932,9 +784,9 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         ignore = "materialize_verify_env chmods build.sh; Miri has no chmod shim"
     )]
     fn gtest_only_cmake_has_no_fuzztest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let translated = tmp.path();
-        let c_src = translated.join("c_src");
+        let case = CaseDir::new().unwrap();
+        let workspace = &case.workspace();
+        let c_src = case.c_src();
         fs::create_dir_all(&c_src).unwrap();
         fs::write(
             c_src.join("CMakeLists.txt"),
@@ -942,18 +794,23 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         )
         .unwrap();
 
-        materialize_verify_env(translated, &c_src, false).unwrap();
-        let cml = fs::read_to_string(translated.join("verify_env/CMakeLists.txt")).unwrap();
+        materialize_verify_env(&case, false).unwrap();
+        let cml = fs::read_to_string(workspace.join("verify_env/CMakeLists.txt")).unwrap();
         assert!(cml.contains("XXH_NAMESPACE=LZ4_"));
+        // The C source is inputs/c_src of the checkout, a default that -DHARVEST_C_SRC replaces.
+        assert!(cml.contains(
+            "set(HARVEST_C_SRC \"${CMAKE_CURRENT_SOURCE_DIR}/../inputs/c_src\" CACHE PATH"
+        ));
+        assert!(cml.contains("\"${HARVEST_C_SRC}/src/*.c\""));
         assert!(cml.contains("GTest::gtest_main"));
         assert!(!cml.to_ascii_lowercase().contains("fuzz"));
-        assert!(!translated.join("verify_env/build_fuzz.sh").exists());
-        assert!(!translated.join("verify_env/run_fuzz.sh").exists());
-        assert!(translated.join("verify_env/run_tests.sh").exists());
-        assert!(translated.join("verify_env/memory_scope.sh").exists());
+        assert!(!workspace.join("verify_env/build_fuzz.sh").exists());
+        assert!(!workspace.join("verify_env/run_fuzz.sh").exists());
+        assert!(workspace.join("verify_env/run_tests.sh").exists());
+        assert!(workspace.join("verify_env/memory_scope.sh").exists());
         // Inspect every delivered file, not only CMake: comments and README
         // text must not reveal the optional mechanism to the control agent.
-        for entry in fs::read_dir(translated.join("verify_env")).unwrap() {
+        for entry in fs::read_dir(workspace.join("verify_env")).unwrap() {
             let path = entry.unwrap().path();
             assert!(path.is_file(), "unexpected scaffold directory: {path:?}");
             assert!(!path.file_name().unwrap().to_string_lossy().contains("fuzz"));
@@ -962,6 +819,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
                 assert!(!text.contains(hint), "{path:?} reveals {hint}");
             }
         }
+        case.finish();
     }
 
     // Escape hatch for the manual integration check: when VE_OUT is set,
@@ -970,9 +828,15 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     #[test]
     #[ignore]
     fn materialize_to_ve_out() {
+        // VE_OUT holds the C source in c_src/. The test copies it into a new case_dir, writes
+        // verify_env/ in its workspace and keeps the case_dir: its path goes to stderr.
         let out = std::path::PathBuf::from(std::env::var("VE_OUT").unwrap());
         let fuzz = std::env::var("VE_FUZZ").ok().as_deref() == Some("1");
-        materialize_verify_env(&out, &out.join("c_src"), fuzz).unwrap();
+        let case = CaseDir::new().unwrap();
+        harvest_core::cargo_utils::copy_directory_recursive(&out.join("c_src"), &case.c_src())
+            .unwrap();
+        materialize_verify_env(&case, fuzz).unwrap();
+        drop(case); // not finished: kept
     }
 
     #[test]
@@ -1009,23 +873,24 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         ignore = "materialize_verify_env chmods build.sh; Miri has no chmod shim"
     )]
     fn fuzz_cmake_wires_fuzztest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let translated = tmp.path();
-        let c_src = translated.join("c_src");
+        let case = CaseDir::new().unwrap();
+        let workspace = &case.workspace();
+        let c_src = case.c_src();
         fs::create_dir_all(&c_src).unwrap();
         fs::write(c_src.join("CMakeLists.txt"), "").unwrap();
 
-        materialize_verify_env(translated, &c_src, true).unwrap();
-        let cml = fs::read_to_string(translated.join("verify_env/CMakeLists.txt")).unwrap();
+        materialize_verify_env(&case, true).unwrap();
+        let cml = fs::read_to_string(workspace.join("verify_env/CMakeLists.txt")).unwrap();
         assert!(cml.contains("link_fuzztest(verification_tests)"));
         assert!(cml.contains("fuzztest_setup_fuzzing_flags()"));
         assert!(cml.contains("-UFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"));
         assert!(cml.contains(FUZZTEST_GIT_TAG));
         assert!(!cml.contains("GTest::gtest_main"));
-        assert!(translated.join("verify_env/build_fuzz.sh").exists());
-        assert!(translated.join("verify_env/run_fuzz.sh").exists());
-        assert!(translated.join("verify_env/run_tests.sh").exists());
-        assert!(translated.join("verify_env/memory_scope.sh").exists());
+        assert!(workspace.join("verify_env/build_fuzz.sh").exists());
+        assert!(workspace.join("verify_env/run_fuzz.sh").exists());
+        assert!(workspace.join("verify_env/run_tests.sh").exists());
+        assert!(workspace.join("verify_env/memory_scope.sh").exists());
+        case.finish();
     }
 
     #[test]

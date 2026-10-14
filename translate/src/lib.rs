@@ -9,7 +9,7 @@ pub mod util;
 use build_project_spec::BuildProjectSpec;
 use c_ast::ParseToAst;
 use conform_agentic::ConformAgentic;
-use harvest_core::config::{Config, Stage};
+use harvest_core::config::{Config, Stage, ToolConfig};
 use harvest_core::utils::get_version;
 use harvest_core::{HarvestIR, diagnostics};
 use load_raw_source::LoadRawSource;
@@ -24,6 +24,46 @@ use tracing::{error, info};
 use translate_agentic::TranslateAgentic;
 use try_cargo_build::TryCargoBuild;
 use verify_fix_agentic::VerifyFixAgentic;
+
+/// The settings a run of [`transpile`] uses, for the stage manifest: the agent and the resolved
+/// configuration of each agentic tool that runs, with the tool's own defaults filled in, or the
+/// configuration section of the non-agentic translator as given. Secrets (`env`, `api_key`) are
+/// left out. The tools are the ones [`transpile`] schedules for `config`.
+pub fn effective_config(config: &Config) -> Result<serde_json::Value, serde_json::Error> {
+    fn section<T: ToolConfig>(
+        config: &Config,
+        tools: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), serde_json::Error> {
+        tools.insert(
+            T::KEY.to_owned(),
+            serde_json::to_value(config.tool::<T>()?)?,
+        );
+        Ok(())
+    }
+    let mut tools = serde_json::Map::new();
+    if config.stages.is_empty() {
+        let key = if config.modular {
+            "modular_translation_llm"
+        } else {
+            "raw_source_to_cargo_llm"
+        };
+        let mut raw = config.tools.get(key).cloned().unwrap_or_default();
+        if let Some(fields) = raw.as_object_mut() {
+            fields.remove("api_key");
+            fields.remove("env");
+        }
+        tools.insert(key.to_owned(), raw);
+        return Ok(serde_json::json!({ "modular": config.modular, "tools": tools }));
+    }
+    for stage in &config.stages {
+        match stage {
+            Stage::Translate => section::<translate_agentic::Config>(config, &mut tools)?,
+            Stage::Verify => section::<verify_fix_agentic::Config>(config, &mut tools)?,
+            Stage::Conform => section::<conform_agentic::Config>(config, &mut tools)?,
+        }
+    }
+    Ok(serde_json::json!({ "agentic_agent": config.agentic_agent, "tools": tools }))
+}
 
 /// Performs the complete transpilation process using the scheduler.
 pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::Error>> {
@@ -95,4 +135,45 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
         return Err(e);
     }
     Ok(ir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_config_has_the_tools_of_the_stages() {
+        let mut config = Config::mock();
+        config.stages = vec![Stage::Translate, Stage::Verify];
+        config.tools.insert(
+            "verify_fix_agentic".to_owned(),
+            serde_json::json!({"fuzz": false, "env": {"KEY": "secret"}}),
+        );
+        let value = effective_config(&config).unwrap();
+        let tools = value["tools"].as_object().unwrap();
+        assert_eq!(
+            tools.keys().collect::<Vec<_>>(),
+            ["translate_agentic", "verify_fix_agentic"]
+        );
+        // Defaults filled in, overrides kept, secrets left out.
+        assert_eq!(tools["translate_agentic"]["tab2rust"], true);
+        assert_eq!(tools["verify_fix_agentic"]["fuzz"], false);
+        assert!(tools["verify_fix_agentic"].get("env").is_none());
+        assert_eq!(value["agentic_agent"], "opencode");
+    }
+
+    #[test]
+    fn effective_config_of_a_direct_translator_drops_secrets() {
+        let mut config = Config::mock();
+        config.tools.insert(
+            "raw_source_to_cargo_llm".to_owned(),
+            serde_json::json!({"model": "m", "api_key": "secret"}),
+        );
+        let value = effective_config(&config).unwrap();
+        assert_eq!(
+            value["tools"]["raw_source_to_cargo_llm"],
+            serde_json::json!({"model": "m"})
+        );
+        assert_eq!(value["modular"], false);
+    }
 }

@@ -1,7 +1,7 @@
 # Harvest Agentic Translator
 
 Harvest translates C projects into pure-Rust Cargo packages by driving coding
-agents (Claude Code, OpenCode, Kiro) through staged translation and
+agents (OpenCode, Claude Code, Kiro) through staged translation and
 verification, then grades the result against an external GoogleTest suite
 built from the C library's own upstream tests.
 The agentic translator builds on the ideas of
@@ -34,8 +34,8 @@ selects which ones run (bare `--agentic` means `translate,verify`), and a
 later stage can resume from an earlier run's output directory.
 
 1. **Translate** (`tools/translate_agentic`, stage `translate`/`t`). A coding
-   agent is launched in a fresh working directory containing the C source
-   under `c_src/`. It translates the project into a Cargo package and iterates
+   agent is launched in a fresh working directory; the C source is a read-only
+   input in its `inputs/`. It translates the project into a Cargo package and iterates
    until `cargo build --release` passes for every feature combination.
 2. **Verify & fix** (`tools/verify_fix_agentic`, stage `verify`/`v`). A second
    agent receives the Rust translation together with the C source. It builds a
@@ -82,6 +82,16 @@ cargo run --bin=benchmark --release -- --agentic=t,v,c --agent claude --model so
 
 The corresponding agent CLI must be installed and authenticated on your PATH.
 
+**OpenCode** (`--agent opencode`, alias `oc`; the default):
+
+- Models use `provider/model` format, e.g. `openrouter/deepseek/deepseek-v4-pro`,
+  `opencode-go/mimo-v2.5`, `xiaomi-token-plan-cn/mimo-v2.5-pro`. Any provider
+  configured in your OpenCode installation works.
+- The model's context/output limits are read from `opencode models --verbose`
+  and injected into the prompt so the agent knows its real window.
+- After each run, all OpenCode sessions (including sub-agents) are exported
+  and appended to the logs, so traces are complete.
+
 **Claude Code** (`--agent claude`):
 
 - Anthropic models: pass short aliases (`sonnet`, `opus`, `haiku`) or full
@@ -93,16 +103,6 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:3456`. Start CCR yourself
   beforehand (with the provider API keys exported in the same shell). Appending `[1m]` to the model name requests the 1M-context
   variant where the provider offers one.
-
-**OpenCode** (`--agent opencode`, alias `oc`):
-
-- Models use `provider/model` format, e.g. `openrouter/deepseek/deepseek-v4-pro`,
-  `opencode-go/mimo-v2.5`, `xiaomi-token-plan-cn/mimo-v2.5-pro`. Any provider
-  configured in your OpenCode installation works.
-- The model's context/output limits are read from `opencode models --verbose`
-  and injected into the prompt so the agent knows its real window.
-- After each run, all OpenCode sessions (including sub-agents) are exported
-  and appended to the logs, so traces are complete.
 
 **Kiro** (`--agent kiro`): legacy backend using per-project-kind prompts; kept for comparison.
 
@@ -140,11 +140,11 @@ harness build would otherwise report every test as a failure.
 | Flag | Meaning |
 |------|---------|
 | `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`conform` is an experimental research stage). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
-| `--agent <A>` | `claude`, `opencode`/`oc`, or `kiro` |
+| `--agent <A>` | `opencode`/`oc`, `claude`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
-| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or `--agent kiro` |
+| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |

@@ -7,7 +7,7 @@
 // input and asserts the observable results match.
 //
 // This is a starting point — replace the placeholder example with tests for the
-// actual public API (see c_src/include for the headers).
+// actual public API (see inputs/c_src/include for the headers).
 
 #include "gtest/gtest.h"
 
@@ -15,7 +15,7 @@
 #include "rust_lib.h"
 
 // --- C reference (linked statically) ----------------------------------------
-// Declare the C functions under test here, matching c_src/include signatures.
+// Declare the C functions under test here, matching inputs/c_src/include signatures.
 extern "C" {
 // Example:
 // int my_api(const unsigned char* in, int in_len, unsigned char* out, int cap);

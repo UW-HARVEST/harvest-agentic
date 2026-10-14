@@ -16,37 +16,36 @@
 //! - **The suite reaches only this stage.** It enters the pipeline as its own
 //!   representation, and only this tool declares it as an input, so rounds 1
 //!   and 2 cannot see the external tests by construction.
-//! - **The agent's edits to the suite are discarded and reported.** The suite
-//!   directories are read-only inputs guarded by
-//!   [`ReferenceGuard`](harvest_core::fs::ReferenceGuard): they are stripped
-//!   before the working directory is frozen, so an edited suite can neither be
-//!   graded nor leak into a later stage, and an edit leaves a warning plus a
-//!   preserved copy instead of no trace at all.
+//! - **The agent cannot change the suite it is graded on.** The suite is a
+//!   read-only input in case_dir's `inputs/`, outside the frozen workspace,
+//!   so an edited suite can neither be graded nor leak into a later stage.
+//!   [`ReferenceGuard`](harvest_core::fs::ReferenceGuard) reports an edit, so
+//!   it leaves a trace in the snapshot.
 
-use agent_runner::{AgentInvocation, AgentPhase};
+use agent_runner::case_dir::INPUTS;
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
 use full_source::{CargoPackage, ExternalTestSuite, RawSource, TestSuiteKind};
-use harvest_core::config::unknown_field_warning;
-use harvest_core::fs::{
-    RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
-};
+use harvest_core::config::{ToolConfig, unknown_field_warning};
+use harvest_core::stage_manifest::SUITE_DIR;
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, read_dir};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 const PROMPT_CONFORM: &str = include_str!("prompt_conform.md");
+/// How to build and run each kind of external suite (`{CONFORM_TEST_INSTRUCTIONS}`).
+const TEST_GTEST: &str = include_str!("test_gtest.md");
+const TEST_LIB: &str = include_str!("test_lib.md");
+const TEST_BIN: &str = include_str!("test_bin.md");
 
-/// The agent's persistent notes file (anti-compaction log) and its final
-/// gap-analysis report. Both are copied out to sidecar paths so a later
-/// stage's freeze cannot lose them.
-const CONFORM_NOTES: &str = "CONFORM.md";
+/// The agent's final gap-analysis report. It stays in the crate, like its notes
+/// file `CONFORM.md`.
 const CONFORM_REPORT: &str = "CONFORM_REPORT.md";
 
 /// Tool-specific configuration, read from `[tools.conform_agentic]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     /// Agent timeout in seconds.
     #[serde(default = "default_timeout_secs")]
@@ -57,27 +56,21 @@ pub struct Config {
     pub model: Option<String>,
 
     /// Extra environment variables to inject into the agent process.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub env: HashMap<String, String>,
 
     /// Destination path for the benchmark's output.log file, so the agent's
     /// full trace is appended to the same log as benchmark messages.
     pub output_log_path: Option<PathBuf>,
 
-    /// Directory where a read-only reference the agent modified is preserved
-    /// for review (`.harvest/rejected/<stage>/`). Injected by the benchmark.
-    pub rejected_output_dir: Option<PathBuf>,
+    /// Directory that records the read-only inputs the agent changed, one file each
+    /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
+    pub reference_audit_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
     /// Injected from the stage manifest when resuming from a snapshot, whose
     /// C source no longer sits inside the corpus.
     pub test_corpus_root: Option<PathBuf>,
-
-    /// Destination path for the agent's `CONFORM.md` notes.
-    pub notes_output_path: Option<PathBuf>,
-
-    /// Destination path for the agent's `CONFORM_REPORT.md` gap analysis.
-    pub report_output_path: Option<PathBuf>,
 
     #[serde(flatten)]
     unknown: HashMap<String, serde_json::Value>,
@@ -87,9 +80,13 @@ fn default_timeout_secs() -> u64 {
     agent_runner::DEFAULT_AGENT_TIMEOUT_SECS
 }
 
+impl ToolConfig for Config {
+    const KEY: &'static str = "conform_agentic";
+}
+
 impl Config {
     fn validate(&self) {
-        unknown_field_warning("tools.conform_agentic", &self.unknown);
+        unknown_field_warning(&format!("tools.{}", Self::KEY), &self.unknown);
     }
 }
 
@@ -105,14 +102,7 @@ impl Tool for ConformAgentic {
         context: RunContext,
         inputs: Vec<Id>,
     ) -> Result<Box<dyn Representation>, Box<dyn std::error::Error>> {
-        let default_config = serde_json::Value::Object(Default::default());
-        let config = Config::deserialize(
-            context
-                .config
-                .tools
-                .get("conform_agentic")
-                .unwrap_or(&default_config),
-        )?;
+        let config: Config = context.config.tool()?;
         config.validate();
 
         let cargo_package = context
@@ -128,31 +118,19 @@ impl Tool for ConformAgentic {
             .get::<ExternalTestSuite>(inputs[2])
             .ok_or("No ExternalTestSuite representation found in IR")?;
 
-        // case_dir/
-        //   translated_rust/        <- the Rust project to refine (work dir)
-        //     c_src/                <- C reference (semantic ground truth)
-        //     <suite dirs>/         <- external tests, revealed to the agent
-        let work_dir = tempfile::tempdir()?;
-        let case_dir = work_dir.path();
-        let translated = case_dir.join("translated_rust");
-        cargo_package.dir.materialize(&translated)?;
-
-        let c_src_dir = translated.join("c_src");
-        fs::create_dir_all(&c_src_dir)?;
-        raw_source.dir.materialize(&c_src_dir)?;
-
-        suite.dir.materialize(&translated)?;
-        // Both the C source and the suite are read-only inputs. Guarding the
-        // suite is what keeps this stage honest: an agent that "passes" by
-        // editing the tests is caught here rather than rewarded, since the
-        // edit is discarded and reported instead of frozen.
-        let references: Vec<&str> = std::iter::once("c_src")
-            .chain(suite.kind.dirs().iter().copied())
-            .collect();
-        let reference_guard = ReferenceGuard::capture(&translated, &references)?;
+        // The agent refines case_dir/workspace/, the materialized CargoPackage. The C source and
+        // the external suite are read-only inputs in case_dir/inputs/ (see agent_runner::CaseDir).
+        let case = CaseDir::new()?;
+        let workspace = case.workspace();
+        cargo_package.dir.materialize(&workspace)?;
+        raw_source.dir.materialize(case.c_src())?;
+        suite.dir.materialize(case.inputs().join(SUITE_DIR))?;
+        // Guarding the suite is what keeps this stage honest: an agent that "passes" by editing
+        // the tests is reported. The grade runs a pristine copy of the suite in any case.
+        let reference_guard = case.lock_inputs()?;
         info!(
             "Conform working directory: {} ({} suite revealed)",
-            case_dir.display(),
+            workspace.display(),
             suite.kind
         );
 
@@ -161,109 +139,52 @@ impl Tool for ConformAgentic {
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-        let model_limits = match (agent, &config.model) {
-            (harvest_core::config::AgentKind::OpenCode, Some(model)) => {
-                let limits = agent_runner::load_opencode_model_limits(model)?;
-                agent_runner::render_model_limits_block(&limits)
-            }
-            _ => String::new(),
-        };
+        let suite_path = format!("{INPUTS}/{SUITE_DIR}");
         let prompt = PROMPT_CONFORM
             .replace(
-                "{AGENT_BUG_WORKAROUNDS}",
-                agent_runner::agent_bug_workarounds(agent),
-            )
-            .replace("{GIT_DISCIPLINE}", agent_runner::git_discipline())
-            .replace(
                 "{CONFORM_TEST_INSTRUCTIONS}",
-                &test_instructions(suite.kind, &rust_toolchain_context.required_version),
+                &test_instructions(
+                    suite.kind,
+                    &suite_path,
+                    &rust_toolchain_context.required_version,
+                ),
             )
-            .replace("{EXTERNAL_TEST_DIRS}", &suite_dir_list(suite.kind))
             .replace(
-                "{RUST_TOOLCHAIN_CONTEXT}",
-                &rust_toolchain_context.prompt_block,
-            )
-            .replace(
-                "{WORKDIR_BOUNDARY}",
-                &agent_runner::render_workdir_boundary(agent, &translated),
-            )
-            .replace("{MODEL_LIMITS}", &model_limits);
+                "{EXTERNAL_TEST_DIRS}",
+                &suite_dir_list(suite.kind, &suite_path),
+            );
 
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Conform,
             agent,
-            work_dir: &translated,
+            case: &case,
             prompt: &prompt,
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             no_plan: false,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
-            rust_toolchain: Some(&rust_toolchain_context.required_version),
+            rust_toolchain: &rust_toolchain_context,
         })?;
         info!("Conformance refinement complete");
 
-        copy_out(
-            &translated,
-            CONFORM_NOTES,
-            config.notes_output_path.as_deref(),
-        );
-        copy_out(
-            &translated,
-            CONFORM_REPORT,
-            config.report_output_path.as_deref(),
-        );
-        if !translated.join(CONFORM_REPORT).is_file() {
+        if !workspace.join(CONFORM_REPORT).is_file() {
             warn!(
                 "conform agent did not produce {CONFORM_REPORT} (internal-vs-external gap analysis missing)"
             );
         }
 
-        // Sanitize the working directory before freezing it into the IR.
-        remove_hidden_entries(&translated)?;
-        reference_guard.strip(&translated, config.rejected_output_dir.as_deref())?;
-        let target_out = translated.join("target");
-        if target_out.exists()
-            && let Err(e) = fs::remove_dir_all(&target_out)
-        {
-            warn!(
-                "Failed to remove {} before freeze: {e}",
-                target_out.display()
-            );
-        }
-        if let Err(e) = remove_worktree_dir(&translated) {
-            warn!("Failed to remove leftover worktree dir: {e}");
-        }
-        for entry in collect_symlinks(&translated) {
-            warn!("translated_rust contains symlink: {}", entry);
-        }
-
-        let (dir, directories, files) = RawDir::populate_from(read_dir(&translated)?)?;
-        info!("Produced CargoPackage with {directories} directories and {files} files");
+        let dir = case.freeze(&reference_guard, config.reference_audit_dir.as_deref())?;
         Ok(Box::new(CargoPackage { dir }))
-    }
-}
-
-/// Copies an agent-written file out of the working directory before the
-/// tempdir is dropped. Absence is normal (the agent may skip the step).
-fn copy_out(translated: &Path, name: &str, dest: Option<&Path>) {
-    let src = translated.join(name);
-    let Some(dest) = dest else { return };
-    if !src.is_file() {
-        return;
-    }
-    match fs::copy(&src, dest) {
-        Ok(_) => info!("{name} written to {}", dest.display()),
-        Err(e) => warn!("Failed to copy {name} to {}: {e}", dest.display()),
     }
 }
 
 /// Renders the suite's directories as the backtick-quoted list the prompt
 /// splices into `{EXTERNAL_TEST_DIRS}`.
-fn suite_dir_list(kind: TestSuiteKind) -> String {
+fn suite_dir_list(kind: TestSuiteKind, suite: &str) -> String {
     kind.dirs()
         .iter()
-        .map(|d| format!("`{d}/`"))
+        .map(|d| format!("`{suite}/{d}/`"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -271,64 +192,13 @@ fn suite_dir_list(kind: TestSuiteKind) -> String {
 /// Builds the harness-specific "how to build and run the external tests" block
 /// injected into the prompt. Mirrors exactly what the benchmark grader runs so
 /// the agent iterates against the same commands.
-fn test_instructions(kind: TestSuiteKind, toolchain: &str) -> String {
-    match kind {
-        TestSuiteKind::Gtest => format!(
-            "The external tests are a **GoogleTest suite** in `gtest_suite/`. The\n\
-             grader builds your crate as a `cdylib`, then builds the suite against\n\
-             that `.so` and runs **each test in its own process** (a crash or\n\
-             timeout in one test never hides the others). Reproduce it exactly:\n\n\
-             ```bash\n\
-             # 1. Build your crate as a cdylib (Cargo.toml must set crate-type = [\"cdylib\"]).\n\
-             RUSTUP_TOOLCHAIN={tc} cargo build --release\n\
-             #    The .so lands in target/release/lib<crate>.so\n\n\
-             # 2. Configure + build the suite against YOUR freshly built library.\n\
-             cmake -S gtest_suite -B target/gtest_build -DCMAKE_BUILD_TYPE=Release \\\n\
-                   -DTEST_LIB_PATH=$(pwd)/target/release/lib<crate>.so\n\
-             cmake --build target/gtest_build -j\n\n\
-             # 3. Enumerate tests (parameterized cases expand here).\n\
-             LD_LIBRARY_PATH=$(pwd)/target/release \\\n\
-                 ./target/gtest_build/harvest_gtest --gtest_list_tests\n\n\
-             # 4. Run one test, in its own process, exactly like the grader.\n\
-             LD_LIBRARY_PATH=$(pwd)/target/release \\\n\
-                 ./target/gtest_build/harvest_gtest --gtest_filter='SuiteName.TestName'\n\
-             ```\n\n\
-             Read the failing test's source under `gtest_suite/` to learn the\n\
-             exact behavior it asserts, then trace back into `c_src/` for the\n\
-             reference semantics. Some tests are heavy (tens of seconds) — that is\n\
-             not a hang. Every public symbol the C library exports must also be\n\
-             exported by your crate, or the suite fails to link.",
-            tc = toolchain
-        ),
-        TestSuiteKind::Lib => format!(
-            "The external tests use the **cando2 library runner** (`runner/` +\n\
-             `test_vectors/`). The grader builds your crate as a `cdylib` and, for\n\
-             each vector, runs the compiled runner with `RUST_ARTIFACTS=1` so it\n\
-             loads YOUR `.so`. Reproduce it:\n\n\
-             ```bash\n\
-             RUSTUP_TOOLCHAIN={tc} cargo build --release          # cdylib -> target/release/lib<crate>.so\n\
-             RUSTUP_TOOLCHAIN={tc} cargo build --release --manifest-path runner/Cargo.toml\n\
-             # Per vector (bare filename; cando2 prepends test_vectors/):\n\
-             RUST_ARTIFACTS=1 LD_LIBRARY_PATH=$(pwd)/target/release \\\n\
-                 ./runner/target/release/<runner-bin> -t $(pwd) -v <vector>.json --rust lib\n\
-             ```\n\n\
-             A vector passes when the runner exits 0. Read `runner/src/main.rs`\n\
-             and the vector JSON to see what state is compared, and `c_src/` for\n\
-             the reference semantics.",
-            tc = toolchain
-        ),
-        TestSuiteKind::Bin => format!(
-            "The external tests are **executable/stdout** vectors in\n\
-             `test_vectors/`. The grader builds the `driver` binary and, for each\n\
-             vector, feeds `argv`/`stdin` and compares stdout to the expected\n\
-             pattern. Reproduce it:\n\n\
-             ```bash\n\
-             RUSTUP_TOOLCHAIN={tc} cargo build --release          # -> target/release/driver\n\
-             ./target/release/driver <argv...>  < <stdin>          # compare stdout to the vector\n\
-             ```\n\n\
-             Each `test_vectors/*.json` gives `argv`, `stdin`, and the expected\n\
-             `stdout`. Read `c_src/` for the reference behavior.",
-            tc = toolchain
-        ),
-    }
+fn test_instructions(kind: TestSuiteKind, suite: &str, toolchain: &str) -> String {
+    let text = match kind {
+        TestSuiteKind::Gtest => TEST_GTEST,
+        TestSuiteKind::Lib => TEST_LIB,
+        TestSuiteKind::Bin => TEST_BIN,
+    };
+    text.trim_end()
+        .replace("{SUITE}", suite)
+        .replace("{TOOLCHAIN}", toolchain)
 }

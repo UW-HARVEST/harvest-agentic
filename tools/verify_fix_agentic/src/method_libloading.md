@@ -4,16 +4,16 @@ You compare C against Rust from **inside a Rust integration test**: build the C
 code as a shared library, `dlopen` it with the `libloading` crate, and call the
 C and Rust implementations side by side on the same inputs.
 
-Build the C code as a shared library first. Look at `c_src/CMakeLists.txt` to
+Build the C code as a shared library first. Look at `inputs/c_src/CMakeLists.txt` to
 understand the build system, then:
 
 ```
-cd c_src && mkdir -p build && cd build && \
-cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
-cmake --build .
+cmake -S inputs/c_src -B scratch/c-build \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
+cmake --build scratch/c-build
 ```
 
-Find the resulting `.so` files in the build output.
+Find the resulting `.so` files in `scratch/c-build`.
 
 Then do the actual verification:
 

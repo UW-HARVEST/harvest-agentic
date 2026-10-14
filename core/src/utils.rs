@@ -52,10 +52,10 @@ pub enum EmptyDirError {
     NotWritable,
 }
 
-/// Returns the version string for this build of HARVEST.
-/// These environment variables are set in build.rs.
+/// Returns the version string for this build of HARVEST: `<sha>[*] (<date>)`, and for a build
+/// from a changed working tree (`*`) also `diff <hash of git diff HEAD>`. Set in build.rs.
 pub fn get_version() -> &'static str {
-    concat!(env!("GIT_SHA"), " (", env!("GIT_DATE"), ")")
+    env!("HARVEST_VERSION")
 }
 
 /// Returns the git revision of the checkout containing `dir`, in the same

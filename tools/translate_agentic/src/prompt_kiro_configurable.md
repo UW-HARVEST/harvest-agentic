@@ -1,13 +1,13 @@
 <!-- markdownlint-disable MD041 -->
-Translate the C code in c_src/ to Rust that produces **byte-identical output** for the same inputs.
-Write Cargo.toml and src/ files in the current directory (NOT in c_src/).
+Translate the C code in inputs/c_src to Rust that produces **byte-identical output** for the same inputs.
+Write Cargo.toml and src/ files in the current directory (NOT in inputs/c_src).
 
 You MUST translate ALL C source files — no stubs, no placeholders, no empty
 functions. Every .c file MUST have a complete Rust equivalent. The binary MUST
 produce the same stdout as the C binary for the same inputs.
 
 This project has **build-time configurability** via CMake cache variables.
-Look at c_src/CMakeLists.txt — it uses variables to select which source files
+Look at inputs/c_src/CMakeLists.txt — it uses variables to select which source files
 to compile and which parameter headers to include at build time.
 
 You MUST preserve this configurability using **Cargo features**. Each CMake cache
@@ -59,7 +59,7 @@ Requirements:
 - Do NOT fix bugs in the original C code — reproduce behavior exactly
 - Use safe Rust internally where possible
 
-Do NOT modify anything in c_src/.
+Do NOT modify anything in inputs/c_src.
 
 {MODEL_LIMITS}
 
@@ -72,7 +72,7 @@ As you work through this translation, pay attention to moments where you think:
 - "If I had a tool that could do Y, I would have much higher confidence in this translation step."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:
@@ -91,3 +91,5 @@ Field definitions:
 
 ## Git discipline
 {GIT_DISCIPLINE}
+
+{CASE_LAYOUT}

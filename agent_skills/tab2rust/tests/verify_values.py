@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True  # no __pycache__ in the skill directory (it is embedded and copied to agents)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
 from tab2rust_lib import gdbrun, records  # noqa: E402
 from tab2rust_lib.emit import index_path  # noqa: E402

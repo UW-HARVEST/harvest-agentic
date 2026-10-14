@@ -1,4 +1,4 @@
-# C-to-Rust conformance refinement (third stage)
+# C-to-Rust conformance refinement
 
 You are given a Rust project that was already translated from C and then
 verified against the translator's **own, internally generated** tests. It
@@ -8,18 +8,18 @@ pass**, by fixing the Rust — without weakening or gaming the tests.
 
 {AGENT_BUG_WORKAROUNDS}
 
-{WORKDIR_BOUNDARY}
+{CASE_LAYOUT}
 
 {RUST_TOOLCHAIN_CONTEXT}
 
 {MODEL_LIMITS}
 
-## What is in your working directory
+## What you have
 
 - `src/`, `Cargo.toml`, `Cargo.lock` — the Rust project you are refining. This
   is the ONLY code you may change.
-- `c_src/` — the original C source. It is the **semantic ground truth**:
-  when a test expects some value, `c_src/` is where you learn *why*. Never
+- `inputs/c_src` — the original C source. It is the **semantic ground truth**:
+  when a test expects some value, `inputs/c_src` is where you learn *why*. Never
   modify it.
 - `{EXTERNAL_TEST_DIRS}` — the **external test suite**. This is your target.
   You may read it and run it, but you must NOT modify it (see rules below).
@@ -27,8 +27,8 @@ pass**, by fixing the Rust — without weakening or gaming the tests.
   verify stage (a differential harness comparing Rust against C). These are
   **context, not your target**: they already pass. They show you what was
   checked before — and, by omission, what was missed.
-- `PLAN.md` / `plan_translate.md` — the original translation plan (round 1).
-- `HYPOTHESES.md` / `hypotheses_verify.md` — the verify stage's bug-hypothesis
+- `PLAN.md` — the original translation plan (round 1).
+- `HYPOTHESES.md` — the verify stage's bug-hypothesis
   log (round 2). Read it first: it often already names suspected defects
   (e.g. "decompress corrupts inputs over N bytes") that are exactly what the
   external tests will catch. Treat it as a set of leads.
@@ -55,11 +55,11 @@ test, your hypothesis for the cause, the fix, and the outcome.
 ### Ground truth
 - The EXTERNAL test suite in {EXTERNAL_TEST_DIRS} defines success. The goal is
   zero external-test failures.
-- `c_src/` is the semantic reference explaining WHY a test expects a value.
+- `inputs/c_src` is the semantic reference explaining WHY a test expects a value.
   If Rust and C disagree, the C behavior is correct — fix Rust.
 
 ### Boundaries
-- Only `src/` and `Cargo.toml` may change. NEVER modify `c_src/`, the external
+- Only `src/` and `Cargo.toml` may change. NEVER modify `inputs/c_src`, the external
   test suite ({EXTERNAL_TEST_DIRS}), or `tests/`.
 - The final grade re-runs the SAME external suite from a pristine copy, so any
   edit to the tests is discarded and counts as cheating. Editing tests can
@@ -110,13 +110,13 @@ killed and **counts as a failure**.
 1. Build and run the whole external suite once; record every failure in
    `CONFORM.md`.
 2. Triage: group failures by likely root cause. Read the failing test source
-   to learn the exact expected behavior, then read the corresponding `c_src/`
+   to learn the exact expected behavior, then read the corresponding `inputs/c_src`
    to learn the correct semantics.
 3. Fix the Rust in `src/`. Re-run the specific failing test, then the whole
    suite to catch regressions.
 4. For independent bugs, delegate to sub-agents so they can be worked in
    parallel — each with a precise, self-contained task and the relevant
-   `c_src/` reference.
+   `inputs/c_src` reference.
 5. Repeat until the external suite reports **zero failures**. Long-running
    tests are normal; do not mistake them for hangs.
 
@@ -141,7 +141,7 @@ internal tests and the external tests**.
 
 - Which external tests failed on arrival (before your fixes)? List them.
 - For each, was the underlying bug something the internal tests in `tests/`
-  (and the `hypotheses_verify.md` log) *could* have caught but didn't? Explain
+  (and the `HYPOTHESES.md` log) *could* have caught but didn't? Explain
   **why the internal differential harness failed to capture it**.
 - Categorize the misses (missing API coverage, missing input diversity,
   missing multi-call/stateful sequences, missing edge cases, ABI/export gaps,

@@ -20,16 +20,16 @@ const HARVEST_SHELL_INNER: &str = include_str!("agent_env/harvest-shell-inner");
 const SLICE: &str = "harvest.slice";
 const SLICE_LIMITS: [&str; 2] = ["MemoryMax=5G", "MemorySwapMax=10G"];
 
-/// Writes the shell into `<run_tempdir>/agent_env/` and returns its path.
+/// Writes the shell into `<case_dir>/agent_env/` and returns its path.
 /// `None` when the slice limits cannot be set: commands then run unlimited.
-pub(crate) fn install(run_tempdir: &Path) -> Option<PathBuf> {
-    try_install(run_tempdir)
+pub(crate) fn install(case_root: &Path) -> Option<PathBuf> {
+    try_install(case_root)
         .inspect_err(|e| warn!("Agent commands run without memory limits: {e}"))
         .ok()
 }
 
-fn try_install(run_tempdir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let dir = run_tempdir.join("agent_env");
+fn try_install(case_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = case_root.join("agent_env");
     fs::create_dir_all(&dir)?;
     for (name, script) in [
         ("harvest-shell", HARVEST_SHELL),

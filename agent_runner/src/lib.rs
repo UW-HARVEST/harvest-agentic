@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 mod agent_env;
+pub mod case_dir;
+
+pub use case_dir::CaseDir;
 
 #[derive(Debug, Clone, Copy)]
 pub enum AgentPhase {
@@ -83,17 +86,42 @@ const TIMEOUT_EXIT_CODE: i32 = 124;
 pub struct AgentInvocation<'a> {
     pub phase: AgentPhase,
     pub agent: AgentKind,
-    pub work_dir: &'a Path,
+    /// The run directory. The agent works in its workspace.
+    pub case: &'a CaseDir,
+    /// The prompt template, with the placeholders of the tool filled in. [`invoke_agent`] fills
+    /// the shared ones (`AgentInvocation::render_prompt`).
     pub prompt: &'a str,
     pub timeout_secs: u64,
     pub model: Option<&'a str>,
     pub no_plan: bool,
     pub extra_env: &'a HashMap<String, String>,
     pub output_log_path: Option<&'a Path>,
-    pub rust_toolchain: Option<&'a str>,
+    pub rust_toolchain: &'a RustToolchainContext,
 }
 
 impl AgentInvocation<'_> {
+    /// The prompt with the placeholders that all main prompts share filled in:
+    /// `{AGENT_BUG_WORKAROUNDS}`, `{GIT_DISCIPLINE}`, `{RUST_TOOLCHAIN_CONTEXT}`,
+    /// `{CASE_LAYOUT}` and `{MODEL_LIMITS}`.
+    fn render_prompt(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let model_limits = match (self.agent, self.model) {
+            (AgentKind::OpenCode, Some(model)) => {
+                render_model_limits_block(&load_opencode_model_limits(model)?)
+            }
+            _ => String::new(),
+        };
+        Ok(self
+            .prompt
+            .replace("{AGENT_BUG_WORKAROUNDS}", agent_bug_workarounds(self.agent))
+            .replace("{GIT_DISCIPLINE}", git_discipline())
+            .replace(
+                "{RUST_TOOLCHAIN_CONTEXT}",
+                &self.rust_toolchain.prompt_block,
+            )
+            .replace("{CASE_LAYOUT}", self.case.layout())
+            .replace("{MODEL_LIMITS}", &model_limits))
+    }
+
     /// Whether the prompt instructs the agent to maintain persistent plan
     /// files (PLAN.md / HYPOTHESES.md). `no_plan` (no plan, no sub-agent push)
     /// drops that instruction, so the per-turn "read PLAN.md after compaction"
@@ -463,16 +491,27 @@ fn extract_model_limits_from_output(
     None
 }
 
+/// The command of the agent CLI.
+fn cli_name(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::OpenCode => "opencode",
+        AgentKind::Claude => "claude",
+        AgentKind::Kiro => "kiro-cli",
+    }
+}
+
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    ensure_workdir_git(invocation.work_dir);
+    let prompt = invocation.render_prompt()?;
+    let invocation = AgentInvocation {
+        prompt: &prompt,
+        ..invocation
+    };
+    ensure_workdir_git(&invocation.case.workspace());
+    invocation.case.commit_links();
 
     prepare_agent_env(&invocation)?;
 
-    let logs_dir = invocation
-        .work_dir
-        .parent()
-        .unwrap_or(invocation.work_dir)
-        .join("logs");
+    let logs_dir = invocation.case.root().join("logs");
     fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join(invocation.phase.log_file_name());
     // Start the phase with an empty log; the first run and every resume append to it.
@@ -589,12 +628,9 @@ fn iso_utc_now() -> String {
 fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
         AgentKind::Kiro => {}
-        AgentKind::Claude => {
-            let case_dir = invocation.work_dir.parent().unwrap_or(invocation.work_dir);
-            write_claude_sandbox(case_dir)?;
-        }
+        AgentKind::Claude => write_claude_sandbox(invocation.case.root())?,
         AgentKind::OpenCode => write_opencode_agent(
-            invocation.work_dir,
+            invocation.case,
             OpenCodeAgentConfig {
                 name: invocation.phase.opencode_agent_name(),
                 description: invocation.phase.opencode_description(),
@@ -605,7 +641,7 @@ fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std
                     .then(|| format!("cat {}", invocation.phase.recovery_files().join(" "))),
             },
             invocation.model,
-            agent_env::install(run_tempdir(invocation.work_dir)).as_deref(),
+            agent_env::install(invocation.case.root()).as_deref(),
         )?,
     }
     Ok(())
@@ -625,7 +661,6 @@ fn invoke_kiro(
         invocation,
         log_path,
         invocation.timeout_secs,
-        "kiro-cli",
         &[
             "chat",
             "--no-interactive",
@@ -669,13 +704,7 @@ fn invoke_claude(
         "stream-json",
         "--verbose",
     ]);
-    run_agent(
-        invocation,
-        log_path,
-        invocation.timeout_secs,
-        "claude",
-        &args,
-    )
+    run_agent(invocation, log_path, invocation.timeout_secs, &args)
 }
 
 fn invoke_opencode(
@@ -706,7 +735,6 @@ fn invoke_opencode(
         invocation,
         log_path,
         invocation.timeout_secs,
-        "opencode",
         &opencode_run_args(invocation, None, invocation.prompt),
     )?;
 
@@ -805,7 +833,6 @@ fn invoke_opencode(
                     invocation,
                     log_path,
                     remaining_secs,
-                    "opencode",
                     &opencode_run_args(invocation, Some(&session_id), OPENCODE_RESUME_PROMPT),
                 )?;
             }
@@ -853,24 +880,22 @@ fn run_agent(
     invocation: &AgentInvocation<'_>,
     log_path: &Path,
     timeout_secs: u64,
-    program: &str,
     args: &[&str],
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let mut cmd = Command::new("timeout");
     cmd.arg(timeout_secs.to_string())
-        .arg(program)
+        .arg(cli_name(invocation.agent))
         .args(args)
         .env("OPENSSL_DIR", openssl_dir)
-        .current_dir(invocation.work_dir)
+        .current_dir(invocation.case.workspace())
         // OpenCode takes its project directory from $PWD before the real cwd,
         // and `current_dir` leaves the inherited $PWD pointing at ours.
-        .env("PWD", std::path::absolute(invocation.work_dir)?);
+        .env("PWD", std::path::absolute(invocation.case.workspace())?);
 
-    if let Some(toolchain) = invocation.rust_toolchain {
-        info!("Injecting RUSTUP_TOOLCHAIN={toolchain}");
-        cmd.env("RUSTUP_TOOLCHAIN", toolchain);
-    }
+    let toolchain = &invocation.rust_toolchain.required_version;
+    info!("Injecting RUSTUP_TOOLCHAIN={toolchain}");
+    cmd.env("RUSTUP_TOOLCHAIN", toolchain);
 
     if invocation.agent == AgentKind::OpenCode {
         // Hide the user-global OpenCode config from the run. OpenCode
@@ -881,7 +906,7 @@ fn run_agent(
         // without disabling the project-local compaction-recovery plugin.
         // Auth (XDG data dir) and the models cache (XDG cache dir) are
         // unaffected.
-        let xdg_config = run_tempdir(invocation.work_dir).join("xdg-config");
+        let xdg_config = invocation.case.root().join("xdg-config");
         info!(
             "Injecting XDG_CONFIG_HOME={} (run-private, replaces --pure isolation)",
             xdg_config.display()
@@ -1306,12 +1331,6 @@ const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[
     ("skill", "deny"),
 ];
 
-/// The run's private temp directory: the parent of `work_dir`
-/// (`/tmp/.tmpXXXX` for `/tmp/.tmpXXXX/translated_rust`).
-fn run_tempdir(work_dir: &Path) -> &Path {
-    work_dir.parent().unwrap_or(work_dir)
-}
-
 /// Project-level OpenCode config written alongside the agent definitions.
 /// `external_directory` defaults to "ask", and task sub-agent sessions do not
 /// inherit `--dangerously-skip-permissions`, so in a headless run any
@@ -1327,12 +1346,12 @@ fn run_tempdir(work_dir: &Path) -> &Path {
 /// `shell` runs the agent's commands under memory limits (see `agent_env`).
 /// OpenCode uses it for tool calls, sub-agents included.
 fn opencode_project_config(
-    work_dir: &Path,
+    case_root: &Path,
     model: Option<&str>,
     staged_provider: Option<&(String, serde_json::Value)>,
     shell: Option<&Path>,
 ) -> String {
-    let tempdir_pattern = format!("{}/**", run_tempdir(work_dir).display());
+    let tempdir_pattern = format!("{}/**", case_root.display());
     // The pin wins over a staged entry: a user shadowing a built-in provider
     // (e.g. openrouter) keeps today's routing behavior.
     let provider_value = openrouter_provider_pin(model).or_else(|| {
@@ -1454,32 +1473,14 @@ fn custom_provider_stage(
     }
 }
 
-const WORKDIR_BOUNDARY_TEMPLATE: &str = r#"### Filesystem boundary
-- `{TEMPDIR}` is the ONLY directory you may read or write.
-- Keep all scratch files inside the project directory.
-- Prefer relative paths. Never retype the absolute temp-directory prefix
-  by hand: a single typo in it makes the path "external" and the call is
-  denied.
-- When you dispatch sub-agents, copy this entire "Filesystem boundary"
-  section into every sub-agent prompt verbatim."#;
-
-/// Prompt block telling the agent it may only touch files under this run's
-/// temp directory, mirroring the `external_directory` policy that
-/// `opencode_project_config` enforces. Rendered for OpenCode only. Other
-/// agents get an empty string (substituted for `{WORKDIR_BOUNDARY}`).
-pub fn render_workdir_boundary(agent: AgentKind, work_dir: &Path) -> String {
-    if agent != AgentKind::OpenCode {
-        return String::new();
-    }
-    WORKDIR_BOUNDARY_TEMPLATE.replace("{TEMPDIR}", &run_tempdir(work_dir).display().to_string())
-}
-
+/// Writes the OpenCode project config and agent definition into the workspace of `case`.
 fn write_opencode_agent(
-    work_dir: &Path,
+    case: &CaseDir,
     config: OpenCodeAgentConfig<'_>,
     model: Option<&str>,
     shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let work_dir = case.workspace();
     let agents_dir = work_dir.join(".opencode/agents");
     fs::create_dir_all(&agents_dir)?;
 
@@ -1487,7 +1488,7 @@ fn write_opencode_agent(
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
     fs::write(
         work_dir.join(".opencode/opencode.json"),
-        opencode_project_config(work_dir, model, staged.as_ref(), shell),
+        opencode_project_config(case.root(), model, staged.as_ref(), shell),
     )?;
 
     let mut permissions = String::new();
@@ -1584,7 +1585,7 @@ pub fn ensure_workdir_git(work_dir: &Path) {
     );
     if let Err(e) = fs::write(
         work_dir.join(".gitignore"),
-        "# Framework-written: build outputs and worktrees stay untracked.\ntarget/\nbuild*/\ncbuild/\nwt/\n.opencode/\n",
+        "# Framework-written: build outputs, scratch and worktrees stay untracked.\ntarget/\nbuild*/\ncbuild/\nscratch/\nwt/\n.opencode/\n",
     ) {
         warn!("failed to write .gitignore in {}: {e}", work_dir.display());
     }
@@ -1599,6 +1600,35 @@ pub fn ensure_workdir_git(work_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_prompt_fills_shared_placeholders() {
+        let case = CaseDir::new().unwrap();
+        let toolchain = RustToolchainContext {
+            required_version: "1.94.1".to_owned(),
+            prompt_block: "TOOLCHAIN".to_owned(),
+            test_corpus_root: None,
+        };
+        let env = HashMap::new();
+        let invocation = AgentInvocation {
+            phase: AgentPhase::Translate,
+            agent: AgentKind::Claude,
+            case: &case,
+            prompt: "{AGENT_BUG_WORKAROUNDS}\n{GIT_DISCIPLINE}\n{RUST_TOOLCHAIN_CONTEXT}\n\
+                     {CASE_LAYOUT}\n{MODEL_LIMITS}",
+            timeout_secs: 1,
+            model: None,
+            no_plan: false,
+            extra_env: &env,
+            output_log_path: None,
+            rust_toolchain: &toolchain,
+        };
+        let prompt = invocation.render_prompt().unwrap();
+        assert!(prompt.contains("TOOLCHAIN"));
+        assert!(prompt.contains("### Directories of this run"));
+        assert!(!prompt.contains('{'), "{prompt}");
+        case.finish();
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)] // spawns git; Miri cannot run subprocesses
@@ -1767,9 +1797,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_project_config_scopes_external_directory_to_run_tempdir() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, None, None, None);
+    fn opencode_project_config_scopes_external_directory_to_case_dir() {
+        let case_root = Path::new("/tmp/.tmpAbc123");
+        let raw = opencode_project_config(case_root, None, None, None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         let rules = config
@@ -1790,7 +1820,7 @@ mod tests {
 
     #[test]
     fn opencode_project_config_disables_snapshot() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let case_root = Path::new("/tmp/.tmpAbc123");
         let staged = (
             "harvest-hyak".to_string(),
             serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
@@ -1800,7 +1830,7 @@ mod tests {
             (Some("openrouter/xiaomi/mimo-v2.5-pro"), None),
             (Some("harvest-hyak/qwen3.8-27b"), Some(&staged)),
         ] {
-            let raw = opencode_project_config(work_dir, model, staged, None);
+            let raw = opencode_project_config(case_root, model, staged, None);
             let config: serde_json::Value =
                 serde_json::from_str(&raw).expect("project config must be valid JSON");
             assert_eq!(config.get("snapshot"), Some(&serde_json::json!(false)));
@@ -1809,10 +1839,10 @@ mod tests {
 
     #[test]
     fn opencode_project_config_sets_shell_only_when_given() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let case_root = Path::new("/tmp/.tmpAbc123");
         let shell = Path::new("/tmp/.tmpAbc123/agent_env/harvest-shell");
         let with: serde_json::Value =
-            serde_json::from_str(&opencode_project_config(work_dir, None, None, Some(shell)))
+            serde_json::from_str(&opencode_project_config(case_root, None, None, Some(shell)))
                 .expect("project config must be valid JSON");
         assert_eq!(
             with.get("shell"),
@@ -1821,15 +1851,15 @@ mod tests {
             ))
         );
         let without: serde_json::Value =
-            serde_json::from_str(&opencode_project_config(work_dir, None, None, None)).unwrap();
+            serde_json::from_str(&opencode_project_config(case_root, None, None, None)).unwrap();
         assert!(without.get("shell").is_none());
     }
 
     #[test]
     fn opencode_project_config_pins_openrouter_to_author_endpoint() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let case_root = Path::new("/tmp/.tmpAbc123");
         let raw = opencode_project_config(
-            work_dir,
+            case_root,
             Some("openrouter/xiaomi/mimo-v2.5-pro"),
             None,
             None,
@@ -1851,8 +1881,8 @@ mod tests {
 
     #[test]
     fn opencode_project_config_no_pin_for_non_openrouter() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let raw = opencode_project_config(work_dir, Some("opencode-go/mimo-v2.5"), None, None);
+        let case_root = Path::new("/tmp/.tmpAbc123");
+        let raw = opencode_project_config(case_root, Some("opencode-go/mimo-v2.5"), None, None);
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
         assert!(config.get("provider").is_none());
@@ -1860,13 +1890,13 @@ mod tests {
 
     #[test]
     fn opencode_project_config_stages_custom_provider() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let case_root = Path::new("/tmp/.tmpAbc123");
         let definition = serde_json::json!({
             "npm": "@ai-sdk/openai-compatible",
             "options": { "baseURL": "https://endpoint.example/v1" }
         });
         let raw = opencode_project_config(
-            work_dir,
+            case_root,
             Some("harvest-hyak/qwen3.8-27b"),
             Some(&("harvest-hyak".to_string(), definition)),
             None,
@@ -1883,9 +1913,9 @@ mod tests {
 
     #[test]
     fn opencode_project_config_prefers_openrouter_pin_over_staged_entry() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
+        let case_root = Path::new("/tmp/.tmpAbc123");
         let raw = opencode_project_config(
-            work_dir,
+            case_root,
             Some("openrouter/xiaomi/mimo-v2.5-pro"),
             Some(&(
                 "openrouter".to_string(),
@@ -1906,9 +1936,10 @@ mod tests {
 
     #[test]
     fn write_opencode_agent_writes_project_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let case = CaseDir::new().unwrap();
+        let dir = case.workspace();
         write_opencode_agent(
-            dir.path(),
+            &case,
             OpenCodeAgentConfig {
                 name: "harvest-translate",
                 description: "test",
@@ -1918,31 +1949,29 @@ mod tests {
             None,
         )
         .unwrap();
-        let config = fs::read_to_string(dir.path().join(".opencode/opencode.json")).unwrap();
+        let config = fs::read_to_string(dir.join(".opencode/opencode.json")).unwrap();
         assert_eq!(
             config,
-            opencode_project_config(dir.path(), None, None, None)
+            opencode_project_config(case.root(), None, None, None)
         );
         let agent_md =
-            fs::read_to_string(dir.path().join(".opencode/agents/harvest-translate.md")).unwrap();
+            fs::read_to_string(dir.join(".opencode/agents/harvest-translate.md")).unwrap();
         // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
         // official default provider system prompt applies. The compaction
         // hint lives in the plugin, not here.
         assert!(agent_md.ends_with("---\n"));
         assert!(!agent_md.contains("compaction"));
         // No recovery command -> no plugin.
-        assert!(
-            !dir.path()
-                .join(".opencode/plugin/compaction-recovery.js")
-                .exists()
-        );
+        assert!(!dir.join(".opencode/plugin/compaction-recovery.js").exists());
+        case.finish();
     }
 
     #[test]
     fn write_opencode_agent_writes_compaction_recovery_plugin() {
-        let dir = tempfile::tempdir().unwrap();
+        let case = CaseDir::new().unwrap();
+        let dir = case.workspace();
         write_opencode_agent(
-            dir.path(),
+            &case,
             OpenCodeAgentConfig {
                 name: "harvest-verify",
                 description: "test",
@@ -1953,24 +1982,14 @@ mod tests {
         )
         .unwrap();
         let plugin =
-            fs::read_to_string(dir.path().join(".opencode/plugin/compaction-recovery.js")).unwrap();
+            fs::read_to_string(dir.join(".opencode/plugin/compaction-recovery.js")).unwrap();
         assert!(plugin.contains("run `cat PLAN.md HYPOTHESES.md` to restore"));
         assert!(!plugin.contains("{RECOVERY_CMD}"));
         assert!(plugin.contains("experimental.chat.messages.transform"));
         assert!(plugin.contains("experimental.session.compacting"));
         // Fallback predicate must not depend solely on the unstable metadata marker.
         assert!(plugin.contains("Continue if you have next steps"));
-    }
-
-    #[test]
-    fn workdir_boundary_rendered_for_opencode_only() {
-        let work_dir = Path::new("/tmp/.tmpAbc123/translated_rust");
-        let block = render_workdir_boundary(AgentKind::OpenCode, work_dir);
-        assert!(block.starts_with("### Filesystem boundary"));
-        assert!(block.contains("/tmp/.tmpAbc123"));
-        assert!(block.contains("sub-agent prompt"));
-        assert_eq!(render_workdir_boundary(AgentKind::Claude, work_dir), "");
-        assert_eq!(render_workdir_boundary(AgentKind::Kiro, work_dir), "");
+        case.finish();
     }
 
     #[test]

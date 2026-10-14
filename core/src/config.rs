@@ -2,6 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::{collections::HashMap, path::PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,15 +11,14 @@ use serde_json::Value;
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     #[default]
-    Kiro,
-    Claude,
     OpenCode,
+    Claude,
+    /// Legacy backend with per-project-kind prompts, kept for comparison.
+    Kiro,
 }
 
 /// One agentic pipeline stage. Stages compose in pipeline order
 /// (translate < verify < conform); a run executes an ordered subset.
-/// `Conform` is driven by the benchmark binary and never enters
-/// [`crate::HarvestIR`]-based scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
@@ -55,9 +55,24 @@ impl FromStr for Stage {
 impl fmt::Display for AgentKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AgentKind::Kiro => write!(f, "kiro"),
-            AgentKind::Claude => write!(f, "claude"),
             AgentKind::OpenCode => write!(f, "opencode"),
+            AgentKind::Claude => write!(f, "claude"),
+            AgentKind::Kiro => write!(f, "kiro"),
+        }
+    }
+}
+
+impl FromStr for AgentKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "opencode" | "oc" => Ok(AgentKind::OpenCode),
+            "claude" => Ok(AgentKind::Claude),
+            "kiro" => Ok(AgentKind::Kiro),
+            other => Err(format!(
+                "unknown agent kind: {other} (expected: opencode/oc, claude, kiro)"
+            )),
         }
     }
 }
@@ -93,8 +108,6 @@ pub struct Config {
 
     /// Which agentic stages to run, in pipeline order. Empty means the run is
     /// not agentic (direct LLM translation tools are used instead).
-    /// `Stage::Conform` is not valid here (the benchmark drives conform
-    /// outside the IR pipeline).
     #[serde(default)]
     pub stages: Vec<Stage>,
 
@@ -124,6 +137,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// The `[tools.<KEY>]` section as the tool's config type. A missing section is an empty
+    /// table, so the defaults of the type apply.
+    pub fn tool<T: ToolConfig>(&self) -> Result<T, serde_json::Error> {
+        match self.tools.get(T::KEY) {
+            Some(section) => T::deserialize(section),
+            None => T::deserialize(Value::Object(Default::default())),
+        }
+    }
+
     /// Returns a mock config for testing.
     pub fn mock() -> Self {
         Self {
@@ -180,6 +202,13 @@ impl Config {
     }
 }
 
+/// The config type of a tool: the `[tools.<KEY>]` section of the HARVEST config. It is
+/// serialized for the stage manifest.
+pub trait ToolConfig: DeserializeOwned + Serialize {
+    /// The name of the config section.
+    const KEY: &'static str;
+}
+
 /// Prints out a warning message for every field in `unknown`.
 ///
 /// This is intended for use by config validation routines. `prefix` should be the path to this
@@ -191,4 +220,48 @@ pub fn unknown_field_warning(prefix: &str, unknown: &HashMap<String, Value>) {
         "" => eprintln!("Warning: unknown config key {name}"),
         p => eprintln!("Warning: unknown config key {p}.{name}"),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_kind_parses_names_and_alias() {
+        assert_eq!("opencode".parse::<AgentKind>(), Ok(AgentKind::OpenCode));
+        assert_eq!("OC".parse::<AgentKind>(), Ok(AgentKind::OpenCode));
+        assert_eq!("claude".parse::<AgentKind>(), Ok(AgentKind::Claude));
+        assert_eq!("kiro".parse::<AgentKind>(), Ok(AgentKind::Kiro));
+        assert!(
+            "gpt"
+                .parse::<AgentKind>()
+                .unwrap_err()
+                .contains("opencode/oc")
+        );
+        assert_eq!(AgentKind::default(), AgentKind::OpenCode);
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct Sample {
+        #[serde(default = "five")]
+        n: u32,
+    }
+
+    fn five() -> u32 {
+        5
+    }
+
+    impl ToolConfig for Sample {
+        const KEY: &'static str = "sample";
+    }
+
+    #[test]
+    fn tool_section_defaults_when_missing() {
+        let mut config = Config::mock();
+        assert_eq!(config.tool::<Sample>().unwrap(), Sample { n: 5 });
+        config
+            .tools
+            .insert("sample".to_owned(), serde_json::json!({"n": 7}));
+        assert_eq!(config.tool::<Sample>().unwrap(), Sample { n: 7 });
+    }
 }

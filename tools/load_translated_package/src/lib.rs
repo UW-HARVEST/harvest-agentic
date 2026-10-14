@@ -54,7 +54,7 @@ pub fn load_snapshot(directory: &Path) -> Result<CargoPackage, Box<dyn std::erro
 
     let stages = StageManifest::read_from_dir(directory)
         .map(|m| {
-            m.stages
+            m.stages()
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -97,23 +97,15 @@ impl Tool for LoadTranslatedPackage {
 #[cfg(all(not(miri), test))]
 mod tests {
     use super::*;
-    use harvest_core::config::{AgentKind, Stage};
     use std::fs;
 
     fn write_manifest(dir: &Path) {
         StageManifest {
-            schema_version: 1,
-            stages: vec![Stage::Translate],
-            agent: Some(AgentKind::Claude),
-            model: None,
-            prompt_mode: "plan".to_owned(),
-            harvest_version: "test".to_owned(),
+            schema_version: 2,
             bench_program: "prog".to_owned(),
             bench_revision: None,
             test_corpus_root: None,
-            test_corpus_revision: None,
-            reference_modified: Vec::new(),
-            created_unix: 0,
+            runs: Vec::new(),
         }
         .write_to_dir(dir)
         .unwrap();

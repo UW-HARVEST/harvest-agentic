@@ -4,7 +4,7 @@ force = false
 log_filter = "info"
 modular = false
 stages = []
-agentic_agent = "kiro"
+agentic_agent = "opencode"
 
 [tools.raw_source_to_cargo_llm]
 address = "http://localhost:11434"

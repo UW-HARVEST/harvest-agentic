@@ -46,8 +46,8 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub stage_input: Option<PathBuf>,
 
-    /// Which agent to use for agentic translation: kiro, claude, or opencode (requires --agentic).
-    #[arg(long = "agent", requires = "agentic", value_parser = parse_agent_kind)]
+    /// Which agent to use for agentic translation: opencode (default), claude, or kiro (requires --agentic).
+    #[arg(long = "agent", requires = "agentic", value_parser = |s: &str| s.parse::<harvest_core::config::AgentKind>())]
     pub agentic_agent: Option<harvest_core::config::AgentKind>,
 
     /// Path to the directory containing the C code to translate.
@@ -74,17 +74,6 @@ pub(crate) fn unknown_field_warning(prefix: &str, unknown: &HashMap<String, Valu
         "" => eprintln!("Warning: unknown config key {name}"),
         p => eprintln!("Warning: unknown config key {p}.{name}"),
     });
-}
-
-fn parse_agent_kind(s: &str) -> Result<harvest_core::config::AgentKind, String> {
-    match s.to_lowercase().as_str() {
-        "kiro" => Ok(harvest_core::config::AgentKind::Kiro),
-        "claude" => Ok(harvest_core::config::AgentKind::Claude),
-        "opencode" | "oc" => Ok(harvest_core::config::AgentKind::OpenCode),
-        other => Err(format!(
-            "unknown agent kind: {other} (expected: kiro, claude, opencode)"
-        )),
-    }
 }
 
 /// Performs parsing and validation of the config; to be called by main() before executing any code

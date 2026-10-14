@@ -98,6 +98,8 @@ def run(a):
                 stack += v
             elif isinstance(v, dict) and 'sym' in v:
                 v['target'] = r['targets'].get(v['sym'])
+    for r in ok:
+        em.scan(r, r['rust_name'])
     items = []
     for r in ok:
         radix = r['opts'].get('radix', 'auto')

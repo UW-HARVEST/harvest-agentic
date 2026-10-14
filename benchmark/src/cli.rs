@@ -40,17 +40,6 @@ pub enum VerifyHarness {
     Libloading,
 }
 
-fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
-    match s.to_lowercase().as_str() {
-        "kiro" => Ok(AgentKind::Kiro),
-        "claude" => Ok(AgentKind::Claude),
-        "opencode" | "oc" => Ok(AgentKind::OpenCode),
-        other => Err(format!(
-            "unknown agent kind: {other} (expected: kiro, claude, opencode)"
-        )),
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "harvest-benchmark")]
 #[command(
@@ -111,8 +100,8 @@ pub struct Args {
     )]
     pub agentic: Option<Vec<Stage>>,
 
-    /// Which agent to use: kiro, claude, or opencode.
-    #[arg(long, requires = "agentic", value_parser = parse_agent_kind)]
+    /// Which agent to use: opencode (default), claude, or kiro.
+    #[arg(long, requires = "agentic", value_parser = |s: &str| s.parse::<AgentKind>())]
     pub agent: Option<AgentKind>,
 
     /// Agent model for the agentic stages of this run.
@@ -149,9 +138,9 @@ pub struct Args {
     /// Do not give the translate stage the tab2rust skill. By default the
     /// scouts find the C data tables with tab2rust and the translation
     /// sub-agents generate them. Requires the translate stage. Only the plan
-    /// prompt of Claude and OpenCode uses tab2rust, so the flag is an error
-    /// with --no-plan or --agent kiro.
-    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
+    /// prompt of Claude and OpenCode uses tab2rust, so the translate stage
+    /// stops with an error when the flag is given with --no-plan or Kiro.
+    #[arg(long, requires = "agentic")]
     pub no_tab2rust: bool,
 
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
@@ -225,10 +214,10 @@ impl Args {
                 stages_str()
             ));
         }
-        if self.no_tab2rust && self.agent == Some(AgentKind::Kiro) {
-            return Err("--no-tab2rust has no effect with --agent kiro: \
-                        the Kiro prompts do not use tab2rust"
-                .to_owned());
+        // The translate stage checks the resolved config too (an agent set in a config file).
+        if self.no_tab2rust {
+            translate_agentic::check_tab2rust(false, self.no_plan, self.agent.unwrap_or_default())
+                .map_err(|e| format!("--no-tab2rust: {e}"))?;
         }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
@@ -312,27 +301,14 @@ mod tests {
 
     #[test]
     fn no_tab2rust_needs_a_prompt_that_uses_tab2rust() {
-        assert!(parse(&[
-            "bench",
-            "--agentic=t",
-            "--no-plan",
-            "--no-tab2rust",
-            "in",
-            "out"
-        ])
-        .is_err());
-        let args = parse(&[
-            "bench",
-            "--agentic=t",
-            "--agent",
-            "kiro",
-            "--no-tab2rust",
-            "in",
-            "out",
-        ])
-        .unwrap();
-        let err = args.validate_stages(&args.stages()).unwrap_err();
-        assert!(err.contains("kiro"), "{err}");
+        for extra in [&["--no-plan"][..], &["--agent", "kiro"]] {
+            let mut argv = vec!["bench", "--agentic=t", "--no-tab2rust"];
+            argv.extend_from_slice(extra);
+            argv.extend(["in", "out"]);
+            let args = parse(&argv).unwrap();
+            let err = args.validate_stages(&args.stages()).unwrap_err();
+            assert!(err.starts_with("--no-tab2rust"), "{err}");
+        }
     }
 
     #[test]

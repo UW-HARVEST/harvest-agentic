@@ -1,12 +1,12 @@
 # verify_env — differential verification environment
 
 A ready-to-use GoogleTest environment for comparing the original C reference
-against the translated Rust. The C reference (`../c_src/`) is compiled into the
+against the translated Rust. The C reference (`inputs/c_src`) is compiled into the
 test binary; the translated Rust cdylib is loaded as a black box via `dlopen`.
 
 ## Files
 
-- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `../c_src/src/*.c`
+- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `inputs/c_src/src/*.c`
   into the test binary, links, and registers tests. Normally unedited; the one
   spot you may need to touch is the `target_compile_definitions(c_under_test ...)`
   line if the C reference needs build flags this scaffold did not pick up.

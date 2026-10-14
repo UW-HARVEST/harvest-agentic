@@ -96,61 +96,52 @@ pub fn hash_dir(root: &Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-/// Tracks the read-only reference directories an agentic tool hands to an
-/// agent — the C source (`c_src/`) and, for the conform stage, the external
-/// test suite.
+/// Fingerprints the read-only inputs that an agentic tool hands to an agent: the directories in
+/// case_dir's `inputs/` (the C source, task files, skills, and the conform stage's test suite).
+/// It only reports changes. The inputs are outside the frozen working directory, so a change
+/// cannot reach the output.
 pub struct ReferenceGuard {
-    /// (entry name, hash at the time it was handed to the agent)
+    /// (directory name, hash at the time it was handed to the agent)
     entries: Vec<(String, String)>,
 }
 
 impl ReferenceGuard {
-    /// Fingerprints each of `names` under `work_dir`, right after they were
-    /// materialized. Names that do not exist are ignored.
-    pub fn capture(work_dir: &Path, names: &[&str]) -> io::Result<Self> {
+    /// Fingerprints each directory in `dir`, after the inputs were written there.
+    pub fn capture(dir: &Path) -> io::Result<Self> {
         let mut entries = Vec::new();
-        for name in names {
-            let path = work_dir.join(name);
-            if path.is_dir() {
-                entries.push(((*name).to_owned(), hash_dir(&path)?));
+        for entry in read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                entries.push((name, hash_dir(&entry.path())?));
             }
         }
+        entries.sort();
         Ok(ReferenceGuard { entries })
     }
 
-    /// Re-checks each reference directory and removes it from `work_dir` so it
-    /// is not frozen into the IR. A directory the agent modified is first
-    /// preserved under `rejected_dir` (when one is configured) and reported.
-    ///
-    /// Returns the names of the modified references, for the caller to record.
-    pub fn strip(&self, work_dir: &Path, rejected_dir: Option<&Path>) -> io::Result<Vec<String>> {
-        let mut modified = Vec::new();
+    /// Checks each fingerprinted directory again. A changed or missing one is logged and, when
+    /// `report_dir` is given, recorded as a file `report_dir/<name>` ("modified" or "deleted").
+    /// Returns the names of the changed directories.
+    pub fn audit(&self, dir: &Path, report_dir: Option<&Path>) -> io::Result<Vec<String>> {
+        let mut changed = Vec::new();
         for (name, original) in &self.entries {
-            let path = work_dir.join(name);
-            if !path.is_dir() {
-                tracing::warn!("agent deleted the read-only reference {name}/");
-                modified.push(name.clone());
+            let path = dir.join(name);
+            let what = if !path.is_dir() {
+                "deleted"
+            } else if hash_dir(&path)? != *original {
+                "modified"
+            } else {
                 continue;
+            };
+            tracing::warn!("agent {what} the read-only input {}", path.display());
+            if let Some(report_dir) = report_dir {
+                std::fs::create_dir_all(report_dir)?;
+                std::fs::write(report_dir.join(name), what)?;
             }
-            if hash_dir(&path)? != *original {
-                tracing::warn!(
-                    "agent modified the read-only reference {name}/ — the change is discarded; \
-                     preserving a copy for review"
-                );
-                modified.push(name.clone());
-                if let Some(rejected) = rejected_dir {
-                    let dest = rejected.join(name);
-                    if dest.exists() {
-                        std::fs::remove_dir_all(&dest)?;
-                    }
-                    std::fs::create_dir_all(rejected)?;
-                    crate::cargo_utils::copy_directory_recursive(&path, &dest)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                }
-            }
-            std::fs::remove_dir_all(&path)?;
+            changed.push(name.clone());
         }
-        Ok(modified)
+        Ok(changed)
     }
 }
 
@@ -780,56 +771,43 @@ mod tests {
     }
 
     #[test]
-    fn reference_guard_detects_and_quarantines_edits() {
-        let work = tempdir().unwrap();
-        let rejected = tempdir().unwrap();
-        create_dir(work.path().join("c_src")).unwrap();
-        write(work.path().join("c_src/a.c"), "int x;").unwrap();
-        create_dir(work.path().join("gtest_suite")).unwrap();
-        write(work.path().join("gtest_suite/t.cc"), "TEST(A,B){}").unwrap();
+    fn reference_guard_reports_edits_and_deletions() {
+        let inputs = tempdir().unwrap();
+        let report = tempdir().unwrap();
+        for (dir, file) in [
+            ("c_src", "a.c"),
+            ("gtest_suite", "t.cc"),
+            ("prompts", "SCOUT.md"),
+        ] {
+            create_dir(inputs.path().join(dir)).unwrap();
+            write(inputs.path().join(dir).join(file), "x").unwrap();
+        }
+        let guard = ReferenceGuard::capture(inputs.path()).unwrap();
+        // The agent "fixes" the oracle, deletes the suite, and leaves its task file alone.
+        write(inputs.path().join("c_src/a.c"), "y").unwrap();
+        std::fs::remove_dir_all(inputs.path().join("gtest_suite")).unwrap();
 
-        let guard = ReferenceGuard::capture(work.path(), &["c_src", "gtest_suite"]).unwrap();
-        // The agent "fixes" the oracle and leaves the suite alone.
-        write(work.path().join("c_src/a.c"), "int x = 1;").unwrap();
-
-        let modified = guard.strip(work.path(), Some(rejected.path())).unwrap();
-        assert_eq!(modified, ["c_src"]);
-        // Both references are gone from the working directory...
-        assert!(!work.path().join("c_src").exists());
-        assert!(!work.path().join("gtest_suite").exists());
-        // ...and only the edited one is preserved, with the agent's content.
-        assert_eq!(
-            read(rejected.path().join("c_src/a.c")).unwrap(),
-            b"int x = 1;"
-        );
-        assert!(!rejected.path().join("gtest_suite").exists());
-    }
-
-    #[test]
-    fn reference_guard_reports_a_deleted_reference() {
-        let work = tempdir().unwrap();
-        create_dir(work.path().join("c_src")).unwrap();
-        write(work.path().join("c_src/a.c"), "int x;").unwrap();
-        let guard = ReferenceGuard::capture(work.path(), &["c_src"]).unwrap();
-        std::fs::remove_dir_all(work.path().join("c_src")).unwrap();
-        assert_eq!(guard.strip(work.path(), None).unwrap(), ["c_src"]);
+        let changed = guard.audit(inputs.path(), Some(report.path())).unwrap();
+        assert_eq!(changed, ["c_src", "gtest_suite"]);
+        assert_eq!(read(report.path().join("c_src")).unwrap(), b"modified");
+        assert_eq!(read(report.path().join("gtest_suite")).unwrap(), b"deleted");
+        assert!(!report.path().join("prompts").exists());
     }
 
     #[test]
     fn reference_guard_is_quiet_when_nothing_changed() {
-        let work = tempdir().unwrap();
-        let rejected = tempdir().unwrap();
-        create_dir(work.path().join("c_src")).unwrap();
-        write(work.path().join("c_src/a.c"), "int x;").unwrap();
-        let guard = ReferenceGuard::capture(work.path(), &["c_src"]).unwrap();
+        let inputs = tempdir().unwrap();
+        let report = tempdir().unwrap();
+        create_dir(inputs.path().join("c_src")).unwrap();
+        write(inputs.path().join("c_src/a.c"), "int x;").unwrap();
+        let guard = ReferenceGuard::capture(inputs.path()).unwrap();
         assert!(
             guard
-                .strip(work.path(), Some(rejected.path()))
+                .audit(inputs.path(), Some(report.path()))
                 .unwrap()
                 .is_empty()
         );
-        assert!(!work.path().join("c_src").exists());
-        assert_eq!(read_dir(rejected.path()).unwrap().count(), 0);
+        assert_eq!(read_dir(report.path()).unwrap().count(), 0);
     }
 
     #[test]

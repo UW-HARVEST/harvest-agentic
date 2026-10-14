@@ -228,6 +228,31 @@ const uintptr_t addr_tab[32] = { (uintptr_t)&fx_gdata[0], 1, 2, 3, 4, 5, 6, 7, 8
 const char fx_chars[4] = "abc";
 #define FX_CHARS_NAME fx_chars
 
+/* one struct type in several arrays: one Rust definition. Only kv_b_tab has a NULL name, only kv_c_tab
+   points into a char array. Struct and field names that are Rust keywords. */
+struct fx_kv { const char *name; int v; };
+static const struct fx_kv kv_a_tab[16] = {
+  {"a0", 0}, {"a1", 1}, {"a2", 2}, {"a3", 3}, {"a4", 4}, {"a5", 5}, {"a6", 6}, {"a7", 7},
+  {"a8", 8}, {"a9", 9}, {"a10", 10}, {"a11", 11}, {"a12", 12}, {"a13", 13}, {"a14", 14}, {"a15", 15}
+};
+static const struct fx_kv kv_b_tab[16] = {
+  {"b0", 0}, {"b1", 1}, {"b2", 2}, {"b3", 3}, {"b4", 4}, {"b5", 5}, {"b6", 6}, {"b7", 7},
+  {"b8", 8}, {"b9", 9}, {"b10", 10}, {"b11", 11}, {"b12", 12}, {"b13", 13}, {"b14", 14}, {NULL, 15}
+};
+static const struct fx_kv kv_c_tab[16] = {
+  {&fx_chars[0], 0}, {&fx_chars[1], 1}, {&fx_chars[2], 2}, {&fx_chars[3], 3}, {&fx_chars[0], 4}, {&fx_chars[1], 5}, {&fx_chars[2], 6}, {&fx_chars[3], 7},
+  {&fx_chars[0], 8}, {&fx_chars[1], 9}, {&fx_chars[2], 10}, {&fx_chars[3], 11}, {&fx_chars[0], 12}, {&fx_chars[1], 13}, {&fx_chars[2], 14}, {&fx_chars[3], 15}
+};
+static const struct match { int self; int priv; } kw_tab[16] = {
+  {0, -1}, {1, -2}, {2, -3}, {3, -4}, {4, -5}, {5, -6}, {6, -7}, {7, -8},
+  {8, -9}, {9, -10}, {10, -11}, {11, -12}, {12, -13}, {13, -14}, {14, -15}, {15, -16}
+};
+/* char pointers made by a cast: into a uint8_t array (a byte string in Rust: kept), into an int8_t array (refused) */
+static const int8_t fx_sbytes[8] = { -1, 0, 2, 3, 0, 4, 5, -6 };
+static const char *const ucast_tab[32] = { (const char *)&fx_bytes[0], (const char *)&fx_bytes[1], (const char *)&fx_bytes[2], (const char *)&fx_bytes[3], (const char *)&fx_bytes[4], (const char *)&fx_bytes[5], (const char *)&fx_bytes[6], (const char *)&fx_bytes[7], (const char *)&fx_bytes[0], (const char *)&fx_bytes[1], (const char *)&fx_bytes[2], (const char *)&fx_bytes[3], (const char *)&fx_bytes[4], (const char *)&fx_bytes[5], (const char *)&fx_bytes[6], (const char *)&fx_bytes[7], (const char *)&fx_bytes[0], (const char *)&fx_bytes[1], (const char *)&fx_bytes[2], (const char *)&fx_bytes[3], (const char *)&fx_bytes[4], (const char *)&fx_bytes[5], (const char *)&fx_bytes[6], (const char *)&fx_bytes[7], (const char *)&fx_bytes[0], (const char *)&fx_bytes[1], (const char *)&fx_bytes[2], (const char *)&fx_bytes[3], (const char *)&fx_bytes[4], (const char *)&fx_bytes[5], (const char *)&fx_bytes[6], (const char *)&fx_bytes[7] };
+static const char *const scast_tab[32] = { (const char *)&fx_sbytes[0], (const char *)&fx_sbytes[1], (const char *)&fx_sbytes[2], (const char *)&fx_sbytes[3], (const char *)&fx_sbytes[4], (const char *)&fx_sbytes[5], (const char *)&fx_sbytes[6], (const char *)&fx_sbytes[7], (const char *)&fx_sbytes[0], (const char *)&fx_sbytes[1], (const char *)&fx_sbytes[2], (const char *)&fx_sbytes[3], (const char *)&fx_sbytes[4], (const char *)&fx_sbytes[5], (const char *)&fx_sbytes[6], (const char *)&fx_sbytes[7], (const char *)&fx_sbytes[0], (const char *)&fx_sbytes[1], (const char *)&fx_sbytes[2], (const char *)&fx_sbytes[3], (const char *)&fx_sbytes[4], (const char *)&fx_sbytes[5], (const char *)&fx_sbytes[6], (const char *)&fx_sbytes[7], (const char *)&fx_sbytes[0], (const char *)&fx_sbytes[1], (const char *)&fx_sbytes[2], (const char *)&fx_sbytes[3], (const char *)&fx_sbytes[4], (const char *)&fx_sbytes[5], (const char *)&fx_sbytes[6], (const char *)&fx_sbytes[7] };
+int fx_kv(int i) { i &= 15; return kv_a_tab[i].v + kv_b_tab[i].v + kv_c_tab[i].v + kw_tab[i].self + kw_tab[i].priv + *ucast_tab[i] + *scast_tab[i]; }
+
 /* DEAD in a function with a long head, inside an extern "C" block: the text rule finds the function.
    A compiler-made array (__func__, DW_AT_artificial) is not a record. */
 #ifdef __cplusplus

@@ -5,7 +5,7 @@ import shlex
 
 from . import die
 
-KEEP = ('-I', '-D', '-U', '-isystem', '-include')  # flags with a separate value
+KEEP = ('-I', '-D', '-U', '-isystem', '-iquote', '-idirafter', '-include', '-imacros')  # flags with a separate value
 KEEP_PREFIX = KEEP + ('-std', '-f', '-m')
 
 
@@ -19,7 +19,7 @@ def entries(build_dir):
 
 
 def flags(entry):
-    """The -I/-D/-U/-std/-f/-m/-include/-isystem flags of one entry. Run gcc in entry['directory'],
+    """The include, macro, -std, -f and -m flags of one entry. Run gcc in entry['directory'],
     so that relative paths stay correct."""
     argv = entry.get('arguments') or shlex.split(entry['command'])
     out, args = [], iter(argv[1:])

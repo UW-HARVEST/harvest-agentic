@@ -3,6 +3,7 @@
 Names become I, numbers N, strings S. Keywords, punctuation and preprocessor directive
 names stay. A window is repetitive when few of its 8-token sequences are distinct.
 """
+import collections
 import re
 
 KEYWORDS = set('if else for while do switch case default return break continue goto sizeof struct union '
@@ -76,5 +77,5 @@ def line_head(sf, l0, l1):
                          else '<string>' if t[0] in '"\'' else t)
     if not heads:
         return None, 0, 0.0
-    top = max(set(heads), key=heads.count)
-    return top, heads.count(top), heads.count(top) / len(heads)
+    top, n = collections.Counter(heads).most_common(1)[0]  # a tie goes to the token seen first
+    return top, n, n / len(heads)

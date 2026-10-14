@@ -7,27 +7,27 @@ even if it looks unusual or inconsistent. Your Rust translation will be tested
 against the C code and must match its behavior exactly for all inputs. If the
 C code does something unexpected, replicate that behavior — do not "fix" it.
 
-Working directory: {CASE_DIR}
+The working directory is the Rust project.
 
-- `translated_rust/c_src/` contains the original C source code
-- `translated_rust/src/` contains the Rust translation
-- The C code can be compiled as a shared library. Look at c_src/CMakeLists.txt
+- `inputs/c_src` contains the original C source code
+- `src/` contains the Rust translation
+- The C code can be compiled as a shared library. Look at inputs/c_src/CMakeLists.txt
   to understand the build system. Build it with:
   ```
-  cd translated_rust/c_src && mkdir -p build && cd build && \
-  cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
-  cmake --build .
+  cmake -S inputs/c_src -B scratch/c-build \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
+  cmake --build scratch/c-build
   ```
-- Find the resulting .so files in the build output
+- Find the resulting .so files in scratch/c-build
 
 Your task:
-1. Read Cargo.toml [features] and c_src/CMakeLists.txt to understand all
+1. Read Cargo.toml [features] and inputs/c_src/CMakeLists.txt to understand all
    build-time configurations. Enumerate every valid feature combination.
 2. Run `cargo check --no-default-features --features <combo>` for EVERY
    combination. Fix all compile errors before proceeding. Modules or code
    that only apply to certain backends must use `#[cfg(feature = "...")]`.
 3. Build the C code as a shared library for the default configuration.
-4. Write Rust integration tests (in translated_rust/tests/) that use
+4. Write Rust integration tests (in tests/) that use
    `libloading` to load BOTH the C .so AND the Rust .so, and compare their
    outputs through the FFI boundary. Never call Rust functions directly —
    always load the Rust .so via libloading and call its exported symbols,
@@ -55,8 +55,8 @@ to check all feature combinations: extract them from Cargo.toml, loop over them,
 and run `cargo check` for each. Same for running tests across combinations.
 Do not manually repeat commands for each configuration — automate it.
 
-Add `libloading = "0.8"` to [dev-dependencies] in translated_rust/Cargo.toml.
-Do NOT modify anything in c_src/.
+Add `libloading = "0.8"` to [dev-dependencies] in Cargo.toml.
+Do NOT modify anything in inputs/c_src.
 
 IMPORTANT: If a file is too large to write in one tool call, build it up
 piece by piece using multiple smaller writes (create then append).
@@ -77,7 +77,7 @@ As you work through verification and fixing, pay attention to moments where you 
 - "If I had a tool that could do Y, I would have much higher confidence in this fix."
 
 Whenever such a thought arises, **immediately** append one JSON object (on a single line) to
-the file `{WISHLIST_PATH}`. Do not wait until the end — record the wish as soon as it occurs,
+the file `tool_wishlist.json`. Do not wait until the end — record the wish as soon as it occurs,
 while the context is fresh. Multiple entries are encouraged; record every distinct need.
 
 Each entry must be a single-line JSON object with exactly these fields:
@@ -96,3 +96,5 @@ Field definitions:
 
 ## Git discipline
 {GIT_DISCIPLINE}
+
+{CASE_LAYOUT}

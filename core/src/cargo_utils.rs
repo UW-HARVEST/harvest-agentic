@@ -262,12 +262,12 @@ pub fn sanitize_package_name(raw: &str) -> String {
 /// Removes `src/main.rs` and the `tests/` directory from a translated library project.
 ///
 /// These files are not needed in a library crate and may cause build errors if left in.
-pub fn strip_for_lib(translated_rust_dir: &Path) -> Result<()> {
-    let main_rs = translated_rust_dir.join("src/main.rs");
+pub fn strip_for_lib(crate_dir: &Path) -> Result<()> {
+    let main_rs = crate_dir.join("src/main.rs");
     if main_rs.exists() {
         fs::remove_file(&main_rs)?;
     }
-    let tests_dir = translated_rust_dir.join("tests");
+    let tests_dir = crate_dir.join("tests");
     if tests_dir.exists() {
         fs::remove_dir_all(&tests_dir)?;
     }

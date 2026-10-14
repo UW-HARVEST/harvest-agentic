@@ -23,6 +23,7 @@ harvest-bench = { git = "https://github.com/UW-HARVEST/harvest-bench", rev = "8a
 harvest_core = { workspace = true }
 load_test_suite = { workspace = true }
 harvest_translate = { workspace = true }
+translate_agentic = { workspace = true }
 log = { workspace = true }
 regex = "1.12.2"
 serde = { workspace = true }
