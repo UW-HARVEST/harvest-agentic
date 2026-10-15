@@ -1,16 +1,23 @@
 use harvest_core::config::AgentKind;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 mod agent_env;
 pub mod case_dir;
+mod claude;
+mod kiro;
+mod opencode;
+mod prompt;
+mod toolchain;
 
 pub use case_dir::CaseDir;
+use claude::claude_uses_ccr;
+use prompt::RegistryLimits;
+pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_test_corpus};
 
 #[derive(Debug, Clone, Copy)]
 pub enum AgentPhase {
@@ -39,36 +46,6 @@ impl AgentPhase {
         }
     }
 
-    fn opencode_agent_name(self) -> &'static str {
-        match self {
-            AgentPhase::Translate => "harvest-translate",
-            AgentPhase::Verify => "harvest-verify",
-            AgentPhase::Conform => "harvest-conform",
-        }
-    }
-
-    fn opencode_description(self) -> &'static str {
-        match self {
-            AgentPhase::Translate => "Harvest agentic translation backend",
-            AgentPhase::Verify => "Harvest agentic verification backend",
-            AgentPhase::Conform => "Harvest agentic conformance backend",
-        }
-    }
-
-    /// Compaction-recovery hint, injected per turn. Claude-only: the OpenCode
-    /// backend replaces this with the compaction-recovery plugin (see
-    /// `OPENCODE_COMPACTION_PLUGIN`), which fires exactly once per compaction
-    /// instead of diluting every turn's system prompt.
-    fn append_system_prompt(self) -> &'static str {
-        match self {
-            AgentPhase::Translate => "After any context compaction, you MUST first read PLAN.md.",
-            AgentPhase::Verify => {
-                "After any context compaction, you MUST first read PLAN.md and HYPOTHESES.md."
-            }
-            AgentPhase::Conform => "After any context compaction, you MUST first read CONFORM.md.",
-        }
-    }
-
     /// The persistent memory files the agent must re-read to recover after a
     /// context compaction. Only meaningful when plan files are enabled.
     fn recovery_files(self) -> &'static [&'static str] {
@@ -81,7 +58,6 @@ impl AgentPhase {
 }
 
 pub const DEFAULT_AGENT_TIMEOUT_SECS: u64 = 48 * 60 * 60;
-const TIMEOUT_EXIT_CODE: i32 = 124;
 
 pub struct AgentInvocation<'a> {
     pub phase: AgentPhase,
@@ -101,22 +77,6 @@ pub struct AgentInvocation<'a> {
 }
 
 impl AgentInvocation<'_> {
-    /// The prompt with the placeholders that all main prompts share filled in:
-    /// `{AGENT_BUG_WORKAROUNDS}`, `{GIT_DISCIPLINE}`, `{RUST_TOOLCHAIN_CONTEXT}`,
-    /// `{CASE_LAYOUT}` and `{MODEL_LIMITS}`.
-    fn render_prompt(&self, limits: &RegistryLimits) -> String {
-        let model_limits = render_model_limits(self.subagent_model, limits);
-        self.prompt
-            .replace("{AGENT_BUG_WORKAROUNDS}", agent_bug_workarounds(self.agent))
-            .replace("{GIT_DISCIPLINE}", git_discipline())
-            .replace(
-                "{RUST_TOOLCHAIN_CONTEXT}",
-                &self.rust_toolchain.prompt_block,
-            )
-            .replace("{CASE_LAYOUT}", self.case.layout())
-            .replace("{MODEL_LIMITS}", &model_limits)
-    }
-
     /// Whether the prompt instructs the agent to maintain persistent plan
     /// files (PLAN.md / HYPOTHESES.md). `no_plan` (no plan, no sub-agent push)
     /// drops that instruction, so the per-turn "read PLAN.md after compaction"
@@ -154,455 +114,6 @@ pub fn effective_subagent_model<'a>(
     }
 }
 
-/// Agent-specific temporary bug workarounds, injected into every prompt.
-/// Prompt templates carry an `{AGENT_BUG_WORKAROUNDS}` placeholder, and
-/// prompt-building tools substitute this text for it. Each backend's text
-/// lives in `agent_bug_workarounds/<agent>.md` and states the known upstream
-/// bug and the behavior that avoids it. The main agent must copy it into
-/// every sub-agent prompt, because sub-agents do not see this prompt. Add a
-/// file when a backend needs a temporary fix, and remove it when the upstream
-/// fix ships.
-pub fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Kiro => "",
-        // Async sub-agents are killed when a headless `claude -p` session ends.
-        AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),
-        AgentKind::OpenCode => include_str!("agent_bug_workarounds/opencode.md").trim_end(),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RustToolchainContext {
-    pub required_version: String,
-    pub prompt_block: String,
-    /// The Test-Corpus / cando2 checkout the contract was read from, if one
-    /// was found. Recorded in the stage manifest so a run resuming from a
-    /// snapshot can find it again without the C source's original location.
-    pub test_corpus_root: Option<PathBuf>,
-}
-
-/// Detects the Rust toolchain contract for a run.
-///
-/// The version comes from the Test-Corpus / cando2 checkout, found by walking
-/// up from `input_path`. That walk only works while the C source still sits
-/// inside the corpus, which stops being true once a run resumes from a
-/// self-contained snapshot (whose C source lives under the snapshot's own
-/// `.harvest/c_src/`). So the corpus root is detected once, on the run that
-/// starts from the bench directory, recorded in the stage manifest, and passed
-/// back in as `test_corpus_root` by later runs. The resolved root is reported
-/// in [`RustToolchainContext::test_corpus_root`] for the caller to persist.
-pub fn detect_rust_toolchain_context(
-    input_path: &Path,
-    test_corpus_root: Option<&Path>,
-) -> Result<RustToolchainContext, Box<dyn std::error::Error>> {
-    let repo_root = std::env::current_dir()?;
-    let root_toolchain = read_toolchain_channel(&repo_root);
-    let test_corpus_root = match test_corpus_root {
-        Some(root) if root.is_dir() => Some(root.to_path_buf()),
-        Some(root) => {
-            warn!(
-                "recorded Test-Corpus root {} no longer exists; falling back to detection",
-                root.display()
-            );
-            find_test_corpus_root(input_path, &repo_root)
-        }
-        None => find_test_corpus_root(input_path, &repo_root),
-    };
-    let test_corpus_toolchain = test_corpus_root
-        .as_ref()
-        .and_then(|root| read_toolchain_channel(root));
-    let cando2_cargo = test_corpus_root
-        .as_ref()
-        .map(|root| root.join("tools/cando2/Cargo.toml"));
-    let cando2_rust_version = cando2_cargo
-        .as_ref()
-        .and_then(|path| read_cargo_rust_version(path));
-
-    let required_version = cando2_rust_version
-        .clone()
-        .or_else(|| test_corpus_toolchain.clone())
-        .or_else(|| root_toolchain.clone())
-        .ok_or("Unable to determine required Rust toolchain version from rust-toolchain.toml or cando2 Cargo.toml")?;
-
-    check_version_match(
-        "HARVEST rust-toolchain.toml",
-        root_toolchain.as_deref(),
-        &required_version,
-    )?;
-    check_version_match(
-        "Test-Corpus rust-toolchain.toml",
-        test_corpus_toolchain.as_deref(),
-        &required_version,
-    )?;
-    check_version_match(
-        "cando2 rust-version",
-        cando2_rust_version.as_deref(),
-        &required_version,
-    )?;
-
-    let rustc_version = command_stdout("rustc", &["--version"])?;
-    let cargo_version = command_stdout("cargo", &["--version"])?;
-    let active_rustc = parse_rustc_semver(&rustc_version).ok_or_else(|| {
-        format!(
-            "Could not parse rustc version from `{}`",
-            rustc_version.trim()
-        )
-    })?;
-    if active_rustc != required_version {
-        return Err(format!(
-            "Rust toolchain mismatch: required {required_version} from Test-Corpus/cando2 contract, but active rustc is {active_rustc} (`{}`)",
-            rustc_version.trim()
-        )
-        .into());
-    }
-
-    let prompt_block = format!(
-        "### Rust toolchain contract\n\
-         - Required Rust toolchain: `{required_version}`\n\
-         - Detected rustc: `{}`\n\
-         - Detected cargo: `{}`\n\
-         - All self-tests and build checks MUST use this exact toolchain. Run Cargo as `RUSTUP_TOOLCHAIN={required_version} cargo ...` (or verify `rustc --version` reports `{required_version}` first). If a different Rust version is active, stop and report an environment/toolchain problem instead of treating test failures as translation bugs.",
-        rustc_version.trim(),
-        cargo_version.trim(),
-    );
-
-    Ok(RustToolchainContext {
-        required_version,
-        prompt_block,
-        test_corpus_root,
-    })
-}
-
-/// Locates the Test-Corpus / cando2 checkout for `input_path` without
-/// performing the toolchain checks, so a caller can record it (see
-/// [`detect_rust_toolchain_context`]) before any agent runs.
-pub fn locate_test_corpus(input_path: &Path) -> Option<PathBuf> {
-    let repo_root = std::env::current_dir().ok()?;
-    find_test_corpus_root(input_path, &repo_root)
-}
-
-fn find_test_corpus_root(input_path: &Path, repo_root: &Path) -> Option<PathBuf> {
-    let absolute = if input_path.is_absolute() {
-        input_path.to_path_buf()
-    } else {
-        repo_root.join(input_path)
-    };
-    for ancestor in absolute.ancestors() {
-        if ancestor.file_name().and_then(|s| s.to_str()) == Some("Test-Corpus") {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    let candidate = repo_root.join("Test-Corpus");
-    candidate.exists().then_some(candidate)
-}
-
-fn read_toolchain_channel(dir: &Path) -> Option<String> {
-    read_quoted_value(&dir.join("rust-toolchain.toml"), "channel")
-        .or_else(|| fs::read_to_string(dir.join("rust-toolchain")).ok())
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn read_cargo_rust_version(path: &Path) -> Option<String> {
-    read_quoted_value(path, "rust-version")
-}
-
-fn read_quoted_value(path: &Path, key: &str) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with(key) {
-            continue;
-        }
-        let (_, value) = trimmed.split_once('=')?;
-        return Some(value.trim().trim_matches('"').to_string()).filter(|s| !s.is_empty());
-    }
-    None
-}
-
-fn check_version_match(
-    label: &str,
-    found: Option<&str>,
-    required: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(found) = found
-        && found != required
-    {
-        return Err(format!(
-            "Rust toolchain contract mismatch: {label} is {found}, required version is {required}"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn command_stdout(cmd: &str, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new(cmd).args(args).output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} {} failed with status {}: {}",
-            cmd,
-            args.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn parse_rustc_semver(version: &str) -> Option<String> {
-    version.split_whitespace().nth(1).map(|v| v.to_string())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenCodeModelLimits {
-    pub context: u64,
-    pub output: Option<u64>,
-}
-
-/// The registry limits of the run's models, read once per stage: the prompt
-/// and the output-cap workaround both use them. Only OpenCode has a registry,
-/// and a model left to the CLI default has no entry.
-#[derive(Debug, Default)]
-struct RegistryLimits {
-    main: Option<OpenCodeModelLimits>,
-    subagent: Option<OpenCodeModelLimits>,
-}
-
-impl RegistryLimits {
-    fn load(invocation: &AgentInvocation<'_>) -> Result<Self, Box<dyn std::error::Error>> {
-        if invocation.agent != AgentKind::OpenCode {
-            return Ok(Self::default());
-        }
-        Ok(Self {
-            main: invocation
-                .model
-                .map(load_opencode_model_limits)
-                .transpose()?,
-            subagent: invocation
-                .subagent_model
-                .map(load_opencode_model_limits)
-                .transpose()?,
-        })
-    }
-
-    /// OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX (opencode#29363 workaround).
-    /// OpenCode caps each model at `min(limit.output, cap)`, and a model with
-    /// no output limit at the cap itself. So the cap is the larger limit, set
-    /// only when every model has one; else `None` keeps the 32k default.
-    fn output_cap(&self) -> Option<u64> {
-        let main = self.main.as_ref()?.output?;
-        match &self.subagent {
-            None => Some(main),
-            Some(subagent) => Some(main.max(subagent.output?)),
-        }
-    }
-}
-
-pub fn load_opencode_model_limits(
-    model: &str,
-) -> Result<OpenCodeModelLimits, Box<dyn std::error::Error>> {
-    let (provider, metadata_id) = parse_opencode_model(model)?;
-    let provider_output = run_opencode_models(Some(&provider))?;
-    if let Some(limits) =
-        extract_model_limits_from_output(&provider_output, &provider, &metadata_id)
-    {
-        info!(
-            "Resolved OpenCode model limits from provider listing (provider={provider}, id={metadata_id}): context={}, output={:?}",
-            limits.context, limits.output,
-        );
-        return Ok(limits);
-    }
-
-    let all_output = run_opencode_models(None)?;
-    if let Some(limits) = extract_model_limits_from_output(&all_output, &provider, &metadata_id) {
-        info!(
-            "Resolved OpenCode model limits from global listing (provider={provider}, id={metadata_id}): context={}, output={:?}",
-            limits.context, limits.output,
-        );
-        return Ok(limits);
-    }
-
-    Err(format!(
-        "OpenCode model metadata not found for {model}; run `opencode models --verbose` and verify the model exists with a limit.context field"
-    ).into())
-}
-
-fn parse_opencode_model(model: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
-    // Split "provider/id" or "provider/id:suffix"
-    // The colon suffix (e.g. ":floor") is a provider-specific routing hint
-    // that must be passed to OpenCode as-is, but stripped when matching
-    // model metadata (limit.context etc.) from the registry.
-    match model.split_once('/') {
-        Some((provider, raw_id)) if !provider.is_empty() && !raw_id.is_empty() => {
-            let metadata_id = raw_id.split_once(':').map(|(id, _)| id).unwrap_or(raw_id);
-            Ok((provider.to_string(), metadata_id.to_string()))
-        }
-        _ => Err(format!("OpenCode model must be in provider/model format, got: {model}").into()),
-    }
-}
-
-fn run_opencode_models(provider: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("opencode");
-    cmd.arg("models");
-    if let Some(provider) = provider {
-        cmd.arg(provider);
-    }
-    cmd.arg("--verbose");
-    let output = cmd.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "opencode models --verbose failed (status={}): {}",
-            output.status,
-            stderr.trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-fn extract_model_limits_from_output(
-    output: &str,
-    expected_provider: &str,
-    expected_id: &str,
-) -> Option<OpenCodeModelLimits> {
-    let mut buf: Vec<String> = Vec::new();
-    let mut collecting = false;
-    let mut brace_depth: i32 = 0;
-
-    for raw_line in output.lines() {
-        let trimmed = raw_line.trim();
-        if !collecting {
-            if trimmed.starts_with('{') {
-                buf.clear();
-                buf.push(trimmed.to_string());
-                collecting = true;
-                brace_depth = trimmed.chars().filter(|&c| c == '{').count() as i32
-                    - trimmed.chars().filter(|&c| c == '}').count() as i32;
-                if brace_depth <= 0 {
-                    // Single-line JSON object
-                    collecting = false;
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        let provider = value
-                            .get("providerID")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        if provider == expected_provider && id == expected_id {
-                            let Some(limit) = value.get("limit") else {
-                                continue;
-                            };
-                            let Some(context) = limit.get("context").and_then(|v| v.as_u64())
-                            else {
-                                continue;
-                            };
-                            let output = registry_output_limit(limit);
-                            return Some(OpenCodeModelLimits { context, output });
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        buf.push(trimmed.to_string());
-        brace_depth += trimmed.chars().filter(|&c| c == '{').count() as i32
-            - trimmed.chars().filter(|&c| c == '}').count() as i32;
-        if brace_depth > 0 {
-            continue;
-        }
-
-        let joined = buf.join("\n");
-        collecting = false;
-        buf.clear();
-
-        let value = match serde_json::from_str::<serde_json::Value>(&joined) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let provider = value
-            .get("providerID")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if provider == expected_provider && id == expected_id {
-            let Some(limit) = value.get("limit") else {
-                continue;
-            };
-            let Some(context) = limit.get("context").and_then(|v| v.as_u64()) else {
-                continue;
-            };
-            let output = registry_output_limit(limit);
-            return Some(OpenCodeModelLimits { context, output });
-        }
-    }
-
-    None
-}
-
-/// The `limit.output` of a registry entry. OpenCode stores a missing output
-/// limit as 0, so 0 means none.
-fn registry_output_limit(limit: &serde_json::Value) -> Option<u64> {
-    limit
-        .get("output")
-        .and_then(|v| v.as_u64())
-        .filter(|&output| output > 0)
-}
-
-/// The text for the `{MODEL_LIMITS}` placeholder of the main prompts: the main
-/// model's registry limits, and with a sub-agent model the "Sub-agent model"
-/// section (the model, and its registry limits). Data only: the prompts say
-/// how to use it.
-fn render_model_limits(subagent_model: Option<&str>, limits: &RegistryLimits) -> String {
-    let mut sections = Vec::new();
-    if let Some(main) = &limits.main {
-        sections.push(limits_section(
-            "### Registry context limits",
-            None,
-            Some(main),
-        ));
-    }
-    if let Some(sub) = subagent_model {
-        sections.push(limits_section(
-            "### Sub-agent model",
-            Some(sub),
-            limits.subagent.as_ref(),
-        ));
-    }
-    sections.join("\n\n")
-}
-
-/// A heading and its `key: value` lines: the model, if given, then the
-/// registry limits, if known.
-fn limits_section(
-    heading: &str,
-    model: Option<&str>,
-    limits: Option<&OpenCodeModelLimits>,
-) -> String {
-    let mut lines = vec![heading.to_string()];
-    lines.extend(model.map(|model| format!("model: {model}")));
-    if let Some(limits) = limits {
-        lines.push(format!("context_limit: {}", limits.context));
-        lines.extend(
-            limits
-                .output
-                .map(|output| format!("output_limit: {output}")),
-        );
-    }
-    lines.join("\n")
-}
-
-/// The command of the agent CLI.
-fn cli_name(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::OpenCode => "opencode",
-        AgentKind::Claude => "claude",
-        AgentKind::Kiro => "kiro-cli",
-    }
-}
-
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let mut invocation = invocation;
     invocation.subagent_model = effective_subagent_model(
@@ -610,7 +121,10 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
         invocation.model,
         invocation.subagent_model,
     )?;
-    let limits = RegistryLimits::load(&invocation)?;
+    let limits = match invocation.agent {
+        AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
+        AgentKind::Claude | AgentKind::Kiro => RegistryLimits::default(),
+    };
     let prompt = invocation.render_prompt(&limits);
     invocation.prompt = &prompt;
     ensure_workdir_git(&invocation.case.workspace());
@@ -644,9 +158,9 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     );
 
     let status = match invocation.agent {
-        AgentKind::Kiro => invoke_kiro(&invocation, &log_path)?,
-        AgentKind::Claude => invoke_claude(&invocation, &log_path)?,
-        AgentKind::OpenCode => invoke_opencode(&invocation, &log_path, limits.output_cap())?,
+        AgentKind::Kiro => kiro::invoke_kiro(&invocation, &log_path)?,
+        AgentKind::Claude => claude::invoke_claude(&invocation, &log_path)?,
+        AgentKind::OpenCode => opencode::invoke_opencode(&invocation, &log_path, &limits)?,
     };
 
     if !status.success() {
@@ -671,7 +185,7 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
                 invocation.phase.label()
             ),
         );
-        if let Err(e) = export_opencode_sessions(&log_path, invocation.output_log_path) {
+        if let Err(e) = opencode::export_opencode_sessions(&log_path, invocation.output_log_path) {
             warn!("OpenCode session export failed (non-fatal): {e}");
             append_output_log_line(
                 invocation.output_log_path,
@@ -690,332 +204,35 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-/// Appends one ISO-timestamped runner marker line to the shared output log,
-/// formatted like a tracing log line so `parse_trace.py` picks it up with the
-/// same regexes it already uses on stderr-captured traces. Best-effort: a
-/// missing/unwritable output log is not an error.
-fn append_output_log_line(output_log_path: Option<&Path>, msg: &str) {
-    let Some(out_path) = output_log_path else {
-        return;
-    };
-    use std::io::Write;
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out_path)
-    {
-        let _ = writeln!(f, "{}  INFO agent_runner: {}", iso_utc_now(), msg);
-    }
-}
-
-/// Current UTC time as ISO-8601 (`2026-07-18T12:34:56.789Z`) without a chrono
-/// dependency (civil-from-days algorithm).
-fn iso_utc_now() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = d.as_secs() as i64;
-    let millis = d.subsec_millis();
-    let days = secs.div_euclid(86400);
-    let sod = secs.rem_euclid(86400);
-    let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
-}
-
 fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
         AgentKind::Kiro => {}
-        AgentKind::Claude => write_claude_sandbox(invocation.case.root())?,
-        AgentKind::OpenCode => write_opencode_agent(
-            invocation.case,
-            OpenCodeAgentConfig {
-                name: invocation.phase.opencode_agent_name(),
-                description: invocation.phase.opencode_description(),
-                // The recovery files (PLAN.md/HYPOTHESES.md/CONFORM.md) do
-                // not exist when plan files are disabled.
-                recovery_command: invocation
-                    .plan_files_enabled()
-                    .then(|| format!("cat {}", invocation.phase.recovery_files().join(" "))),
-            },
-            invocation.model,
-            invocation.subagent_model,
-            agent_env::install(invocation.case.root()).as_deref(),
-        )?,
+        AgentKind::Claude => claude::write_claude_sandbox(invocation.case.root())?,
+        AgentKind::OpenCode => opencode::write_project(invocation)?,
     }
     Ok(())
 }
 
-fn invoke_kiro(
-    invocation: &AgentInvocation<'_>,
-    log_path: &Path,
-) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    info!(
-        "Invoking Kiro {} agent (timeout={}s, extra_env={} vars)",
-        invocation.phase.label(),
-        invocation.timeout_secs,
-        invocation.extra_env.len()
-    );
-    run_agent(
-        invocation,
-        log_path,
-        invocation.timeout_secs,
-        &[
-            "chat",
-            "--no-interactive",
-            "--trust-all-tools",
-            invocation.prompt,
-        ],
-        &[],
-    )
+/// The command of the agent CLI.
+fn cli_name(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::OpenCode => "opencode",
+        AgentKind::Claude => "claude",
+        AgentKind::Kiro => "kiro-cli",
+    }
 }
 
-fn invoke_claude(
-    invocation: &AgentInvocation<'_>,
-    log_path: &Path,
-) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    let use_ccr = claude_uses_ccr(invocation.model);
-    info!(
-        "Invoking Claude Code {} agent (model={}, subagent_model={}, no_plan={}, timeout={}s, ccr={}, extra_env={} vars)",
-        invocation.phase.label(),
-        invocation.model.unwrap_or("(cli default)"),
-        invocation.subagent_model.unwrap_or("(main model)"),
-        invocation.no_plan,
-        invocation.timeout_secs,
-        use_ccr,
-        invocation.extra_env.len()
-    );
+/// The exit code of `timeout` when the deadline ends the command.
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
-    let mut args = vec!["-p", invocation.prompt];
-    if let Some(model) = invocation.model {
-        args.extend(["--model", model]);
-    }
-    args.extend(["--allowed-tools", "Bash(*)", "Write", "Edit"]);
-    args.push("--dangerously-skip-permissions");
-    if invocation.plan_files_enabled() {
-        args.extend([
-            "--append-system-prompt",
-            invocation.phase.append_system_prompt(),
-        ]);
-    }
-    args.extend([
-        "--max-turns",
-        "1000",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ]);
-    // Claude Code gives sandboxed commands CLAUDE_CODE_TMPDIR (default
-    // /tmp/claude), not the TMPDIR that `run_agent` sets, and keeps its own
-    // per-user directory there too.
-    let mut env = vec![(
-        "CLAUDE_CODE_TMPDIR",
-        invocation.case.tmp().display().to_string(),
-    )];
-    // Claude Code picks a sub-agent model from, in order: the Agent tool's
-    // `model` parameter, the agent definition's frontmatter, then
-    // CLAUDE_CODE_SUBAGENT_MODEL. With CLAUDE_CODE_SUBAGENT_MODEL_FORCE it
-    // drops the first two (and the Workflow tool's per-agent models), so the
-    // run's sub-agent model holds like OpenCode's (verified in the 2.1.294
-    // bundle).
-    if let Some(sub) = invocation.subagent_model {
-        env.push(("CLAUDE_CODE_SUBAGENT_MODEL", sub.to_string()));
-        env.push(("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1".to_string()));
-    }
-    run_agent(invocation, log_path, invocation.timeout_secs, &args, &env)
-}
-
-fn invoke_opencode(
-    invocation: &AgentInvocation<'_>,
-    log_path: &Path,
-    output_cap: Option<u64>,
-) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    info!(
-        "Invoking OpenCode {} agent (model={}, subagent_model={}, timeout={}s, extra_env={} vars)",
-        invocation.phase.label(),
-        invocation.model.unwrap_or("(cli default)"),
-        invocation.subagent_model.unwrap_or("(main model)"),
-        invocation.timeout_secs,
-        invocation.extra_env.len()
-    );
-
-    // Temporary workaround for an OpenCode bug (upstream issue #29363).
-    let env: Vec<(&str, String)> = match output_cap {
-        Some(cap) => vec![("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", cap.to_string())],
-        None => {
-            if invocation.model.is_some() {
-                warn!(
-                    "A model of this run has no registry output limit, so every model keeps \
-                     OpenCode's 32k output cap (opencode#29363)"
-                );
-            }
-            Vec::new()
-        }
-    };
-
-    // No `--pure`: its single effect (verified in the opencode source) is to
-    // clear the external-plugin list, which would also disable the
-    // project-local compaction-recovery plugin written by
-    // `write_opencode_agent`. Isolation from the user-global config is
-    // instead achieved by pointing XDG_CONFIG_HOME at a run-private empty
-    // directory in `run_agent` — stronger than `--pure` (hides global
-    // plugins AND global config/instructions), while project-local
-    // `.opencode/` still loads.
-    //
-    // One deadline covers the first run and every resume, so resumes cannot
-    // stretch the stage past `timeout_secs`.
-    let deadline = Instant::now() + Duration::from_secs(invocation.timeout_secs);
-    let mut status = run_agent(
-        invocation,
-        log_path,
-        invocation.timeout_secs,
-        &opencode_run_args(invocation, None, invocation.prompt),
-        &env,
-    )?;
-
-    // OpenCode ends the process with success when a provider stream dies
-    // mid-response: it treats the truncated turn as a finished one. Half a
-    // translation is then graded as if the agent had chosen to stop.
-    // Resume the session so the run continues from the work it already did
-    // instead of being scored on it.
-    let mut resumes = 0;
-    loop {
-        // The stage used up its time budget, so it is not resumed.
-        if status.code() == Some(TIMEOUT_EXIT_CODE) {
-            warn!(
-                "OpenCode {} agent timed out after {}s.",
-                invocation.phase.label(),
-                invocation.timeout_secs
-            );
-            append_output_log_line(
-                invocation.output_log_path,
-                &format!(
-                    "WARNING: {} agent timed out after {}s",
-                    invocation.phase.label(),
-                    invocation.timeout_secs
-                ),
-            );
-            break;
-        }
-        match assess_opencode_run(log_path) {
-            OpenCodeOutcome::Healthy => break,
-            OpenCodeOutcome::Fatal(error) => {
-                // Retrying cannot fix this, and grading the partial output
-                // would put an environment failure into the results as if it
-                // were the model's score.
-                return Err(format!(
-                    "OpenCode {} agent hit an unrecoverable provider error: {error}",
-                    invocation.phase.label()
-                )
-                .into());
-            }
-            OpenCodeOutcome::Resumable { session_id, reason } => {
-                // Assessment runs after every resume, so a run that stays
-                // broken is reported rather than passed off as recovered.
-                if resumes >= OPENCODE_MAX_RESUMES {
-                    warn!(
-                        "OpenCode {} session {session_id} still ending abnormally (reason: \
-                         {reason}) after {OPENCODE_MAX_RESUMES} resumes; giving up. The output \
-                         is incomplete — grade it as such.",
-                        invocation.phase.label()
-                    );
-                    append_output_log_line(
-                        invocation.output_log_path,
-                        &format!(
-                            "WARNING: {} session {session_id} still abnormal (reason: {reason}) \
-                             after {OPENCODE_MAX_RESUMES} resumes; output is incomplete",
-                            invocation.phase.label()
-                        ),
-                    );
-                    break;
-                }
-                let remaining_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
-                if remaining_secs == 0 {
-                    warn!(
-                        "OpenCode {} session {session_id} ended abnormally (reason: {reason}) \
-                         with no time left of the {}s budget; not resuming.",
-                        invocation.phase.label(),
-                        invocation.timeout_secs
-                    );
-                    append_output_log_line(
-                        invocation.output_log_path,
-                        &format!(
-                            "WARNING: {} session {session_id} ended abnormally (reason: {reason}) \
-                             with no time left; not resumed",
-                            invocation.phase.label()
-                        ),
-                    );
-                    break;
-                }
-                resumes += 1;
-                warn!(
-                    "OpenCode {} session {session_id} ended abnormally (last step reason: {reason}); \
-                     resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES}, {remaining_secs}s left)",
-                    invocation.phase.label()
-                );
-                append_output_log_line(
-                    invocation.output_log_path,
-                    &format!(
-                        "WARNING: {} session {session_id} ended abnormally (reason: {reason}); \
-                         resuming (attempt {resumes}/{OPENCODE_MAX_RESUMES}, {remaining_secs}s left)",
-                        invocation.phase.label()
-                    ),
-                );
-                // The resumed run extends the log: the first segment holds
-                // everything the agent did before the stream died, which
-                // trace analysis still needs.
-                status = run_agent(
-                    invocation,
-                    log_path,
-                    remaining_secs,
-                    &opencode_run_args(invocation, Some(&session_id), OPENCODE_RESUME_PROMPT),
-                    &env,
-                )?;
-            }
-        }
-    }
-
-    Ok(status)
-}
-
-/// Sent when resuming a session whose stream died. It names the failure so the
-/// model does not mistake the gap for a compaction, and points it at the plan
-/// file, which is the only state that survived intact.
-const OPENCODE_RESUME_PROMPT: &str = "\
-Your previous response was cut off by a provider failure. \
-Re-read your plan file to see where you were. \
-Check the filesystem to see which files actually exist before you trust any \
-earlier claim that one was written. \
-Then continue the work from the first unfinished step.";
-
-fn opencode_run_args<'a>(
-    invocation: &AgentInvocation<'a>,
-    session_id: Option<&'a str>,
-    prompt: &'a str,
-) -> Vec<&'a str> {
-    let mut args = vec!["run", "--format", "json", "--thinking"];
-    args.extend([
-        "--dangerously-skip-permissions",
-        "--agent",
-        invocation.phase.opencode_agent_name(),
-    ]);
-    if let Some(session_id) = session_id {
-        args.extend(["--session", session_id]);
-    }
-    if let Some(model) = invocation.model {
-        args.extend(["--model", model]);
-    }
-    args.push(prompt);
-    args
+/// Environment variables a backend sets on its CLI process, around the run
+/// config's `extra_env`.
+#[derive(Default)]
+struct BackendEnv {
+    /// Set before `extra_env`, so a value from the run config wins.
+    defaults: Vec<(&'static str, String)>,
+    /// Set after `extra_env`: values the backend cannot run without.
+    overrides: Vec<(&'static str, String)>,
 }
 
 /// Runs `program args` in the work dir under `timeout`, so the stage deadline
@@ -1026,7 +243,7 @@ fn run_agent(
     log_path: &Path,
     timeout_secs: u64,
     args: &[&str],
-    backend_env: &[(&str, String)],
+    env: &BackendEnv,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let mut cmd = Command::new("timeout");
@@ -1049,26 +266,7 @@ fn run_agent(
     info!("Injecting TMPDIR={}", tmp.display());
     cmd.env("TMPDIR", &tmp);
 
-    if invocation.agent == AgentKind::OpenCode {
-        // Hide the user-global OpenCode config from the run. OpenCode
-        // resolves its global config dir via xdg-basedir
-        // (XDG_CONFIG_HOME/opencode), so a run-private empty directory makes
-        // global plugins, global opencode.json{,c}, and global AGENTS.md
-        // instructions unreachable — the isolation `--pure` used to provide,
-        // without disabling the project-local compaction-recovery plugin.
-        // Auth (XDG data dir) and the models cache (XDG cache dir) are
-        // unaffected.
-        let xdg_config = invocation.case.root().join("xdg-config");
-        info!(
-            "Injecting XDG_CONFIG_HOME={} (run-private, replaces --pure isolation)",
-            xdg_config.display()
-        );
-        cmd.env("XDG_CONFIG_HOME", &xdg_config);
-    }
-
-    // The backend's own variables come before `extra_env`, so a value from
-    // the run config wins.
-    for (key, value) in backend_env {
+    for (key, value) in &env.defaults {
         info!("Injecting {key}={value}");
         cmd.env(key, value);
     }
@@ -1076,9 +274,9 @@ fn run_agent(
         info!("Injecting env var: {key}");
         cmd.env(key, value);
     }
-
-    if invocation.agent == AgentKind::Claude && claude_uses_ccr(invocation.model) {
-        cmd.env("ANTHROPIC_BASE_URL", "http://127.0.0.1:3456");
+    for (key, value) in &env.overrides {
+        info!("Injecting {key}={value}");
+        cmd.env(key, value);
     }
 
     let mut sinks: Vec<(String, Box<dyn Write>)> = vec![(
@@ -1168,623 +366,6 @@ fn run_teed(
     child.wait()
 }
 
-fn claude_uses_ccr(model: Option<&str>) -> bool {
-    model.is_some_and(|m| m.contains(','))
-}
-
-/// How an OpenCode run ended, judged from its own JSONL log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OpenCodeOutcome {
-    /// The session reached a real end of turn.
-    Healthy,
-    /// The session stopped early in a way a `continue` can pick up.
-    Resumable { session_id: String, reason: String },
-    /// The provider refused in a way retrying cannot fix.
-    Fatal(String),
-}
-
-/// Maximum `--session … continue` attempts after one dead stream. A provider
-/// that keeps dropping the stream must not spin here.
-const OPENCODE_MAX_RESUMES: u32 = 3;
-
-/// Provider errors that no amount of retrying fixes. Matched case-insensitively
-/// against the API error text. Anything else (dropped stream, 5xx, timeout) is
-/// treated as transient and resumable.
-const OPENCODE_FATAL_ERROR_MARKERS: &[&str] = &[
-    "insufficient balance",
-    "insufficient_quota",
-    "exceeded your current quota",
-    "invalid api key",
-    "invalid_api_key",
-    "authentication",
-    "unauthorized",
-    "payment required",
-    "billing",
-];
-
-/// Judges how an OpenCode run ended by reading the run's own JSONL log.
-///
-/// Read the per-agent log, never a `&>` capture: the shared `output.log` is
-/// appended across stages, so a capture of it can carry sessions from earlier
-/// runs and mislead this check.
-///
-/// The health test is a WHITELIST: a turn is healthy only when the last
-/// `step_finish` says `stop`. OpenCode reports every abnormal ending as a
-/// normal one — it exits 0 after a stream dies mid-response — and it spells
-/// those endings differently each time. A blacklist of known-bad
-/// values misses the next spelling. Requiring the one known-good value does
-/// not.
-fn assess_opencode_run(log_path: &Path) -> OpenCodeOutcome {
-    let Ok(file) = fs::File::open(log_path) else {
-        return OpenCodeOutcome::Healthy;
-    };
-
-    let mut last_finish_reason: Option<String> = None;
-    let mut last_session_id: Option<String> = None;
-    let mut fatal_error: Option<String> = None;
-    let mut saw_any_event = false;
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        let Some(event_type) = event.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if let Some(sid) = event.get("sessionID").and_then(|v| v.as_str()) {
-            saw_any_event = true;
-            last_session_id = Some(sid.to_string());
-        }
-        match event_type {
-            "step_finish" => {
-                last_finish_reason = event
-                    .get("part")
-                    .and_then(|p| p.get("reason"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-            }
-            "error" => {
-                let text = event
-                    .get("error")
-                    .map(|e| e.to_string())
-                    .unwrap_or_default();
-                let lowered = text.to_lowercase();
-                if OPENCODE_FATAL_ERROR_MARKERS
-                    .iter()
-                    .any(|marker| lowered.contains(marker))
-                {
-                    fatal_error = Some(text);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(error) = fatal_error {
-        return OpenCodeOutcome::Fatal(error);
-    }
-    // No parsable events at all: the run never produced a session (a launch
-    // failure, or a format this parser does not know). Leave it to the
-    // caller's exit-status handling rather than inventing a resume.
-    if !saw_any_event {
-        return OpenCodeOutcome::Healthy;
-    }
-    if last_finish_reason.as_deref() == Some("stop") {
-        return OpenCodeOutcome::Healthy;
-    }
-    match last_session_id {
-        Some(session_id) if !session_id.is_empty() => OpenCodeOutcome::Resumable {
-            session_id,
-            reason: last_finish_reason.unwrap_or_else(|| "missing".to_string()),
-        },
-        _ => OpenCodeOutcome::Healthy,
-    }
-}
-
-/// Extract all unique session IDs from an OpenCode JSONL log file.
-fn extract_session_ids_from_log(log_path: &Path) -> Vec<String> {
-    let Ok(file) = fs::File::open(log_path) else {
-        return Vec::new();
-    };
-    let reader = BufReader::new(file);
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && let Some(sid) = val.get("sessionID").and_then(|v| v.as_str())
-            && seen.insert(sid.to_string())
-        {
-            ids.push(sid.to_string());
-        }
-    }
-    ids
-}
-
-/// Recursively extract sub-agent session IDs from an OpenCode export JSON.
-/// Looks for `task` tool_use entries whose `metadata.sessionID` points to a child session.
-fn extract_sub_session_ids_from_export(export_json: &serde_json::Value) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Some(messages) = export_json.get("messages").and_then(|v| v.as_array()) else {
-        return ids;
-    };
-    for msg in messages {
-        let Some(parts) = msg.get("parts").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for part in parts {
-            let Some(tool_name) = part.get("tool").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if tool_name != "task" {
-                continue;
-            }
-            if let Some(sid) = part
-                .pointer("/state/metadata/sessionID")
-                .or_else(|| part.pointer("/state/metadata/sessionId"))
-                .or_else(|| part.pointer("/state/metadata/session_id"))
-                .and_then(|v| v.as_str())
-                && !sid.is_empty()
-            {
-                ids.push(sid.to_string());
-            }
-        }
-    }
-    ids
-}
-
-/// Export an OpenCode session by ID, returning the raw JSON string.
-///
-/// Known bug (opencode#14948): `opencode export` truncates JSON when stdout is
-/// piped, but works correctly when redirected to a file.  We work around this
-/// by redirecting stdout to a temp file instead of capturing it via pipe.
-fn export_opencode_session(session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let tmp = tempfile::NamedTempFile::new()?;
-    let status = Command::new("opencode")
-        .args(["export", session_id])
-        .stdout(std::fs::File::create(tmp.path())?)
-        .status()?;
-    if !status.success() {
-        return Err(format!("opencode export {session_id} failed (exit {status})").into());
-    }
-    let stdout = std::fs::read_to_string(tmp.path())?;
-    let json_start = stdout.find('{').ok_or("opencode export produced no JSON")?;
-    let raw = &stdout[json_start..];
-
-    // Validate the JSON. If it is still broken (e.g. literal control chars
-    // inside strings), return an error so the caller can fall back to JSONL.
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map_err(|e| format!("opencode export {session_id} produced invalid JSON: {e}"))?;
-
-    Ok(raw.to_string())
-}
-/// Exports the OpenCode sessions named in the per-agent log and their
-/// sub-agent sessions. Each export block is appended to the per-agent log,
-/// to the shared output log (if any), and to stderr, as soon as it is
-/// exported.
-fn export_opencode_sessions(
-    log_path: &Path,
-    output_log_path: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let session_ids = extract_session_ids_from_log(log_path);
-    if session_ids.is_empty() {
-        info!("No session IDs found in OpenCode log; skipping export");
-        return Ok(());
-    }
-
-    let mut exported: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = session_ids;
-
-    while let Some(sid) = queue.pop() {
-        if !exported.insert(sid.clone()) {
-            continue;
-        }
-        info!("Exporting OpenCode session {sid}");
-        match export_opencode_session(&sid) {
-            Ok(json) => {
-                let marker = format!("## opencode-export: {sid}\n");
-                let block = format!("{marker}{json}\n");
-
-                append_to_file(log_path, &block)?;
-                if let Some(out_path) = output_log_path {
-                    append_to_file(out_path, &block)?;
-                }
-
-                // Write the export block to stderr (same stream as tracing log
-                // messages) under a lock so the entire multi-line JSON object is
-                // emitted atomically — no log lines can interleave mid-block.
-                {
-                    use std::io::Write;
-                    let stderr = std::io::stderr();
-                    let mut handle = stderr.lock();
-                    let _ = handle.write_all(block.as_bytes());
-                }
-
-                // Discover sub-agent sessions from this export and enqueue them.
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
-                    for child_sid in extract_sub_session_ids_from_export(&parsed) {
-                        if !exported.contains(&child_sid) {
-                            queue.push(child_sid);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to export OpenCode session {sid}: {e}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn append_to_file(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?
-        .write_all(text.as_bytes())
-}
-
-fn write_claude_sandbox(case_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let claude_dir = case_dir.join(".claude");
-    fs::create_dir_all(&claude_dir)?;
-    fs::write(
-        claude_dir.join("settings.json"),
-        serde_json::json!({
-            "sandbox": {
-                "enabled": true,
-                "allowUnsandboxedCommands": false,
-                "filesystem": {
-                    "allowRead": [case_dir.to_string_lossy()],
-                    "allowWrite": [case_dir.to_string_lossy()]
-                }
-            }
-        })
-        .to_string(),
-    )?;
-    Ok(())
-}
-
-struct OpenCodeAgentConfig<'a> {
-    name: &'a str,
-    description: &'a str,
-    /// `cat <files>` command for post-compaction memory recovery. None when
-    /// plan files are disabled (nothing to recover). Some → the
-    /// compaction-recovery plugin is written next to the agent definition.
-    recovery_command: Option<String>,
-}
-
-/// Project-local OpenCode plugin (auto-loaded from `.opencode/plugin/`) that
-/// makes post-compaction plan-file recovery reliable. A per-turn system-prompt
-/// hint ("after any compaction, read PLAN.md first") is both wasteful and
-/// weakly followed (observed in trace_zstd_44: the instruction was present in
-/// the system prompt AND in the summary text, and was still skipped). See the
-/// plugin source for the mechanism. `{RECOVERY_CMD}` is substituted with the
-/// phase's recovery command before writing.
-const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("opencode_compaction_recovery.js");
-
-/// Project-local OpenCode plugin that rewrites an empty sub-agent `task`
-/// result into an explicit failure report. Written for every OpenCode run
-/// (unlike the compaction plugin, this needs no per-phase substitution). See
-/// the plugin source for the mechanism and the upstream issues.
-const OPENCODE_RESILIENCE_PLUGIN: &str = include_str!("opencode_resilience.js");
-
-const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[
-    ("bash", "allow"),
-    ("read", "allow"),
-    ("edit", "allow"),
-    ("write", "allow"),
-    ("glob", "allow"),
-    ("grep", "allow"),
-    ("todowrite", "allow"),
-    ("lsp", "allow"),
-    ("webfetch", "deny"),
-    ("websearch", "deny"),
-    ("skill", "deny"),
-];
-
-/// The agents that may run as sub-agents: OpenCode's built-in sub-agents. The
-/// main agent's `task` permission allows only these. `task.ts` (v1.18.32)
-/// starts any agent named in `subagent_type`, primary agents included, and
-/// one without a configured model would run on the main model.
-const OPENCODE_SUBAGENTS: &[&str] = &["general", "explore"];
-
-/// The main agent's `task` permission, as frontmatter lines: deny every
-/// agent, then allow [`OPENCODE_SUBAGENTS`]. OpenCode applies the last
-/// matching rule, and hides the `task` tool when the last `task` rule is a
-/// deny of `*`, so the deny comes first. A deny holds under
-/// `--dangerously-skip-permissions`, which approves only what no rule denies.
-fn opencode_task_permission() -> String {
-    let mut lines = String::from("  task:\n    \"*\": deny\n");
-    for name in OPENCODE_SUBAGENTS {
-        lines.push_str(&format!("    {name}: allow\n"));
-    }
-    lines
-}
-
-/// What the run's OpenCode project config carries besides its fixed settings.
-#[derive(Default)]
-struct OpenCodeProjectOptions<'a> {
-    model: Option<&'a str>,
-    subagent_model: Option<&'a str>,
-    /// The custom-provider definitions of the run's models (see
-    /// `custom_provider_stages`).
-    staged_providers: &'a [(String, serde_json::Value)],
-    /// The shell for tool calls (see `agent_env`).
-    shell: Option<&'a Path>,
-}
-
-/// Project-level OpenCode config written alongside the agent definitions.
-/// `external_directory` defaults to "ask", and task sub-agent sessions do not
-/// inherit `--dangerously-skip-permissions`, so in a headless run any
-/// sub-agent tool call that touches a path outside the project directory
-/// blocks forever on the unanswerable permission prompt. Scoping external
-/// access to this run's temp directory and denying everything else makes "ask"
-/// unreachable.
-///
-/// `snapshot` is disabled. OpenCode snapshots a git work tree twice per agent
-/// step to back interactive undo/revert. It is the heaviest path-lookup load
-/// and coincided with `path_is_under` kernel Oops. A headless run does not need it anyways.
-///
-/// `shell` runs the agent's commands under memory limits (see `agent_env`).
-/// OpenCode uses it for tool calls, sub-agents included.
-///
-/// The sub-agent model becomes the model of [`OPENCODE_SUBAGENTS`]. The `task`
-/// tool runs a sub-agent on its agent's configured model and falls back to the
-/// caller's model only when none is configured (`task.ts`, v1.18.32); the tool
-/// has no model parameter, so the main agent cannot pick another one.
-fn opencode_project_config(case_root: &Path, options: &OpenCodeProjectOptions<'_>) -> String {
-    let tempdir_pattern = format!("{}/**", case_root.display());
-    let models: Vec<&str> = options
-        .model
-        .into_iter()
-        .chain(options.subagent_model)
-        .collect();
-    let provider_block = match opencode_provider_config(&models, options.staged_providers) {
-        Some(value) => format!(
-            ",\n  \"provider\": {}",
-            serde_json::to_string(&value).expect("provider block serializes to JSON"),
-        ),
-        None => String::new(),
-    };
-    let agent_block = options
-        .subagent_model
-        .map(|sub| {
-            let agents: serde_json::Map<String, serde_json::Value> = OPENCODE_SUBAGENTS
-                .iter()
-                .map(|name| (name.to_string(), serde_json::json!({ "model": sub })))
-                .collect();
-            format!(
-                ",\n  \"agent\": {}",
-                serde_json::to_string(&agents).expect("agent block serializes to JSON"),
-            )
-        })
-        .unwrap_or_default();
-    let shell_line = options
-        .shell
-        .map(|path| {
-            format!(
-                "\n  \"shell\": {},",
-                serde_json::to_string(&path.display().to_string())
-                    .expect("path serializes to JSON")
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        r#"{{
-  "$schema": "https://opencode.ai/config.json",
-  "snapshot": false,{}
-  "permission": {{
-    "external_directory": {{
-      "*": "deny",
-      {}: "allow"
-    }}
-  }}{}{}
-}}
-"#,
-        shell_line,
-        serde_json::to_string(&tempdir_pattern).expect("path pattern serializes to JSON"),
-        provider_block,
-        agent_block,
-    )
-}
-
-/// The `provider` section for the run's models: the OpenRouter pins, then the
-/// staged custom providers. A pin wins over a staged entry of the same
-/// provider (`or_insert_with`): a user shadowing a built-in provider (e.g.
-/// openrouter) keeps today's routing behavior.
-fn opencode_provider_config(
-    models: &[&str],
-    staged_providers: &[(String, serde_json::Value)],
-) -> Option<serde_json::Value> {
-    let pins: serde_json::Map<String, serde_json::Value> = models
-        .iter()
-        .filter_map(|model| openrouter_provider_pin(model))
-        .collect();
-    let mut providers = serde_json::Map::new();
-    if !pins.is_empty() {
-        providers.insert(
-            "openrouter".to_string(),
-            serde_json::json!({ "models": pins }),
-        );
-    }
-    for (id, definition) in staged_providers {
-        providers
-            .entry(id.clone())
-            .or_insert_with(|| definition.clone());
-    }
-    (!providers.is_empty()).then_some(serde_json::Value::Object(providers))
-}
-
-/// OpenRouter multiplexes each model across several upstream endpoints and
-/// load-balances across them by default, so `openrouter/xiaomi/mimo-v2.5-pro`
-/// may be served by any host — including ones with a smaller context window,
-/// higher price, or worse uptime than the model author's own first-party
-/// endpoint (a run was once routed to a 262k-context, 5x-priced third party
-/// that then dropped the stream). Pin the request to the author's first-party
-/// endpoint and disable fallbacks: for a first-party author OpenRouter's
-/// provider slug equals the author segment of the model id (verified for
-/// `xiaomi` and holds for `deepseek`, `minimax`, etc.), so a run never silently
-/// lands on an inferior host. Returns the model's registry id and its
-/// provider options, or None for non-OpenRouter models (direct providers route
-/// to a single upstream and need no hint).
-fn openrouter_provider_pin(model: &str) -> Option<(String, serde_json::Value)> {
-    let rest = model.strip_prefix("openrouter/")?;
-    // Drop any routing suffix (e.g. ":floor") so the key matches the registry
-    // model id, then take the author segment as the first-party provider slug.
-    let model_id = rest.split(':').next().unwrap_or(rest);
-    let author = model_id.split('/').next().filter(|s| !s.is_empty())?;
-    Some((
-        model_id.to_string(),
-        serde_json::json!({
-            "options": {
-                "provider": { "only": [author], "allow_fallbacks": false }
-            }
-        }),
-    ))
-}
-
-/// The custom-provider definitions of the run's models, for staging into the
-/// run's project config.
-///
-/// `run_agent` points XDG_CONFIG_HOME at an empty directory, which hides
-/// the user's global opencode.json{,c} and every custom provider in it.
-/// auth.json keys survive (XDG data dir), so without staging the run holds a
-/// key to an endpoint it cannot name and fails with opaque provider errors.
-/// `opencode debug config` resolves the user's real config in the harness
-/// environment. Staging that one entry gives the run its endpoint while
-/// global plugins, AGENTS.md instructions, and unrelated config stay hidden.
-/// Built-in providers are absent from the user config and stage nothing. A
-/// provider defined nowhere fails the run before spawn: after spawn the same
-/// mistake surfaces as generic provider stream errors with nothing
-/// actionable in them.
-///
-/// Each provider is looked up once, and `opencode debug config` runs once.
-fn custom_provider_stages(models: &[&str]) -> Result<Vec<(String, serde_json::Value)>, String> {
-    let provider_ids = provider_ids(models);
-    if provider_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let resolved = match command_stdout("opencode", &["debug", "config"]).and_then(|output| {
-        serde_json::from_str::<serde_json::Value>(&output)
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
-    }) {
-        Ok(value) => value,
-        Err(error) => {
-            warn!("opencode debug config unreadable, staging nothing: {error}");
-            return Ok(Vec::new());
-        }
-    };
-    let mut staged = Vec::new();
-    for provider_id in provider_ids {
-        if let Some(definition) = resolved.get("provider").and_then(|p| p.get(&provider_id)) {
-            staged.push((provider_id, definition.clone()));
-        } else if run_opencode_models(Some(&provider_id)).is_err() {
-            // A built-in provider resolves without user config; this one does not.
-            return Err(format!(
-                "OpenCode provider `{provider_id}` is defined nowhere: `opencode models \
-                 {provider_id}` fails and `opencode debug config` has no entry for it. Define it \
-                 in ~/.config/opencode/opencode.jsonc, or export OPENCODE_CONFIG to a config file \
-                 that defines it, and rerun."
-            ));
-        }
-    }
-    Ok(staged)
-}
-
-/// The distinct providers of `provider/model` ids, in order.
-fn provider_ids(models: &[&str]) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for model in models {
-        if let Ok((id, _)) = parse_opencode_model(model)
-            && !ids.contains(&id)
-        {
-            ids.push(id);
-        }
-    }
-    ids
-}
-
-/// Writes the OpenCode project config and agent definition into the workspace of `case`.
-fn write_opencode_agent(
-    case: &CaseDir,
-    config: OpenCodeAgentConfig<'_>,
-    model: Option<&str>,
-    subagent_model: Option<&str>,
-    shell: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let work_dir = case.workspace();
-    let agents_dir = work_dir.join(".opencode/agents");
-    fs::create_dir_all(&agents_dir)?;
-
-    let models: Vec<&str> = model.into_iter().chain(subagent_model).collect();
-    let staged = custom_provider_stages(&models)?;
-    fs::write(
-        work_dir.join(".opencode/opencode.json"),
-        opencode_project_config(
-            case.root(),
-            &OpenCodeProjectOptions {
-                model,
-                subagent_model,
-                staged_providers: &staged,
-                shell,
-            },
-        ),
-    )?;
-
-    let mut permissions = String::new();
-    for (tool, policy) in OPENCODE_LOCAL_PERMISSIONS {
-        permissions.push_str(&format!("  {tool}: {policy}\n"));
-    }
-    permissions.push_str(&opencode_task_permission());
-
-    // The agent .md body becomes `agent.prompt` and would REPLACE OpenCode's
-    // default provider system prompt (request assembly is
-    // `agent.prompt ? [agent.prompt] : SystemPrompt.provider(model)`, the md
-    // body is trimmed, and an empty string is falsy). Historically we put the
-    // compaction-recovery hint here, which silently dropped the entire
-    // default coding prompt (~2k tokens of tool-use/communication guidance).
-    // Deliberately keep the body EMPTY: the official default prompt is a
-    // stable prefix (billed once, then cache reads), and the recovery
-    // instruction now lives in the compaction plugin instead.
-    fs::write(
-        agents_dir.join(format!("{}.md", config.name)),
-        format!(
-            "---\ndescription: {}\nmode: primary\npermission:\n{}---\n",
-            config.description, permissions
-        ),
-    )?;
-
-    let plugin_dir = work_dir.join(".opencode/plugin");
-    fs::create_dir_all(&plugin_dir)?;
-    fs::write(
-        plugin_dir.join("harvest-resilience.js"),
-        OPENCODE_RESILIENCE_PLUGIN,
-    )?;
-
-    if let Some(recovery_command) = &config.recovery_command {
-        fs::write(
-            plugin_dir.join("compaction-recovery.js"),
-            OPENCODE_COMPACTION_PLUGIN.replace("{RECOVERY_CMD}", recovery_command),
-        )?;
-    }
-    Ok(())
-}
-
-const GIT_DISCIPLINE_BODY: &str = include_str!("git_discipline.md");
-
-pub fn git_discipline() -> &'static str {
-    GIT_DISCIPLINE_BODY.trim_end()
-}
-
 /// Prepare the agent working directory as a git repository. A fresh
 /// directory gets `git init`, a local identity (agents run without a global
 /// git config), a `.gitignore` that keeps build outputs and worktrees
@@ -1847,40 +428,65 @@ pub fn ensure_workdir_git(work_dir: &Path) {
     info!("initialized git work record in {}", work_dir.display());
 }
 
+/// Appends one ISO-timestamped runner marker line to the shared output log,
+/// formatted like a tracing log line so `parse_trace.py` picks it up with the
+/// same regexes it already uses on stderr-captured traces. Best-effort: a
+/// missing/unwritable output log is not an error.
+fn append_output_log_line(output_log_path: Option<&Path>, msg: &str) {
+    let Some(out_path) = output_log_path else {
+        return;
+    };
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+    {
+        let _ = writeln!(f, "{}  INFO agent_runner: {}", iso_utc_now(), msg);
+    }
+}
+
+/// Current UTC time as ISO-8601 (`2026-07-18T12:34:56.789Z`) without a chrono
+/// dependency (civil-from-days algorithm).
+fn iso_utc_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs() as i64;
+    let millis = d.subsec_millis();
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    let (h, m, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+fn command_stdout(cmd: &str, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new(cmd).args(args).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} {} failed with status {}: {}",
+            cmd,
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn render_prompt_fills_shared_placeholders() {
-        let case = CaseDir::new().unwrap();
-        let toolchain = RustToolchainContext {
-            required_version: "1.94.1".to_owned(),
-            prompt_block: "TOOLCHAIN".to_owned(),
-            test_corpus_root: None,
-        };
-        let env = HashMap::new();
-        let invocation = AgentInvocation {
-            phase: AgentPhase::Translate,
-            agent: AgentKind::Claude,
-            case: &case,
-            prompt: "{AGENT_BUG_WORKAROUNDS}\n{GIT_DISCIPLINE}\n{RUST_TOOLCHAIN_CONTEXT}\n\
-                     {CASE_LAYOUT}\n{MODEL_LIMITS}",
-            timeout_secs: 1,
-            model: None,
-            subagent_model: None,
-            no_plan: false,
-            extra_env: &env,
-            output_log_path: None,
-            rust_toolchain: &toolchain,
-        };
-        let prompt = invocation.render_prompt(&RegistryLimits::default());
-        assert!(prompt.contains("TOOLCHAIN"));
-        assert!(prompt.contains("### Directories of this run"));
-        assert!(!prompt.contains('{'), "{prompt}");
-        case.finish();
-    }
 
     #[test]
     fn effective_subagent_model_normalizes_and_checks() {
@@ -1915,103 +521,6 @@ mod tests {
         // Unsupported setups.
         assert!(eff(AgentKind::Kiro, None, Some("x")).is_err());
         assert!(eff(AgentKind::Claude, Some("sonnet"), Some("openrouter,a/b")).is_err());
-    }
-
-    fn limits(context: u64, output: Option<u64>) -> OpenCodeModelLimits {
-        OpenCodeModelLimits { context, output }
-    }
-
-    #[test]
-    fn output_cap_needs_the_output_limit_of_every_model() {
-        let cap = |main, subagent| RegistryLimits { main, subagent }.output_cap();
-        assert_eq!(cap(Some(limits(1, Some(128_000))), None), Some(128_000));
-        // The larger limit; OpenCode's min() keeps each model at its own.
-        assert_eq!(
-            cap(Some(limits(1, Some(32_000))), Some(limits(1, Some(65_536)))),
-            Some(65_536)
-        );
-        // A model without an output limit would get the cap itself.
-        assert_eq!(
-            cap(Some(limits(1, Some(65_536))), Some(limits(1, None))),
-            None
-        );
-        assert_eq!(
-            cap(Some(limits(1, None)), Some(limits(1, Some(65_536)))),
-            None
-        );
-        // The main model left to the CLI default has no registry entry.
-        assert_eq!(cap(None, Some(limits(1, Some(65_536)))), None);
-        assert_eq!(cap(None, None), None);
-    }
-
-    #[test]
-    fn extract_model_limits_matches_provider_and_id() {
-        let sample = concat!(
-            "opencode-go/mimo-v2.5-pro\n",
-            "{\n",
-            "  \"id\": \"mimo-v2.5-pro\",\n",
-            "  \"providerID\": \"opencode-go\",\n",
-            "  \"name\": \"MiMo V2.5 Pro\",\n",
-            "  \"limit\": {\n",
-            "    \"context\": 1048576,\n",
-            "    \"output\": 128000\n",
-            "  }\n",
-            "}\n",
-        );
-        let limits = extract_model_limits_from_output(sample, "opencode-go", "mimo-v2.5-pro")
-            .expect("limits must be found");
-        assert_eq!(limits.context, 1_048_576);
-        assert_eq!(limits.output, Some(128_000));
-    }
-
-    #[test]
-    fn extract_model_limits_requires_exact_match() {
-        let sample = concat!(
-            "opencode-go/mimo-v2.5-pro\n",
-            "{\n",
-            "  \"id\": \"mimo-v2.5-pro\",\n",
-            "  \"providerID\": \"opencode-go\",\n",
-            "  \"limit\": {\n",
-            "    \"context\": 1048576,\n",
-            "    \"output\": 128000\n",
-            "  }\n",
-            "}\n",
-        );
-        assert!(extract_model_limits_from_output(sample, "opencode-go", "mimo-v2.5").is_none());
-        assert!(
-            extract_model_limits_from_output(sample, "other-provider", "mimo-v2.5-pro").is_none()
-        );
-    }
-
-    #[test]
-    fn registry_output_limit_zero_means_none() {
-        let sample = r#"{"id": "m", "providerID": "p", "limit": {"context": 8192, "output": 0}}"#;
-        assert_eq!(
-            extract_model_limits_from_output(sample, "p", "m"),
-            Some(limits(8192, None))
-        );
-    }
-
-    #[test]
-    fn model_limits_list_the_registry_and_subagent_sections() {
-        // OpenCode, both models in the registry.
-        let both = RegistryLimits {
-            main: Some(limits(1_048_576, Some(128_000))),
-            subagent: Some(limits(262_144, Some(65_536))),
-        };
-        assert_eq!(
-            render_model_limits(Some("opencode-go/mimo-v2.6-flash"), &both),
-            "### Registry context limits\ncontext_limit: 1048576\noutput_limit: 128000\n\n\
-             ### Sub-agent model\nmodel: opencode-go/mimo-v2.6-flash\n\
-             context_limit: 262144\noutput_limit: 65536"
-        );
-        // Claude Code: no registry, so only the model.
-        let none = RegistryLimits::default();
-        assert_eq!(
-            render_model_limits(Some("haiku"), &none),
-            "### Sub-agent model\nmodel: haiku"
-        );
-        assert_eq!(render_model_limits(None, &none), "");
     }
 
     fn file_sink(path: &Path) -> (String, Box<dyn Write>) {
@@ -2075,398 +584,6 @@ mod tests {
         .expect("spawning thread");
         let status = child.wait().expect("wait");
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
-    }
-
-    /// Writes a JSONL log with the given events and assesses it.
-    fn assess_log(lines: &[&str]) -> OpenCodeOutcome {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("agent.log");
-        fs::write(&path, lines.join("\n")).expect("write log");
-        assess_opencode_run(&path)
-    }
-
-    #[test]
-    fn healthy_run_needs_a_stop_finish() {
-        let outcome = assess_log(&[
-            r#"{"type":"step_start","sessionID":"ses_a","part":{}}"#,
-            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
-            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"stop"}}"#,
-        ]);
-        assert_eq!(outcome, OpenCodeOutcome::Healthy);
-    }
-
-    #[test]
-    fn dead_stream_is_resumable() {
-        // trace_pcre2_3 / trace_libpng_1: reasoning cut mid-sentence, the
-        // synthesized step_finish reports "unknown", and opencode exits 0.
-        let outcome = assess_log(&[
-            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
-            r#"{"type":"reasoning","sessionID":"ses_a","part":{"text":"cut off mid-thou"}}"#,
-            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"unknown"}}"#,
-        ]);
-        assert_eq!(
-            outcome,
-            OpenCodeOutcome::Resumable {
-                session_id: "ses_a".to_string(),
-                reason: "unknown".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn whitelist_catches_endings_no_blacklist_would_list() {
-        // A step_finish with no `reason` at all, and a truncated turn: both
-        // must be caught by requiring "stop" rather than listing bad values.
-        for part in [
-            r#"{}"#,
-            r#"{"reason":"length"}"#,
-            r#"{"reason":"tool-calls"}"#,
-        ] {
-            let line = format!(r#"{{"type":"step_finish","sessionID":"ses_a","part":{part}}}"#);
-            assert!(
-                matches!(assess_log(&[&line]), OpenCodeOutcome::Resumable { .. }),
-                "part {part} should be resumable"
-            );
-        }
-    }
-
-    #[test]
-    fn balance_error_is_fatal_not_resumable() {
-        // trace_mujs_6: the provider refused outright. Resuming would burn the
-        // timeout, and grading the partial run would record an environment
-        // failure as a score.
-        let outcome = assess_log(&[
-            r#"{"type":"step_finish","sessionID":"ses_a","part":{"reason":"tool-calls"}}"#,
-            r#"{"type":"error","sessionID":"ses_a","error":{"name":"APIError","data":{"message":"Upstream request failed: [invalid_request_error] Insufficient Balance"}}}"#,
-        ]);
-        match outcome {
-            OpenCodeOutcome::Fatal(msg) => assert!(msg.contains("Insufficient Balance")),
-            other => panic!("expected Fatal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_log_without_events_is_left_alone() {
-        assert_eq!(assess_log(&["not json", ""]), OpenCodeOutcome::Healthy);
-    }
-
-    #[test]
-    fn resilience_plugin_rewrites_empty_task_results() {
-        assert!(OPENCODE_RESILIENCE_PLUGIN.contains("tool.execute.after"));
-        assert!(OPENCODE_RESILIENCE_PLUGIN.contains("task_result"));
-    }
-
-    #[test]
-    fn opencode_permissions_deny_web_and_skill() {
-        assert!(OPENCODE_LOCAL_PERMISSIONS.contains(&("webfetch", "deny")));
-        assert!(OPENCODE_LOCAL_PERMISSIONS.contains(&("websearch", "deny")));
-        assert!(OPENCODE_LOCAL_PERMISSIONS.contains(&("skill", "deny")));
-        assert!(OPENCODE_LOCAL_PERMISSIONS.contains(&("bash", "allow")));
-    }
-
-    #[test]
-    fn task_permission_allows_only_the_subagents() {
-        let permission = opencode_task_permission();
-        // The deny of every agent comes first: the last matching rule wins,
-        // and a last `task` rule that denies `*` would hide the tool.
-        assert!(permission.starts_with("  task:\n    \"*\": deny\n"));
-        for name in OPENCODE_SUBAGENTS {
-            assert!(permission.contains(&format!("    {name}: allow\n")));
-        }
-        assert!(!permission.trim_end().ends_with("deny"));
-    }
-
-    #[test]
-    fn opencode_project_config_scopes_external_directory_to_case_dir() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(case_root, &OpenCodeProjectOptions::default());
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        let rules = config
-            .pointer("/permission/external_directory")
-            .and_then(|v| v.as_object())
-            .expect("external_directory rules present");
-        assert_eq!(rules.get("*").and_then(|v| v.as_str()), Some("deny"));
-        assert_eq!(
-            rules.get("/tmp/.tmpAbc123/**").and_then(|v| v.as_str()),
-            Some("allow")
-        );
-        // OpenCode resolves rules last-match-wins: the catch-all deny must
-        // appear before the tempdir allow in the serialized config.
-        assert!(raw.find("\"*\"").unwrap() < raw.find("/tmp/.tmpAbc123/**").unwrap());
-        // No model → no provider routing block.
-        assert!(config.get("provider").is_none());
-    }
-
-    #[test]
-    fn opencode_project_config_disables_snapshot() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let staged = (
-            "harvest-hyak".to_string(),
-            serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
-        );
-        for (model, staged) in [
-            (None, &[][..]),
-            (Some("openrouter/xiaomi/mimo-v2.5-pro"), &[][..]),
-            (
-                Some("harvest-hyak/qwen3.8-27b"),
-                std::slice::from_ref(&staged),
-            ),
-        ] {
-            let raw = opencode_project_config(
-                case_root,
-                &OpenCodeProjectOptions {
-                    model,
-                    staged_providers: staged,
-                    ..Default::default()
-                },
-            );
-            let config: serde_json::Value =
-                serde_json::from_str(&raw).expect("project config must be valid JSON");
-            assert_eq!(config.get("snapshot"), Some(&serde_json::json!(false)));
-        }
-    }
-
-    #[test]
-    fn opencode_project_config_sets_shell_only_when_given() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let shell = Path::new("/tmp/.tmpAbc123/agent_env/harvest-shell");
-        let with: serde_json::Value = serde_json::from_str(&opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                shell: Some(shell),
-                ..Default::default()
-            },
-        ))
-        .expect("project config must be valid JSON");
-        assert_eq!(
-            with.get("shell"),
-            Some(&serde_json::json!(
-                "/tmp/.tmpAbc123/agent_env/harvest-shell"
-            ))
-        );
-        let without: serde_json::Value =
-            serde_json::from_str(&opencode_project_config(case_root, &Default::default())).unwrap();
-        assert!(without.get("shell").is_none());
-    }
-
-    #[test]
-    fn opencode_project_config_pins_openrouter_to_author_endpoint() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        let opts = config
-            .pointer("/provider/openrouter/models/xiaomi~1mimo-v2.5-pro/options/provider")
-            .expect("openrouter provider pin present");
-        assert_eq!(
-            opts.pointer("/only").and_then(|v| v.as_array()),
-            Some(&vec![serde_json::json!("xiaomi")])
-        );
-        assert_eq!(
-            opts.pointer("/allow_fallbacks").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn opencode_project_config_no_pin_for_non_openrouter() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("opencode-go/mimo-v2.5"),
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        assert!(config.get("provider").is_none());
-    }
-
-    #[test]
-    fn opencode_project_config_stages_custom_provider() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let definition = serde_json::json!({
-            "npm": "@ai-sdk/openai-compatible",
-            "options": { "baseURL": "https://endpoint.example/v1" }
-        });
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("harvest-hyak/qwen3.8-27b"),
-                staged_providers: &[("harvest-hyak".to_string(), definition)],
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        assert_eq!(
-            config.pointer("/provider/harvest-hyak/options/baseURL"),
-            Some(&serde_json::json!("https://endpoint.example/v1"))
-        );
-        // Staging must not disturb the permission boundary.
-        assert!(config.pointer("/permission/external_directory/*").is_some());
-    }
-
-    #[test]
-    fn opencode_project_config_prefers_openrouter_pin_over_staged_entry() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
-                staged_providers: &[(
-                    "openrouter".to_string(),
-                    serde_json::json!({"npm": "shadowed"}),
-                )],
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        assert!(config.pointer("/provider/openrouter/models").is_some());
-        assert!(config.pointer("/provider/openrouter/npm").is_none());
-    }
-
-    #[test]
-    fn opencode_project_config_sets_subagent_model() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
-                subagent_model: Some("openrouter/deepseek/deepseek-v4-flash"),
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        for name in OPENCODE_SUBAGENTS {
-            assert_eq!(
-                config.pointer(&format!("/agent/{name}/model")),
-                Some(&serde_json::json!("openrouter/deepseek/deepseek-v4-flash"))
-            );
-        }
-        // Both models are pinned to their author's endpoint.
-        let pins = config.pointer("/provider/openrouter/models").unwrap();
-        assert!(pins.get("xiaomi/mimo-v2.5-pro").is_some());
-        assert!(pins.get("deepseek/deepseek-v4-flash").is_some());
-        // Without a sub-agent model the sub-agents keep the main model.
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("opencode-go/mimo-v2.5"),
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(config.get("agent").is_none());
-    }
-
-    #[test]
-    fn opencode_project_config_pins_openrouter_and_stages_custom_provider() {
-        let raw = opencode_project_config(
-            Path::new("/tmp/.tmpAbc123"),
-            &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
-                subagent_model: Some("harvest-hyak/qwen3.8-27b"),
-                staged_providers: &[(
-                    "harvest-hyak".to_string(),
-                    serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
-                )],
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(
-            config
-                .pointer("/provider/openrouter/models/xiaomi~1mimo-v2.5-pro")
-                .is_some()
-        );
-        assert_eq!(
-            config.pointer("/provider/harvest-hyak/npm"),
-            Some(&serde_json::json!("@ai-sdk/openai-compatible"))
-        );
-    }
-
-    #[test]
-    fn provider_ids_are_distinct_and_skip_malformed_models() {
-        assert_eq!(
-            provider_ids(&["harvest-hyak/a", "harvest-hyak/b", "opencode-go/c", "bare"]),
-            ["harvest-hyak", "opencode-go"]
-        );
-        // No provider: nothing to look up, so no `opencode` call.
-        assert!(custom_provider_stages(&["bare"]).unwrap().is_empty());
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn write_opencode_agent_writes_project_config() {
-        let case = CaseDir::new().unwrap();
-        let dir = case.workspace();
-        write_opencode_agent(
-            &case,
-            OpenCodeAgentConfig {
-                name: "harvest-translate",
-                description: "test",
-                recovery_command: None,
-            },
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let config = fs::read_to_string(dir.join(".opencode/opencode.json")).unwrap();
-        assert_eq!(
-            config,
-            opencode_project_config(case.root(), &Default::default())
-        );
-        let agent_md =
-            fs::read_to_string(dir.join(".opencode/agents/harvest-translate.md")).unwrap();
-        // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
-        // official default provider system prompt applies. The compaction
-        // hint lives in the plugin, not here.
-        assert!(agent_md.ends_with("---\n"));
-        assert!(!agent_md.contains("compaction"));
-        assert!(agent_md.contains(&opencode_task_permission()));
-        // No recovery command -> no plugin.
-        assert!(!dir.join(".opencode/plugin/compaction-recovery.js").exists());
-        case.finish();
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn write_opencode_agent_writes_compaction_recovery_plugin() {
-        let case = CaseDir::new().unwrap();
-        let dir = case.workspace();
-        write_opencode_agent(
-            &case,
-            OpenCodeAgentConfig {
-                name: "harvest-verify",
-                description: "test",
-                recovery_command: Some("cat PLAN.md HYPOTHESES.md".to_string()),
-            },
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let plugin =
-            fs::read_to_string(dir.join(".opencode/plugin/compaction-recovery.js")).unwrap();
-        assert!(plugin.contains("run `cat PLAN.md HYPOTHESES.md` to restore"));
-        assert!(!plugin.contains("{RECOVERY_CMD}"));
-        assert!(plugin.contains("experimental.chat.messages.transform"));
-        assert!(plugin.contains("experimental.session.compacting"));
-        // Fallback predicate must not depend solely on the unstable metadata marker.
-        assert!(plugin.contains("Continue if you have next steps"));
-        case.finish();
     }
 
     #[test]
