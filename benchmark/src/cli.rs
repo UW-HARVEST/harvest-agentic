@@ -91,6 +91,7 @@ pub struct Args {
             "agentic",
             "agent",
             "model",
+            "subagent_model",
             "no_plan",
             "workflow",
             "config",
@@ -129,6 +130,13 @@ pub struct Args {
     /// OpenCode expects provider/model format (for example, "opencode-go/deepseek-v4-pro").
     #[arg(long, requires = "agentic")]
     pub model: Option<String>,
+
+    /// Default model of the sub-agents (scouts included) that the main agent
+    /// dispatches, in the same format as --model. Without it, the sub-agents
+    /// use the main model. The main agent cannot override it per sub-agent.
+    /// Applies to every agentic stage of the run.
+    #[arg(long, requires = "agentic")]
+    pub subagent_model: Option<String>,
 
     /// Grade and refine against a bench directory's *current* external test
     /// suite instead of the one the snapshot carries. Only applies when
@@ -234,6 +242,13 @@ impl Args {
                 stages_str()
             ));
         }
+        // Every agentic stage checks the resolved config too (an agent set in a config file); this
+        // reports a bad combination once, before the run, instead of once per program.
+        agent_runner::effective_subagent_model(
+            self.agent.unwrap_or_default(),
+            self.model.as_deref(),
+            self.subagent_model.as_deref(),
+        )?;
         // The translate stage checks the resolved config too (an agent set in a config file).
         if self.no_tab2rust {
             translate_agentic::check_tab2rust(false, self.no_plan, self.agent.unwrap_or_default())
@@ -317,6 +332,24 @@ mod tests {
         assert!(err.contains("--no-tab2rust"), "{err}");
         let args = parse(&["bench", "--agentic=t,v", "--no-tab2rust", "in", "out"]).unwrap();
         args.validate_stages(&args.stages()).unwrap();
+    }
+
+    #[test]
+    fn subagent_model_is_checked_before_the_run() {
+        // The combinations themselves are tested in agent_runner.
+        let args = parse(&[
+            "bench",
+            "--agentic=t",
+            "--agent",
+            "kiro",
+            "--subagent-model",
+            "x",
+            "in",
+            "out",
+        ])
+        .unwrap();
+        assert!(args.validate_stages(&args.stages()).is_err());
+        assert!(parse(&["bench", "--subagent-model", "x", "in", "out"]).is_err());
     }
 
     #[test]

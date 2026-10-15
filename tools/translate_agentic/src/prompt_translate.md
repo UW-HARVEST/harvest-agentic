@@ -30,8 +30,10 @@ Self-assessment:
 - Approximate usable context window: <e.g. 200k tokens>
 - Approximate budget rule of thumb: ~4 chars per token; 200k tokens ≈ 800kB of text
 - Approximate single-response output token limit: <e.g. 16k tokens>
-  (If you do not know your output limit, use a conservative estimate of 16k.
-   This limit caps how much Rust code a single sub-agent call can write.)
+  (If you do not know your output limit, use a conservative estimate of 16k.)
+- Sub-agent model, window, output limit: <the same as yours, unless the Invariants below have a
+  "Sub-agent model" section>
+  (The sub-agent output limit caps how much Rust code a single sub-agent call can write.)
 ```
 
 ### 0.2 Send scouts to explore the C code
@@ -45,14 +47,14 @@ yourself: your context is for the plan and the build.
    find inputs/c_src -name '*.c' -o -name '*.h' | xargs wc -l
    ```
 
-2. One scout can explore code of about 50% of its context window. Scouts use your model. If the
-   code is larger, divide the files into groups of that size, one group for each scout.
+2. One scout can explore code of about 50% of its context window. Scouts use the sub-agent model
+   from 0.1. If the code is larger, divide the files into groups of that size, one group for each scout.
 3. Send all scouts in one message. Give each scout this prompt:
 
    ```
    Read inputs/prompts/SCOUT.md and do the task in it.
    Scout <n> of <N>. File group: <directories or files of inputs/c_src, or "all">.
-   Context window: <from 0.1>. Output token limit: <from 0.1>.
+   Context window: <sub-agent window from 0.1>. Output token limit: <sub-agent output limit from 0.1>.
    ```
 
 4. Each scout writes `scout/REPORT_<n>.md` and replies with a codebase summary, proposed subtasks,
@@ -77,6 +79,7 @@ subtasks T1, T2, ..., and change what you disagree with. The plan is yours.
 - Model: ...
 - Window: ...
 - Output token limit: ... (unknown → use 16k as conservative default)
+- Sub-agents: model ..., window ..., output token limit ...
 
 ## Invariants (do not drift across compactions)
 
@@ -181,11 +184,11 @@ Each subtask must satisfy TWO constraints:
 1. **Context window**: the subtask's combined input (C source to read) + output
    (Rust code to write) + tool overhead must fit within ONE uncompacted context
    window. A safe rule: the total token count (C source + Rust output + tool
-   calls) for a single subtask should not exceed **30%** of your usable context
-   window. If it would, split the subtask further.
+   calls) for a single subtask should not exceed **30%** of the sub-agent's usable
+   context window. If it would, split the subtask further.
 2. **Output token limit**: the Rust code a sub-agent writes in a single response
-   must fit within the single-response output token limit (see Self-assessment
-   above). **Any C file or section exceeding ~1000 lines is very likely to
+   must fit within the sub-agent's single-response output token limit (see
+   Self-assessment above). **Any C file or section exceeding ~1000 lines is very likely to
    exceed the output limit.** There are two strategies to handle this:
    - **Preferred**: split at the plan level — assign different function groups
      or line ranges of the same file to different subtasks/sub-agents.
@@ -297,9 +300,10 @@ it:
 There are **two independent triggers** that require splitting a subtask further:
 
 1. **Context window trigger**: estimated total (input + output + overhead)
-   exceeds ~50% of your remaining usable window.
-2. **Output token limit trigger**: estimated Rust output alone exceeds your
-   single-response output token limit (from Self-assessment 0.1).
+   exceeds ~50% of the usable window of the agent that does the subtask (a
+   sub-agent, or what remains of yours).
+2. **Output token limit trigger**: estimated Rust output alone exceeds the
+   single-response output token limit of that agent (from Self-assessment 0.1).
 
 Either trigger is sufficient to force a split. Better to add three subtasks
 than to be compacted mid-write or hit the output cap mid-file.

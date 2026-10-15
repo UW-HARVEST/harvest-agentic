@@ -142,6 +142,7 @@ harness build would otherwise report every test as a failure.
 | `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`conform` is an experimental research stage). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
 | `--agent <A>` | `opencode`/`oc`, `claude`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
+| `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. Not supported with Kiro. On Claude Code both models must use CCR or neither. |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
 | `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |

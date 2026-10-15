@@ -94,6 +94,7 @@ impl Tool for TranslateAgentic {
             prompt: &translate_prompt,
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
+            subagent_model: config.subagent_model.as_deref(),
             no_plan,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
@@ -221,6 +222,11 @@ pub struct Config {
     /// When Claude is set to a "provider,model" format (e.g. "openrouter,deepseek/deepseek-v4-pro"),
     /// Claude Code is routed through claude-code-router. OpenCode expects provider/model format.
     pub model: Option<String>,
+
+    /// Default model of the sub-agents that the main agent dispatches, in the
+    /// same format as `model`. If absent, the sub-agents use the main model.
+    /// Not supported with Kiro.
+    pub subagent_model: Option<String>,
 
     /// If true, use the pre-anti-compaction prompt (no PLAN.md / Invariants /
     /// sub-agent push) and skip the `--append-system-prompt` flag. Intended for

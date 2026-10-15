@@ -154,6 +154,7 @@ pub struct RunOptions {
     pub stages: Vec<Stage>,
     pub agent: Option<AgentKind>,
     pub model: Option<String>,
+    pub subagent_model: Option<String>,
     pub no_plan: bool,
     pub workflow: bool,
     pub test_harness: TestHarness,
@@ -581,6 +582,9 @@ fn benchmark_single_program(
         }
         if let Some(m) = &opts.model {
             overrides.push(format!("tools.{tool}.model={m}"));
+        }
+        if let Some(m) = &opts.subagent_model {
+            overrides.push(format!("tools.{tool}.subagent_model={m}"));
         }
     };
     // The suite is loaded on every run, whichever translator produces the
@@ -1274,6 +1278,11 @@ fn run(args: Args) -> HarvestResult<()> {
         stages,
         agent: args.agent,
         model: args.model.clone(),
+        // A sub-agent model equal to --model is no sub-agent model.
+        subagent_model: args
+            .subagent_model
+            .clone()
+            .filter(|sub| Some(sub) != args.model.as_ref()),
         no_plan: args.no_plan,
         workflow: args.workflow,
         test_harness: args.test_harness,

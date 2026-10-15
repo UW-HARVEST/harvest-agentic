@@ -55,6 +55,11 @@ pub struct Config {
     /// uses its default.
     pub model: Option<String>,
 
+    /// Default model of the sub-agents that the main agent dispatches, in the
+    /// same format as `model`. If absent, the sub-agents use the main model.
+    /// Not supported with Kiro.
+    pub subagent_model: Option<String>,
+
     /// Extra environment variables to inject into the agent process.
     #[serde(default, skip_serializing)]
     pub env: HashMap<String, String>,
@@ -161,6 +166,7 @@ impl Tool for ConformAgentic {
             prompt: &prompt,
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
+            subagent_model: config.subagent_model.as_deref(),
             no_plan: false,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
