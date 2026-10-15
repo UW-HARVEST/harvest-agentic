@@ -20,6 +20,7 @@ agent_runner = { path = "agent_runner" }
 translate_agentic = { path = "tools/translate_agentic" }
 verify_fix_agentic = { path = "tools/verify_fix_agentic" }
 conform_agentic = { path = "tools/conform_agentic" }
+libc = "0.2.177"
 log = "0.4.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

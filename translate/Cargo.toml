@@ -16,7 +16,7 @@ clap.workspace = true
 config = { default-features = false, features = ["toml"], version = "0.15.18" }
 directories = "6.0.0"
 harvest_core.workspace = true 
-libc = "0.2.177"
+libc.workspace = true
 serde.workspace = true 
 serde_json.workspace = true 
 thiserror.workspace = true 

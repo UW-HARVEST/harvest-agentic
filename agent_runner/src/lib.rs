@@ -814,19 +814,23 @@ fn invoke_claude(
         "stream-json",
         "--verbose",
     ]);
+    // Claude Code gives sandboxed commands CLAUDE_CODE_TMPDIR (default
+    // /tmp/claude), not the TMPDIR that `run_agent` sets, and keeps its own
+    // per-user directory there too.
+    let mut env = vec![(
+        "CLAUDE_CODE_TMPDIR",
+        invocation.case.tmp().display().to_string(),
+    )];
     // Claude Code picks a sub-agent model from, in order: the Agent tool's
     // `model` parameter, the agent definition's frontmatter, then
     // CLAUDE_CODE_SUBAGENT_MODEL. With CLAUDE_CODE_SUBAGENT_MODEL_FORCE it
     // drops the first two (and the Workflow tool's per-agent models), so the
     // run's sub-agent model holds like OpenCode's (verified in the 2.1.294
     // bundle).
-    let env: Vec<(&str, String)> = match invocation.subagent_model {
-        Some(sub) => vec![
-            ("CLAUDE_CODE_SUBAGENT_MODEL", sub.to_string()),
-            ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1".to_string()),
-        ],
-        None => Vec::new(),
-    };
+    if let Some(sub) = invocation.subagent_model {
+        env.push(("CLAUDE_CODE_SUBAGENT_MODEL", sub.to_string()));
+        env.push(("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1".to_string()));
+    }
     run_agent(invocation, log_path, invocation.timeout_secs, &args, &env)
 }
 
@@ -1039,6 +1043,12 @@ fn run_agent(
     info!("Injecting RUSTUP_TOOLCHAIN={toolchain}");
     cmd.env("RUSTUP_TOOLCHAIN", toolchain);
 
+    // Keep the temporary files of the agent and its commands (compilers,
+    // linkers) in case_dir, which is on disk and is removed with the run.
+    let tmp = invocation.case.tmp();
+    info!("Injecting TMPDIR={}", tmp.display());
+    cmd.env("TMPDIR", &tmp);
+
     if invocation.agent == AgentKind::OpenCode {
         // Hide the user-global OpenCode config from the run. OpenCode
         // resolves its global config dir via xdg-basedir
@@ -1085,7 +1095,37 @@ fn run_agent(
         }
     }
     sinks.push(("stdout".into(), Box::new(std::io::stdout())));
+    end_with_parent(&mut cmd);
     Ok(run_teed(cmd, sinks)?)
+}
+
+/// Makes the kernel send `timeout` SIGTERM when the thread that spawns it
+/// ends, so the agent cannot outlive the run.
+///
+/// GNU `timeout` moves itself into a process group of its own. A terminal
+/// Ctrl+C signals only the foreground group, so without this it ends the
+/// benchmark and leaves `timeout` and the agent running under PID 1 until the
+/// stage deadline. On SIGTERM, `timeout` sends the signal to its whole process
+/// group, which includes the agent. This also covers a SIGKILL of the
+/// benchmark. The spawning thread waits for the child (see `run_teed`), so it
+/// does not end first.
+fn end_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id();
+    // SAFETY: the closure runs in the child between fork and exec. It calls
+    // only async-signal-safe functions and does not allocate.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent can exit before the prctl call; then no signal comes.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Runs `cmd` with stdin closed and stdout and stderr merged into one pipe,
@@ -2019,6 +2059,22 @@ mod tests {
         assert_eq!(status.code(), Some(3));
         assert_eq!(fs::read_to_string(&log).unwrap(), "first\nsecond\n");
         assert_eq!(fs::read_to_string(&output_log).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn child_gets_sigterm_when_the_spawning_thread_ends() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::thread::spawn(|| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            end_with_parent(&mut cmd);
+            cmd.spawn().expect("spawn sleep")
+        })
+        .join()
+        .expect("spawning thread");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
     }
 
     /// Writes a JSONL log with the given events and assesses it.

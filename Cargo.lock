@@ -121,6 +121,7 @@ name = "agent_runner"
 version = "0.1.0"
 dependencies = [
  "harvest_core",
+ "libc",
  "serde_json",
  "tempfile",
  "tracing",

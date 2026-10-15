@@ -1,18 +1,20 @@
 //! The directory of one agentic stage run (`case_dir`):
 //!
 //! ```text
-//! /tmp/.tmpXXXX/          case_dir: removed after a successful run, kept after a failed one
+//! /var/tmp/.tmpXXXX/      case_dir (in `large_temp_dir()`): removed after a successful run,
+//!                         kept after a failed one
 //!   inputs/               inputs from the framework (C source, task files, skills, suites), read-only
 //!   shared/               large files that agents share and that git must not record (tab2rust builds)
 //!   workspace/            the agent's working directory: the crate and the reports. Frozen.
 //!     inputs, shared      symbolic links to the two directories above (absolute targets). Git
 //!                         tracks them, so every git worktree of a sub-agent has them, wherever it is.
 //!     scratch/            private temporary output (C builds). Ignored by git. Removed before the freeze.
+//!   tmp/                  `TMPDIR` of the agent and of every command it runs (mode 0700)
 //! ```
 //!
 //! The prompts name every file relative to the checkout (the workspace or a worktree):
 //! `inputs/c_src/...`, `shared/...`, `scratch/...`. The framework also keeps its own files in
-//! case_dir (`logs/`, `agent_env/`, `.claude/`). They go with case_dir. `inputs/` is made
+//! case_dir (`logs/`, `agent_env/`, `.claude/`, `tmp/`). They go with case_dir. `inputs/` is made
 //! read-only before the agent starts, and any change to it is reported
 //! (`harvest_core::fs::ReferenceGuard`). The links are not frozen. The git record keeps them,
 //! and the next stage points them at its own case_dir.
@@ -35,26 +37,49 @@ pub const INPUTS: &str = "inputs";
 pub const SHARED: &str = "shared";
 /// Inside the workspace.
 pub const SCRATCH: &str = "scratch";
+/// In case_dir.
+pub const TMP: &str = "tmp";
 
 const LAYOUT: &str = include_str!("case_layout.md");
 
+/// The free space that [`large_temp_dir`] must have before a run starts. The C and test builds
+/// of a large project and the agent's temporary files take some GB, and the file system is
+/// usually shared with `/`.
+const MIN_FREE_BYTES: u64 = 4 << 30;
+
 /// One stage run's case_dir. [`CaseDir::freeze`] (or [`CaseDir::finish`]) removes it after a
 /// successful run. When the run fails (an error return or a panic), dropping it keeps the
-/// directory for debugging and prints its path to stderr. A failed run of a large project can
-/// leave some MB in `/tmp`.
+/// directory for debugging and prints its path to stderr. With the C builds in `scratch/` and the
+/// temporary files in `tmp/`, a failed run of a large project can leave some GB in
+/// [`large_temp_dir`], and a reboot does not remove them (`/var/tmp` is on disk). A run that a
+/// signal ends (Ctrl+C) also leaves its directory, without the message.
 pub struct CaseDir {
     temp: Option<tempfile::TempDir>,
     root: PathBuf,
 }
 
 impl CaseDir {
-    /// Creates case_dir with empty `workspace/`, `inputs/` and `shared/`.
+    /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `inputs/`, `shared/` and
+    /// `tmp/`. Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`] free.
     pub fn new() -> io::Result<Self> {
-        let temp = tempfile::tempdir()?;
+        use std::os::unix::fs::DirBuilderExt;
+        let base = large_temp_dir();
+        let free = free_bytes(&base)?;
+        if free < MIN_FREE_BYTES {
+            return Err(io::Error::other(format!(
+                "{} has only {:.1} GiB free. Free some space until you have {} GiB available, or set TMPDIR \
+                 to a directory with more space.",
+                base.display(),
+                free as f64 / (1u64 << 30) as f64,
+                MIN_FREE_BYTES >> 30
+            )));
+        }
+        let temp = tempfile::Builder::new().tempdir_in(base)?;
         let root = temp.path().to_path_buf();
         for area in [WORKSPACE, INPUTS, SHARED] {
             fs::create_dir(root.join(area))?;
         }
+        fs::DirBuilder::new().mode(0o700).create(root.join(TMP))?;
         Ok(Self {
             temp: Some(temp),
             root,
@@ -80,6 +105,11 @@ impl CaseDir {
     /// The scratch directory of the main workspace. A sub-agent in a git worktree has its own.
     pub fn scratch(&self) -> PathBuf {
         self.workspace().join(SCRATCH)
+    }
+
+    /// The `TMPDIR` of the agent.
+    pub fn tmp(&self) -> PathBuf {
+        self.root.join(TMP)
     }
 
     pub fn c_src(&self) -> PathBuf {
@@ -199,6 +229,32 @@ impl Drop for CaseDir {
             );
         }
     }
+}
+
+/// The directory for large temporary files: `$TMPDIR` when it names a directory, else
+/// `/var/tmp`. This is systemd's "temporary-large" path (`systemd-path temporary-large`).
+/// `/tmp` is often a small tmpfs in memory with a per-user quota; `/var/tmp` is on disk.
+/// systemd-tmpfiles removes entries of `/var/tmp` that are unused for 30 days.
+pub fn large_temp_dir() -> PathBuf {
+    match std::env::var_os("TMPDIR").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() && dir.is_dir() => dir,
+        _ => PathBuf::from("/var/tmp"),
+    }
+}
+
+/// The space that an unprivileged user can use in the file system of `path`. A per-user quota
+/// (for example on a tmpfs `/tmp`) is not taken into account.
+fn free_bytes(path: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a NUL-terminated string and `stat` points to writable memory.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statvfs succeeded, so it filled `stat`.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_bavail * stat.f_frsize)
 }
 
 /// Adds or removes the write permission of `path` and of everything below it. Symbolic links are
@@ -347,5 +403,12 @@ mod tests {
         assert!(text.contains("`inputs/c_src/`"));
         assert!(!text.contains('{'), "{text}");
         case.finish();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // no statvfs shim
+    fn measures_free_space() {
+        assert!(free_bytes(Path::new("/")).unwrap() > 0);
+        assert!(free_bytes(Path::new("/no/such/dir")).is_err());
     }
 }
