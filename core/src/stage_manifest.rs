@@ -19,6 +19,7 @@
 //!     suite/                                  external tests, rewritten every stage
 //!     reference_modified/<stage>/<name>       read-only inputs an agent changed (audit)
 //!     results.err
+//!     quality.json  unsafe_ops.tsv            code-quality report (benchmark)
 //! ```
 //!
 //! The layout *is* the protocol: the package is everything at the top level

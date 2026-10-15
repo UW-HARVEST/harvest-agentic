@@ -148,13 +148,29 @@ harness build would otherwise report every test as a failure.
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
-| `--test <PATH>` | Re-validate an already-translated output directory without running any stage |
+| `--test[=PARTS]` | Re-grade an already-translated output (`INPUT_DIR`, no `OUTPUT_DIR`) without running any stage. PARTS is a comma list of `correctness`/`c` (the external test suites, `results.csv`) and `quality`/`q` (code quality, see "Code quality metrics"); bare `--test` means `correctness,quality`. The value form requires `=` (`--test=q`, not `--test q`). |
 | `--force` | Erase an output program directory that already holds results (otherwise a populated directory is an error) |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
 
 `--timeout`, `--test-harness`, `--filter`, and `--exclude` work as in
 non-agentic benchmark runs. Flags scoped to a stage (e.g. `--no-fuzz` to verify)
 are rejected when that stage is not part of the run.
+
+## Code quality metrics
+
+After the tests, the benchmark measures every translated crate for safety
+and idiomaticity, following the automated metrics of DARPA TRACTOR's test and evaluation.
+
+- **Safety: operations that require an `unsafe` context** (raw-pointer
+  dereferences, calls to unsafe functions, uses of mutable or extern statics,
+  union field accesses, inline assembly). DARPA counts them with a patched
+  rustc; Harvest gets the same count from the stock compiler by blanking
+  every `unsafe {` keyword in a copy and compiling it.
+- **Idiomaticity: rustc warnings and clippy lints** of the correctness,
+  suspicious, complexity, perf and style groups, counted as DARPA does: the
+  levels are set on the command line, so the crate's own `#[allow]`
+  attributes still apply. Also clippy's cognitive complexity of every
+  function.
 
 ## Examples
 
@@ -200,10 +216,12 @@ cargo run --bin=benchmark --release -- \
   ./harvest-bench/tests/lz4/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
 ```
 
-Re-run only the test-vector validation on an existing output:
+Re-grade an existing output without running any stage (`--test` alone
+grades both correctness and code quality; `--test=c` runs only the test
+suites, `--test=q` only the code-quality measurements):
 
 ```bash
-cargo run --bin=benchmark --release -- --test ./out_lz4_1_cs --timeout 60
+cargo run --bin=benchmark --release -- --test=c ./out_lz4_1_cs --timeout 60
 ```
 
 Single project through the `translate` binary (no test-vector validation;

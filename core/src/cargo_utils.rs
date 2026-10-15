@@ -175,6 +175,56 @@ impl CargoToml {
         }
     }
 
+    /// Makes every relative `path` dependency absolute, resolved against
+    /// `base` (the directory the manifest was written for), so a copy of the
+    /// manifest placed elsewhere still finds its path dependencies. Covers
+    /// `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and
+    /// their `[target.*]` variants.
+    pub fn absolutize_path_dependencies(&mut self, base: &Path) {
+        const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+        let absolutize = |table: &mut dyn toml_edit::TableLike| {
+            for (_, dep) in table.iter_mut() {
+                let path = match &dep {
+                    Item::Value(Value::InlineTable(t)) => t.get("path").and_then(|p| p.as_str()),
+                    Item::Table(t) => t.get("path").and_then(|p| p.as_str()),
+                    _ => None,
+                };
+                let Some(path) = path.filter(|p| Path::new(p).is_relative()) else {
+                    continue;
+                };
+                let absolute = base.join(path).to_string_lossy().into_owned();
+                if let Some(t) = dep.as_inline_table_mut() {
+                    t.insert("path", Value::from(absolute));
+                } else if let Some(t) = dep.as_table_mut() {
+                    t.insert("path", Item::Value(Value::from(absolute)));
+                }
+            }
+        };
+        for section in SECTIONS {
+            if let Some(deps) = self
+                .doc
+                .get_mut(section)
+                .and_then(|d| d.as_table_like_mut())
+            {
+                absolutize(deps);
+            }
+        }
+        if let Some(targets) = self
+            .doc
+            .get_mut("target")
+            .and_then(|t| t.as_table_like_mut())
+        {
+            for (_, target) in targets.iter_mut() {
+                for section in SECTIONS {
+                    if let Some(deps) = target.get_mut(section).and_then(|d| d.as_table_like_mut())
+                    {
+                        absolutize(deps);
+                    }
+                }
+            }
+        }
+    }
+
     /// Sets `[package].name` to match the last component of `project_dir`, sanitized to a
     /// valid Cargo package name. Does nothing if the name is already correct or the directory
     /// name cannot be determined.
@@ -486,5 +536,31 @@ mod tests {
 
         let contents = fs::read_to_string(&cargo_path).unwrap();
         assert!(!contents.contains("[lib]"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_absolutize_path_dependencies() {
+        let f = write_temp(
+            "[package]\nname = \"a\"\n\n\
+             [dependencies]\nlocal = { path = \"../local\" }\nreg = \"1\"\nabs = { path = \"/opt/abs\" }\n\n\
+             [dependencies.tabled]\npath = \"sub/tabled\"\n\n\
+             [target.'cfg(unix)'.dev-dependencies]\nunixy = { path = \"u\" }\n",
+        );
+        let mut cargo = CargoToml::open(f.path()).unwrap();
+        cargo.absolutize_path_dependencies(Path::new("/base/pkg"));
+        cargo.save().unwrap();
+        let contents = fs::read_to_string(f.path()).unwrap();
+        assert!(
+            contents.contains("path = \"/base/pkg/../local\""),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("path = \"/base/pkg/sub/tabled\""),
+            "{contents}"
+        );
+        assert!(contents.contains("path = \"/base/pkg/u\""), "{contents}");
+        assert!(contents.contains("path = \"/opt/abs\""), "{contents}");
+        assert!(contents.contains("reg = \"1\""), "{contents}");
     }
 }

@@ -40,6 +40,17 @@ pub enum VerifyHarness {
     Libloading,
 }
 
+/// One part of what `--test` grades.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestPart {
+    /// Run the external test suites.
+    #[value(alias = "c")]
+    Correctness,
+    /// Measure safety and idiomaticity.
+    #[value(alias = "q")]
+    Quality,
+}
+
 #[derive(Parser)]
 #[command(name = "harvest-benchmark")]
 #[command(
@@ -52,19 +63,29 @@ pub struct Args {
     /// Input directory. Its meaning follows the first stage of the run:
     /// for translate (and the non-agentic modes) it is a bench test-case root;
     /// for verify/conform it is a previous run's output root, whose program
-    /// directories are self-contained snapshots (see .harvest/).
-    #[arg(required_unless_present = "test")]
-    pub input_dir: Option<PathBuf>,
+    /// directories are self-contained snapshots (see .harvest/). With --test
+    /// it is the output to re-grade: an output root, or one program snapshot.
+    pub input_dir: PathBuf,
 
-    /// Output directory where this run's products will be written.
+    /// Output directory where this run's products will be written. Not used
+    /// with --test, which grades INPUT_DIR in place.
     #[arg(required_unless_present = "test")]
     pub output_dir: Option<PathBuf>,
 
-    /// Test an already-translated output directory without running any stage.
-    /// Accepts either an output root containing program subdirectories, or one
-    /// translated program directory.
+    /// Re-grade an already-translated output (INPUT_DIR) without running any
+    /// stage. The optional value selects what is graded (aliases: c, q):
+    /// `correctness` runs the external test suites (results.csv), `quality`
+    /// measures safety and idiomaticity (.harvest/quality.json, quality.csv).
+    /// Bare `--test` means `--test=correctness,quality`.
     #[arg(
         long,
+        value_name = "PARTS",
+        num_args(0..=1),
+        require_equals = true,
+        default_missing_values = ["correctness", "quality"],
+        value_delimiter = ',',
+        value_enum,
+        ignore_case = true,
         conflicts_with_all = [
             "modular",
             "agentic",
@@ -74,11 +95,10 @@ pub struct Args {
             "workflow",
             "config",
             "test_case",
-            "input_dir",
             "output_dir"
         ]
     )]
-    pub test: Option<PathBuf>,
+    pub test: Option<Vec<TestPart>>,
 
     /// Use modular translation rather than standard all-at-once translation.
     #[arg(long, conflicts_with = "agentic")]
@@ -279,7 +299,7 @@ mod tests {
     fn space_separated_stage_value_is_rejected() {
         // require_equals: `--agentic verify` must not swallow a positional.
         let args = parse(&["bench", "--agentic", "in", "out"]).unwrap();
-        assert_eq!(args.input_dir.as_deref().unwrap().to_str(), Some("in"));
+        assert_eq!(args.input_dir, PathBuf::from("in"));
         assert!(parse(&["bench", "--agentic", "verify", "in", "out"]).is_err());
     }
 
@@ -329,6 +349,39 @@ mod tests {
             let args = parse(&["bench", spec, "--test-case", "tc", "in", "out"]).unwrap();
             args.validate_stages(&args.stages()).unwrap();
         }
+    }
+
+    #[test]
+    fn test_parts_follow_the_agentic_value_syntax() {
+        use TestPart::{Correctness, Quality};
+        for (argv, parts) in [
+            (vec!["bench", "--test", "out"], vec![Correctness, Quality]),
+            (
+                vec!["bench", "--test=c,q", "out"],
+                vec![Correctness, Quality],
+            ),
+            (
+                vec!["bench", "--test=quality,correctness", "out"],
+                vec![Quality, Correctness],
+            ),
+            (vec!["bench", "--test=q", "out"], vec![Quality]),
+            (vec!["bench", "--test=Q", "out"], vec![Quality]),
+        ] {
+            let args = parse(&argv).unwrap();
+            assert_eq!(args.test, Some(parts), "{argv:?}");
+            assert_eq!(args.input_dir, PathBuf::from("out"));
+        }
+        // Like --agentic, one-letter forms are not run together.
+        assert!(parse(&["bench", "--test=cq", "out"]).is_err());
+        assert!(parse(&["bench", "--test=x", "out"]).is_err());
+        assert!(parse(&["bench", "--test=", "out"]).is_err());
+        // The graded directory is the positional input; there is no output.
+        assert!(parse(&["bench", "--test", "out", "other"]).is_err());
+        assert!(parse(&["bench", "--test"]).is_err());
+        assert!(
+            parse(&["bench", "in"]).is_err(),
+            "OUTPUT_DIR is required without --test"
+        );
     }
 
     #[test]

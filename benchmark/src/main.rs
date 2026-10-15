@@ -6,7 +6,7 @@ mod ir_utils;
 mod logger;
 mod runner;
 mod stats;
-use crate::cli::{Args, TestHarness};
+use crate::cli::{Args, TestHarness, TestPart};
 use crate::error::HarvestResult;
 use crate::harness::{
     cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, validate_binary_output,
@@ -20,6 +20,7 @@ use crate::logger::TeeLogger;
 use crate::stats::{ProgramEvalStats, SummaryStats, TestResult};
 use build_project_spec::{detect_project_kind, ProjectKind};
 use clap::Parser;
+use harvest_benchmark::quality;
 use harvest_core::config::{AgentKind, Stage};
 use harvest_core::stage_manifest::{self, RunRecord, StageManifest};
 use harvest_core::utils::get_version;
@@ -798,11 +799,14 @@ fn main() -> HarvestResult<()> {
     // output directory and no output.log behind.
     args.validate_stages(&args.stages())?;
 
-    let log_root = args
-        .test
-        .as_ref()
-        .or(args.output_dir.as_ref())
-        .expect("clap requires either --test or output_dir");
+    // `--test` grades INPUT_DIR in place, so its log goes there.
+    let log_root = match args.test {
+        Some(_) => &args.input_dir,
+        None => args
+            .output_dir
+            .as_ref()
+            .expect("clap requires OUTPUT_DIR unless --test is used"),
+    };
     ensure_output_directory(log_root)?;
     // Guard the output root before `output.log` is created in it. `--test`
     // re-grades an existing output in place by design, so it is exempt. The
@@ -1038,13 +1042,13 @@ fn test_existing_program(
     result
 }
 
-fn run_test_only(
+/// The snapshots `--test` grades: `test_path` itself, or its snapshot
+/// children, narrowed by `--filter` / `--exclude`.
+fn test_program_dirs(
     test_path: &Path,
-    timeout: u64,
     filter: Option<&str>,
     exclude: Option<&str>,
-    test_harness: TestHarness,
-) -> HarvestResult<Vec<ProgramEvalStats>> {
+) -> HarvestResult<Vec<PathBuf>> {
     validate_input_directory(test_path)?;
     let mut program_dirs = translated_program_dirs(test_path)?;
     if let Some(filter_pattern) = filter {
@@ -1054,10 +1058,7 @@ fn run_test_only(
         apply_regex_filter(&mut program_dirs, exclude_pattern, false, "Exclude")?;
     }
     log_found_programs(&program_dirs, test_path)?;
-    Ok(program_dirs
-        .iter()
-        .map(|program_dir| test_existing_program(program_dir, timeout, test_harness))
-        .collect())
+    Ok(program_dirs)
 }
 
 /// Resolves a program's inputs for a run that starts from a bench test case:
@@ -1166,36 +1167,41 @@ fn run(args: Args) -> HarvestResult<()> {
 
     let stages = args.stages();
 
-    if let Some(test_path) = &args.test {
+    if let Some(parts) = &args.test {
+        let test_path = &args.input_dir;
         log::info!("Test-only mode: {}", test_path.display());
-        let results = run_test_only(
-            test_path,
-            args.timeout,
-            args.filter.as_deref(),
-            args.exclude.as_deref(),
-            args.test_harness,
-        )?;
-        let csv_output_path = test_path.join("results.csv");
-        write_csv_results(&csv_output_path, &results)?;
-        let summary_stats = SummaryStats::from_results(&results);
-        log_summary_stats(&summary_stats);
-        log::info!("\nOutput Files:");
-        log::info!("  Tested translated projects: {}", test_path.display());
-        log::info!("  CSV results: {}", csv_output_path.display());
-        log::info!("  Error logs: results.err files in each translated project directory");
-        log_failing_programs(&results);
+        let program_dirs =
+            test_program_dirs(test_path, args.filter.as_deref(), args.exclude.as_deref())?;
+        if parts.contains(&TestPart::Correctness) {
+            let results: Vec<ProgramEvalStats> = program_dirs
+                .iter()
+                .map(|dir| test_existing_program(dir, args.timeout, args.test_harness))
+                .collect();
+            let csv_output_path = test_path.join("results.csv");
+            write_csv_results(&csv_output_path, &results)?;
+            let summary_stats = SummaryStats::from_results(&results);
+            log_summary_stats(&summary_stats);
+            log::info!("\nOutput Files:");
+            log::info!("  Tested translated projects: {}", test_path.display());
+            log::info!("  CSV results: {}", csv_output_path.display());
+            log::info!("  Error logs: results.err files in each translated project directory");
+            log_failing_programs(&results);
+        }
+        if parts.contains(&TestPart::Quality) {
+            // Grading a single snapshot needs no summary next to its crate.
+            let csv = (!stage_manifest::is_snapshot(test_path))
+                .then(|| test_path.join(quality::SUMMARY_CSV));
+            quality::grade_programs(&program_dirs, csv.as_deref());
+        }
         log::info!("\nTest-only processing complete.");
         return Ok(());
     }
 
-    let input_dir = args
-        .input_dir
-        .as_ref()
-        .expect("clap requires input_dir unless --test is used");
+    let input_dir = &args.input_dir;
     let output_dir = args
         .output_dir
         .as_ref()
-        .expect("clap requires output_dir unless --test is used");
+        .expect("clap requires OUTPUT_DIR unless --test is used");
 
     validate_input_directory(input_dir)?;
     ensure_output_directory(output_dir)?;
@@ -1290,6 +1296,15 @@ fn run(args: Args) -> HarvestResult<()> {
 
     // Print examples with issues
     log_failing_programs(&results);
+
+    // Correctness is graded per program above; code quality follows for
+    // every crate that was produced.
+    let translated: Vec<PathBuf> = results
+        .iter()
+        .filter(|r| r.translation_success)
+        .map(|r| output_dir.join(&r.program_name))
+        .collect();
+    quality::grade_programs(&translated, Some(&output_dir.join(quality::SUMMARY_CSV)));
 
     log::info!(
         "\nProcessing complete! Check the CSV file and individual project directories for detailed results."

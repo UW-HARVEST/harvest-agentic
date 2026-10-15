@@ -26,9 +26,10 @@ impl TeeLogger {
 
 impl Log for TeeLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        // Only log messages from this crate and its modules
+        // Only log messages from this package: the binary (`benchmark`) and
+        // its library (`harvest_benchmark`).
         let target = metadata.target();
-        target.starts_with("benchmark")
+        target.starts_with("benchmark") || target.starts_with("harvest_benchmark")
     }
 
     fn log(&self, record: &Record<'_>) {

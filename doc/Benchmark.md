@@ -82,6 +82,7 @@ The output directory structure of the `OUTPUT_DIR` of `benchmark` is as follows:
 .
 ├── output.log
 ├── results.csv
+├── quality.csv
 ├── 001_helloworld/
 │   ├── Cargo.toml
 │   └── src
@@ -97,6 +98,7 @@ The output directory structure of the `OUTPUT_DIR` of `benchmark` is as follows:
 
 - `output.log`: The raw output log, which includes the model used, the token budget, and fine-grained results (every test's result, including expected vs actual output).  
 - `results.csv`: Summary statistics for the run, like build success rate and test success rate.  
+- `quality.csv`: Code-quality summary, one row per program: unsafe operations (safety) and clippy lints / rustc warnings (idiomaticity). Each program's full report is in its `.harvest/quality.json`, with the unsafe operations listed in `.harvest/unsafe_ops.tsv`. See "Code quality metrics" in the root README.  
 - `Cargo.toml` and `src`: The translated rust code.   
 - `c_src`: The original C source code, exactly copied from the input.  
 - `failed_tests`: Any test cases that failed (copied from the input)  

@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod harness;
+pub mod quality;
 pub mod runner;
 pub mod stats;
 

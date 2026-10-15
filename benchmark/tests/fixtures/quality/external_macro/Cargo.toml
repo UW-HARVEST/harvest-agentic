@@ -1,0 +1,8 @@
+[package]
+name = "external_macro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+external_macro_dep = { path = "../external_macro_dep" }
+[workspace]
