@@ -1602,6 +1602,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn render_prompt_fills_shared_placeholders() {
         let case = CaseDir::new().unwrap();
         let toolchain = RustToolchainContext {
@@ -1935,6 +1936,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn write_opencode_agent_writes_project_config() {
         let case = CaseDir::new().unwrap();
         let dir = case.workspace();
@@ -1967,6 +1969,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn write_opencode_agent_writes_compaction_recovery_plugin() {
         let case = CaseDir::new().unwrap();
         let dir = case.workspace();

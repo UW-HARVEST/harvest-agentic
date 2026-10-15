@@ -245,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn locks_inputs_and_freezes_only_the_crate() {
         let case = CaseDir::new().unwrap();
         fs::create_dir_all(case.c_src().join("src")).unwrap();
@@ -282,6 +283,7 @@ mod tests {
     /// Two stages in a row: the links are in git, so a worktree has them; the next stage
     /// points them at its own case_dir and commits that.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn links_reach_worktrees_across_stages() {
         let first = CaseDir::new().unwrap();
         fs::create_dir_all(first.c_src()).unwrap();
@@ -326,6 +328,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn keeps_the_directory_when_not_finished() {
         let case = CaseDir::new().unwrap();
         fs::write(case.inputs().join("f"), "").unwrap();
@@ -337,6 +340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn layout_has_no_placeholders() {
         let case = CaseDir::new().unwrap();
         let text = case.layout();
