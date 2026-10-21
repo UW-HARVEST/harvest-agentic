@@ -1,0 +1,11 @@
+[package]
+name = "safe_wrapper_rt"
+version = "0.1.0"
+edition = "2024"
+
+# src/ is the module that translations copy (its root file is mod.rs). The tests are in unit/.
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true

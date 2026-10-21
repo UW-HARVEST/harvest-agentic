@@ -160,6 +160,7 @@ pub struct RunOptions {
     pub test_harness: TestHarness,
     pub verify_harness: crate::cli::VerifyHarness,
     pub no_tab2rust: bool,
+    pub safe_wrapper: bool,
     pub no_fuzz: bool,
     pub force: bool,
 }
@@ -616,6 +617,9 @@ fn benchmark_single_program(
         prompt_mode_overrides(&mut effective_overrides, "translate_agentic");
         if opts.no_tab2rust {
             effective_overrides.push("tools.translate_agentic.tab2rust=false".to_owned());
+        }
+        if opts.safe_wrapper {
+            effective_overrides.push("tools.translate_agentic.safe_wrapper=true".to_owned());
         }
     }
     if opts.has(Stage::Verify) {
@@ -1288,6 +1292,7 @@ fn run(args: Args) -> HarvestResult<()> {
         test_harness: args.test_harness,
         verify_harness: args.verify_harness.unwrap_or_default(),
         no_tab2rust: args.no_tab2rust,
+        safe_wrapper: args.safe_wrapper,
         no_fuzz: args.no_fuzz,
         force: args.force,
     };

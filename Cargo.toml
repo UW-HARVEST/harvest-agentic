@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmark", "core", "tools/full_source", "tools/build_project_spec", "tools/load_raw_source", "tools/load_translated_package", "tools/load_test_suite", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm", "tools/quantize_rust_spans", "tools/fix_declarations_llm", "agent_runner", "tools/translate_agentic", "tools/verify_fix_agentic", "tools/conform_agentic"]
+members = ["benchmark", "core", "tools/full_source", "tools/build_project_spec", "tools/load_raw_source", "tools/load_translated_package", "tools/load_test_suite", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm", "tools/quantize_rust_spans", "tools/fix_declarations_llm", "agent_runner", "tools/translate_agentic", "tools/verify_fix_agentic", "tools/conform_agentic", "tools/translate_agentic/safe_wrapper_rt"]
 resolver = "3"
 
 [workspace.dependencies]

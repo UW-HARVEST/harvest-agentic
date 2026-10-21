@@ -146,6 +146,7 @@ harness build would otherwise report every test as a failure.
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
 | `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |
+| `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` or with the Kiro agent |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |

@@ -171,6 +171,14 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub no_tab2rust: bool,
 
+    /// Send a Safe API Wrapper Designer with the scouts of the translate
+    /// stage. It designs the safe Rust boundary of the C library, and the
+    /// translation follows the design. Requires the translate stage. Only the
+    /// plan prompt of Claude and OpenCode sends scouts, so the translate stage
+    /// stops with an error when the flag is given with --no-plan or Kiro.
+    #[arg(long, requires = "agentic")]
+    pub safe_wrapper: bool,
+
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
     /// harness also describes FuzzTest to the agent and ships its
     /// scaffolding; with this flag the agent gets plain GoogleTest only.
@@ -236,11 +244,17 @@ impl Args {
         if self.agentic.is_some() && stages.is_empty() {
             return Err("--agentic requires at least one stage".to_owned());
         }
-        if self.no_tab2rust && !has(Stage::Translate) {
-            return Err(format!(
-                "--no-tab2rust requires the translate stage (got --agentic={})",
-                stages_str()
-            ));
+        let translate_only_flags = [
+            (self.no_tab2rust, "--no-tab2rust"),
+            (self.safe_wrapper, "--safe-wrapper"),
+        ];
+        for (set, flag) in translate_only_flags {
+            if set && !has(Stage::Translate) {
+                return Err(format!(
+                    "{flag} requires the translate stage (got --agentic={})",
+                    stages_str()
+                ));
+            }
         }
         // Every agentic stage checks the resolved config too (an agent set in a config file); this
         // reports a bad combination once, before the run, instead of once per program.
@@ -250,9 +264,14 @@ impl Args {
             self.subagent_model.as_deref(),
         )?;
         // The translate stage checks the resolved config too (an agent set in a config file).
-        if self.no_tab2rust {
-            translate_agentic::check_tab2rust(false, self.no_plan, self.agent.unwrap_or_default())
-                .map_err(|e| format!("--no-tab2rust: {e}"))?;
+        for (set, flag) in translate_only_flags {
+            if set {
+                translate_agentic::check_scout_option(
+                    flag,
+                    self.no_plan,
+                    self.agent.unwrap_or_default(),
+                )?;
+            }
         }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
@@ -326,12 +345,14 @@ mod tests {
     }
 
     #[test]
-    fn no_tab2rust_requires_translate_stage() {
-        let args = parse(&["bench", "--agentic=v", "--no-tab2rust", "in", "out"]).unwrap();
-        let err = args.validate_stages(&args.stages()).unwrap_err();
-        assert!(err.contains("--no-tab2rust"), "{err}");
-        let args = parse(&["bench", "--agentic=t,v", "--no-tab2rust", "in", "out"]).unwrap();
-        args.validate_stages(&args.stages()).unwrap();
+    fn scout_flags_require_translate_stage() {
+        for flag in ["--no-tab2rust", "--safe-wrapper"] {
+            let args = parse(&["bench", "--agentic=v", flag, "in", "out"]).unwrap();
+            let err = args.validate_stages(&args.stages()).unwrap_err();
+            assert!(err.contains(flag), "{err}");
+            let args = parse(&["bench", "--agentic=t,v", flag, "in", "out"]).unwrap();
+            args.validate_stages(&args.stages()).unwrap();
+        }
     }
 
     #[test]
@@ -353,14 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn no_tab2rust_needs_a_prompt_that_uses_tab2rust() {
-        for extra in [&["--no-plan"][..], &["--agent", "kiro"]] {
-            let mut argv = vec!["bench", "--agentic=t", "--no-tab2rust"];
-            argv.extend_from_slice(extra);
-            argv.extend(["in", "out"]);
-            let args = parse(&argv).unwrap();
-            let err = args.validate_stages(&args.stages()).unwrap_err();
-            assert!(err.starts_with("--no-tab2rust"), "{err}");
+    fn scout_flags_need_a_prompt_that_sends_scouts() {
+        for flag in ["--no-tab2rust", "--safe-wrapper"] {
+            for extra in [&["--no-plan"][..], &["--agent", "kiro"]] {
+                let mut argv = vec!["bench", "--agentic=t", flag];
+                argv.extend_from_slice(extra);
+                argv.extend(["in", "out"]);
+                let args = parse(&argv).unwrap();
+                let err = args.validate_stages(&args.stages()).unwrap_err();
+                assert!(err.starts_with(flag), "{err}");
+            }
         }
     }
 

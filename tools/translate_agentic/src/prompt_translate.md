@@ -60,6 +60,8 @@ yourself: your context is for the plan and the build.
 4. Each scout writes `scout/REPORT_<n>.md` and replies with a codebase summary, proposed subtasks,
    and risks.
 
+{SAFE_WRAPPER_DISPATCH}
+
 ### 0.3 Write a persistent plan to `PLAN.md` BEFORE context fills up
 
 When the scouts reply, immediately create a file `PLAN.md` in the current directory (the Rust
@@ -175,6 +177,8 @@ When in doubt, re-read this section.
 {GIT_DISCIPLINE}
 
 {TAB2RUST_INVARIANT}
+
+{SAFE_WRAPPER_INVARIANT}
 
 ## Codebase summary
 - Files: <one line per .c/.h with line count + 1-line role>

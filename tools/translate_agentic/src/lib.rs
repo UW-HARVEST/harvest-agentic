@@ -12,6 +12,7 @@ use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
 use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -31,6 +32,11 @@ const SCOUT: &str = include_str!("scout.md");
 const SCOUT_TAB2RUST: &str = include_str!("scout_tab2rust.md");
 const TAB2RUST_TRANSLATOR: &str = include_str!("tab2rust_translator.md");
 const TAB2RUST_INVARIANT: &str = include_str!("tab2rust_invariant.md");
+const SAFE_WRAPPER_DESIGNER: &str = include_str!("safe_wrapper_designer.md");
+const SAFE_WRAPPER_TRANSLATOR: &str = include_str!("safe_wrapper_translator.md");
+const SAFE_WRAPPER_DISPATCH: &str = include_str!("safe_wrapper_dispatch.md");
+const SAFE_WRAPPER_INVARIANT: &str = include_str!("safe_wrapper_invariant.md");
+static SAFE_WRAPPER_RT: Dir = include_dir!("$CARGO_MANIFEST_DIR/safe_wrapper_rt/src");
 
 pub struct TranslateAgentic;
 
@@ -57,11 +63,16 @@ impl Tool for TranslateAgentic {
             .ok_or("No ProjectSpec representation found in IR")?;
 
         let agent = context.config.agentic_agent;
-        check_tab2rust(config.tab2rust, config.no_plan, agent)?;
+        if !config.tab2rust {
+            check_scout_option("tab2rust = false", config.no_plan, agent)?;
+        }
+        if config.safe_wrapper {
+            check_scout_option("safe_wrapper = true", config.no_plan, agent)?;
+        }
         let translate_prompt = load_prompt(&config, &project_spec.kind, agent);
         let no_plan = config.no_plan;
 
-        // The agent works in case_dir/workspace/. The C source and, with scouts, their task files and
+        // The agent works in case_dir/workspace/. The C source and, with scouts, the task files and
         // the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
         let case = CaseDir::new()?;
         let workspace = case.workspace();
@@ -70,8 +81,9 @@ impl Tool for TranslateAgentic {
 
         let scouts = sends_scouts(config.no_plan, agent);
         let tab2rust = scouts && config.tab2rust;
+        let safe_wrapper = scouts && config.safe_wrapper;
         if scouts {
-            write_scout_files(&case, tab2rust)?;
+            write_scout_files(&case, tab2rust, safe_wrapper)?;
         }
         let reference_guard = case.lock_inputs()?;
 
@@ -85,7 +97,8 @@ impl Tool for TranslateAgentic {
             ""
         };
         let translate_prompt =
-            fill_tab2rust(translate_prompt, tab2rust).replace("{WORKFLOW_HINT}", workflow_hint);
+            fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper)
+                .replace("{WORKFLOW_HINT}", workflow_hint);
 
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Translate,
@@ -166,16 +179,17 @@ fn sends_scouts(no_plan: bool, agent: AgentKind) -> bool {
     agent != AgentKind::Kiro && !no_plan
 }
 
-/// Refuses `tab2rust = false` where it has no effect: only the prompt that sends scouts (the plan
-/// prompt of Claude and OpenCode) uses tab2rust. The translate stage checks the resolved config;
-/// the benchmark checks its command line before the run starts.
-pub fn check_tab2rust(tab2rust: bool, no_plan: bool, agent: AgentKind) -> Result<(), String> {
-    if tab2rust || sends_scouts(no_plan, agent) {
+/// Refuses an option of the scout wave (`tab2rust = false`, `safe_wrapper = true`) where it has
+/// no effect: only the prompt that sends scouts (the plan prompt of Claude and OpenCode) uses
+/// tab2rust and the Safe API Wrapper Designer. The translate stage checks the resolved config; the
+/// benchmark checks its command line before the run starts.
+pub fn check_scout_option(option: &str, no_plan: bool, agent: AgentKind) -> Result<(), String> {
+    if sends_scouts(no_plan, agent) {
         return Ok(());
     }
     Err(format!(
-        "tab2rust = false has no effect with agent {agent}{}: only the plan prompt of \
-         Claude and OpenCode uses tab2rust",
+        "{option} has no effect with agent {agent}{}: only the plan prompt of Claude and \
+         OpenCode sends scouts",
         if no_plan { " and no_plan" } else { "" }
     ))
 }
@@ -195,16 +209,44 @@ fn fill_tab2rust(prompt: &str, tab2rust: bool) -> String {
     prompt.replace("{TAB2RUST_INVARIANT}", invariant)
 }
 
-/// Writes the scout inputs into `inputs/`: `prompts/SCOUT.md` and, with tab2rust, the skill
-/// (`agent_skills/tab2rust/`) and `prompts/TRANSLATOR.md`. The scouts write their reports in
-/// `workspace/scout/`, which is created here.
-fn write_scout_files(case: &CaseDir, tab2rust: bool) -> io::Result<()> {
+/// Fills the safe-wrapper placeholders of a prompt: the designer in the scout wave and the design
+/// rule, or nothing.
+fn fill_safe_wrapper(prompt: &str, safe_wrapper: bool) -> String {
+    let (dispatch, invariant) = if safe_wrapper {
+        (SAFE_WRAPPER_DISPATCH, SAFE_WRAPPER_INVARIANT)
+    } else {
+        ("", "")
+    };
+    prompt
+        .replace("{SAFE_WRAPPER_DISPATCH}", dispatch)
+        .replace("{SAFE_WRAPPER_INVARIANT}", invariant)
+}
+
+/// Writes the scout inputs into `inputs/`: `prompts/SCOUT.md`; with tab2rust, the skill
+/// (`agent_skills/tab2rust/`) and `prompts/TRANSLATOR.md`; with safe_wrapper,
+/// `prompts/SAFE_WRAPPER_DESIGNER.md`, `prompts/SAFE_WRAPPER_TRANSLATOR.md` and the framework items
+/// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses. The scouts
+/// and the designer write their reports in `workspace/scout/`, which is created here.
+fn write_scout_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::Result<()> {
     let prompts = case.inputs().join("prompts");
     fs::create_dir_all(&prompts)?;
     fs::write(prompts.join("SCOUT.md"), render_scout(tab2rust))?;
     if tab2rust {
         skills::materialize("tab2rust", &case.inputs().join("agent_skills/tab2rust"))?;
         fs::write(prompts.join("TRANSLATOR.md"), TAB2RUST_TRANSLATOR)?;
+    }
+    if safe_wrapper {
+        let rt = case.inputs().join("safe_wrapper_rt");
+        fs::create_dir_all(&rt)?;
+        SAFE_WRAPPER_RT.extract(&rt)?;
+        fs::write(
+            prompts.join("SAFE_WRAPPER_DESIGNER.md"),
+            SAFE_WRAPPER_DESIGNER,
+        )?;
+        fs::write(
+            prompts.join("SAFE_WRAPPER_TRANSLATOR.md"),
+            SAFE_WRAPPER_TRANSLATOR,
+        )?;
     }
     fs::create_dir_all(case.workspace().join("scout"))
 }
@@ -246,6 +288,13 @@ pub struct Config {
     /// prompts that send scouts use it.
     #[serde(default = "default_tab2rust")]
     pub tab2rust: bool,
+
+    /// Send a Safe API Wrapper Designer with the scouts: it designs the safe Rust boundary of the C
+    /// library (wrapper types, API wrappers, an internal module under `forbid(unsafe_code)`), and
+    /// the translation sub-agents follow the design. Off by default; the benchmark flag
+    /// `--safe-wrapper` turns it on. Only the prompts that send scouts use it.
+    #[serde(default)]
+    pub safe_wrapper: bool,
 
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
