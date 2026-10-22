@@ -131,7 +131,7 @@ its standalone runner. Clone it into this repository's root as
 `./harvest-bench`; the examples below assume that location.
 
 Note on toolchains: the agents and the harness must build with the same
-pinned Rust version (`rust-toolchain.toml`, currently 1.94.1). This is
+pinned Rust version (`rust-toolchain.toml`, currently 1.99.0). This is
 checked at startup and the run fails fast on a mismatch, because a mismatched
 harness build would otherwise report every test as a failure.
 

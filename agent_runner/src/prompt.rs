@@ -111,7 +111,7 @@ mod tests {
     fn render_prompt_fills_shared_placeholders() {
         let case = CaseDir::new().unwrap();
         let toolchain = RustToolchainContext {
-            required_version: "1.94.1".to_owned(),
+            required_version: "1.99.0".to_owned(),
             prompt_block: "TOOLCHAIN".to_owned(),
             test_corpus_root: None,
         };

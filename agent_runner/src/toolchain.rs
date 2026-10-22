@@ -18,13 +18,15 @@ pub struct RustToolchainContext {
 
 /// Detects the Rust toolchain contract for a run.
 ///
-/// The version comes from the Test-Corpus / cando2 checkout, found by walking
-/// up from `input_path`. That walk only works while the C source still sits
-/// inside the corpus, which stops being true once a run resumes from a
-/// self-contained snapshot (whose C source lives under the snapshot's own
-/// `.harvest/c_src/`). So the corpus root is detected once, on the run that
-/// starts from the bench directory, recorded in the stage manifest, and passed
-/// back in as `test_corpus_root` by later runs. The resolved root is reported
+/// The version is the channel pinned in HARVEST's own `rust-toolchain.toml`.
+/// The Test-Corpus / cando2 checkout, found by walking up from `input_path`,
+/// only sets a minimum: its pins name the oldest rustc that builds the cando2
+/// runner, so a newer HARVEST pin satisfies them. That walk only works while
+/// the C source still sits inside the corpus, which stops being true once a
+/// run resumes from a self-contained snapshot (whose C source lives under the
+/// snapshot's own `.harvest/c_src/`). So the corpus root is detected once, on
+/// the run that starts from the bench directory, recorded in the stage
+/// manifest, and passed back in as `test_corpus_root` by later runs. The resolved root is reported
 /// in [`RustToolchainContext::test_corpus_root`] for the caller to persist.
 pub fn detect_rust_toolchain_context(
     input_path: &Path,
@@ -53,23 +55,17 @@ pub fn detect_rust_toolchain_context(
         .as_ref()
         .and_then(|path| read_cargo_rust_version(path));
 
-    let required_version = cando2_rust_version
-        .clone()
+    let required_version = root_toolchain
         .or_else(|| test_corpus_toolchain.clone())
-        .or_else(|| root_toolchain.clone())
+        .or_else(|| cando2_rust_version.clone())
         .ok_or("Unable to determine required Rust toolchain version from rust-toolchain.toml or cando2 Cargo.toml")?;
 
-    check_version_match(
-        "HARVEST rust-toolchain.toml",
-        root_toolchain.as_deref(),
-        &required_version,
-    )?;
-    check_version_match(
+    check_minimum_version(
         "Test-Corpus rust-toolchain.toml",
         test_corpus_toolchain.as_deref(),
         &required_version,
     )?;
-    check_version_match(
+    check_minimum_version(
         "cando2 rust-version",
         cando2_rust_version.as_deref(),
         &required_version,
@@ -85,7 +81,7 @@ pub fn detect_rust_toolchain_context(
     })?;
     if active_rustc != required_version {
         return Err(format!(
-            "Rust toolchain mismatch: required {required_version} from Test-Corpus/cando2 contract, but active rustc is {active_rustc} (`{}`)",
+            "Rust toolchain mismatch: required {required_version} from rust-toolchain.toml, but active rustc is {active_rustc} (`{}`)",
             rustc_version.trim()
         )
         .into());
@@ -155,22 +151,53 @@ fn read_quoted_value(path: &Path, key: &str) -> Option<String> {
     None
 }
 
-fn check_version_match(
+/// Fails when `required` is older than the corpus minimum `found`. A channel
+/// that is not a release number (`stable`, `nightly-...`) cannot be ordered,
+/// so it must match exactly.
+fn check_minimum_version(
     label: &str,
     found: Option<&str>,
     required: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(found) = found
-        && found != required
-    {
+    let Some(found) = found else {
+        return Ok(());
+    };
+    let satisfied = match (parse_release(required), parse_release(found)) {
+        (Some(required), Some(found)) => required >= found,
+        _ => required == found,
+    };
+    if !satisfied {
         return Err(format!(
-            "Rust toolchain contract mismatch: {label} is {found}, required version is {required}"
+            "Rust toolchain contract mismatch: {label} requires at least {found}, but the pinned version is {required}"
         )
         .into());
     }
     Ok(())
 }
 
+/// Parses a release number such as `1.99.0` or `1.95` into an ordered tuple.
+fn parse_release(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    let major = parts.next()??;
+    let minor = parts.next()??;
+    let patch = parts.next().unwrap_or(Some(0))?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
 fn parse_rustc_semver(version: &str) -> Option<String> {
     version.split_whitespace().nth(1).map(|v| v.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_pins_are_minimums() {
+        assert!(check_minimum_version("cando2", Some("1.94.1"), "1.99.0").is_ok());
+        assert!(check_minimum_version("cando2", Some("1.94.1"), "1.94.1").is_ok());
+        assert!(check_minimum_version("cando2", Some("1.95"), "1.94.1").is_err());
+        assert!(check_minimum_version("cando2", None, "1.99.0").is_ok());
+        assert!(check_minimum_version("cando2", Some("1.94.1"), "nightly").is_err());
+    }
 }

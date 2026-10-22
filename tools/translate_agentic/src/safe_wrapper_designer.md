@@ -1141,7 +1141,7 @@ main agent decides how to handle them. Exported functions and callback types kee
 
 ### 7.4 Variadic functions
 
-Only mark them. The main agent decides. Stable Rust cannot define a C variadic function.
+Only mark them. The main agent decides.
 
 ## 8. Type-level handling
 

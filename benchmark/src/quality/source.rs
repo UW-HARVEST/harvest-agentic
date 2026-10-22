@@ -212,7 +212,7 @@ fn is_export_attr(attr: &syn::Attribute) -> bool {
 /// Unsafe operations the compiler wraps in its own unsafe blocks. DARPA's
 /// patched rustc counts them, but they never appear in the source, so the
 /// strip-and-recompile method cannot see them; they are counted here from
-/// the constructs that generate them (rustc 1.94):
+/// the constructs that generate them (rustc 1.94 and 1.99):
 ///
 /// * `format_args!` with arguments, written in the crate (directly or in a
 ///   crate-local macro): one call to the unsafe `fmt::Arguments::new`. The

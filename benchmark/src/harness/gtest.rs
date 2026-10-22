@@ -222,32 +222,30 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
             invocation,
             outcome,
             ..
-        } => {
-            if invocation.mode == InvocationMode::Suite {
-                for line in noteworthy.drain(..) {
-                    emit(line);
-                }
-                if outcome.passed > 0 && outcome.passed < outcome.total {
-                    emit(format!(
-                        "  \u{2705} {} other test(s) passed",
-                        outcome.passed
-                    ));
-                }
-                // Historically "passed" here included skips (they count as
-                // non-failures for the batch verdict line).
-                let passed = outcome.passed + outcome.skipped;
+        } if invocation.mode == InvocationMode::Suite => {
+            for line in noteworthy.drain(..) {
+                emit(line);
+            }
+            if outcome.passed > 0 && outcome.passed < outcome.total {
                 emit(format!(
-                    "{} Batch '{}': {}/{} passed",
-                    if passed == outcome.total {
-                        "\u{2705}"
-                    } else {
-                        "\u{274c}"
-                    },
-                    invocation.filter,
-                    passed,
-                    outcome.total
+                    "  \u{2705} {} other test(s) passed",
+                    outcome.passed
                 ));
             }
+            // Historically "passed" here included skips (they count as
+            // non-failures for the batch verdict line).
+            let passed = outcome.passed + outcome.skipped;
+            emit(format!(
+                "{} Batch '{}': {}/{} passed",
+                if passed == outcome.total {
+                    "\u{2705}"
+                } else {
+                    "\u{274c}"
+                },
+                invocation.filter,
+                passed,
+                outcome.total
+            ));
         }
         _ => {}
     }
