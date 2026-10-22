@@ -14,7 +14,8 @@ pub struct Oom;
 /// The allocator of the C library. The containers of this module allocate only through it, so the
 /// number and the order of the allocations are the same as in C.
 ///
-/// Hooks with only malloc and free (no realloc) keep the default `realloc`: malloc, copy, free.
+/// Hooks with only malloc and free keep the default `calloc` (malloc, zero) and `realloc` (malloc,
+/// copy, free).
 ///
 /// # Safety
 /// `malloc` returns null or a block of at least `n` bytes. `free` and `realloc` accept each block
@@ -23,6 +24,16 @@ pub struct Oom;
 /// alignment of each block.
 pub unsafe trait LibAlloc {
     fn malloc(&self, n: usize) -> *mut u8;
+
+    /// A block of `n` bytes set to zero, or null.
+    fn calloc(&self, n: usize) -> *mut u8 {
+        let p = self.malloc(n);
+        if !p.is_null() {
+            // SAFETY: p is a new block of n bytes.
+            unsafe { p.write_bytes(0, n) };
+        }
+        p
+    }
 
     /// # Safety
     /// `p` is null or a live block of this allocator. After the call, `p` is not used.
@@ -47,13 +58,15 @@ pub unsafe trait LibAlloc {
 unsafe extern "C" {
     #[link_name = "malloc"]
     fn c_malloc(n: usize) -> *mut c_void;
+    #[link_name = "calloc"]
+    fn c_calloc(n: usize, size: usize) -> *mut c_void;
     #[link_name = "free"]
     fn c_free(p: *mut c_void);
     #[link_name = "realloc"]
     fn c_realloc(p: *mut c_void, n: usize) -> *mut c_void;
 }
 
-/// The C malloc, free and realloc.
+/// The C malloc, calloc, free and realloc.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Malloc;
 
@@ -62,6 +75,11 @@ unsafe impl LibAlloc for Malloc {
     fn malloc(&self, n: usize) -> *mut u8 {
         // SAFETY: malloc accepts any size.
         unsafe { c_malloc(n).cast() }
+    }
+
+    fn calloc(&self, n: usize) -> *mut u8 {
+        // SAFETY: calloc accepts any size.
+        unsafe { c_calloc(n, 1).cast() }
     }
 
     unsafe fn free(&self, p: *mut u8) {

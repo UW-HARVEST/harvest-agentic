@@ -29,6 +29,16 @@ impl<T, A: LibAlloc> CBox<T, A> {
         Ok(CBox { ptr, alloc })
     }
 
+    /// Allocates the object with one `calloc`, as C does for a context that starts as zero bytes.
+    ///
+    /// # Safety
+    /// All-zero bytes are a valid `T`.
+    pub unsafe fn try_zeroed_in(alloc: A) -> Result<Self, Oom> {
+        let size = size_of::<T>();
+        let ptr = checked_block::<T, A>(&alloc, alloc.calloc(size), size)?;
+        Ok(CBox { ptr, alloc })
+    }
+
     /// Gives the object to C. The allocator value is dropped. `from_raw_in` needs it again.
     pub fn into_raw(self) -> *mut T {
         let me = ManuallyDrop::new(self);

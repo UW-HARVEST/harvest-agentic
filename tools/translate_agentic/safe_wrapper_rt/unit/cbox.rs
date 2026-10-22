@@ -13,3 +13,21 @@ fn handle_round_trip() {
     drop(b);
     assert_eq!((c.mallocs.get(), c.frees.get()), (1, 1));
 }
+
+#[test]
+fn zeroed_context() {
+    #[derive(Debug, PartialEq)]
+    struct Ctx {
+        n: u32,
+        p: *const u8,
+    }
+    // SAFETY: zero bytes are a valid Ctx (0 and a null pointer).
+    let b = unsafe { CBox::<Ctx>::try_zeroed_in(Malloc) }.unwrap();
+    assert_eq!(
+        *b,
+        Ctx {
+            n: 0,
+            p: std::ptr::null()
+        }
+    );
+}

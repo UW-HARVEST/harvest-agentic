@@ -26,8 +26,6 @@ Rules:
 - The framework items of sections 3.1 and 4 are in `inputs/safe_wrapper_rt/`. Its `mod.rs` lists
   them. Use them, and do not design them again. Copy into the skeleton, as `wrap/rt/`, only the
   files that your design uses. In the copies, only delete items that the design does not use.
-- This run has no error transport (7.3) and no human decision (7.4). Only mark these items. The main
-  agent decides.
 
 ## 0. Role and deliverables
 
@@ -40,8 +38,8 @@ translation starts, you design the external boundary of a C library. You deliver
 
 The translation sub-agents translate function by function to your design. If your design is wrong,
 everything after it is wrong. You see only the headers and the library source. You do not see the
-callers or the tests. Thus, support each use that the C interface does not forbid. Prefer the
-conservative design.
+callers or the tests. Thus, support each use that the C code handles (P2). Prefer the conservative
+design.
 
 ## 1. Structure and principles
 
@@ -60,9 +58,11 @@ Five principles:
 - **P1 By default, the data model does not change.** The internal code keeps the C data structures
   (in their wrapped form). It keeps the C structure and control flow, and only changes the access
   to method calls. When you must deviate, use only the ways of section 9, and record each deviation.
-- **P2 For valid input, the visible behavior of C does not change.** This includes the return
+- **P2 C is the only truth: the visible behavior of C does not change.** This includes the return
   values, the written bytes, the number and the order of allocations, and the time when an error
-  occurs.
+  occurs. Do what C does also when you think that an input is undefined behavior in C. Undefined
+  behavior is never a reason to refuse an input or to change a behavior, and your judgment can be
+  wrong. If the C behavior prevents a perfect safe wrapper, keep the C behavior.
 - **P3 unsafe occurs only at the boundary.** For each unsafe, you must be able to give its basis:
   the C interface contract, or an invariant that the wrapper layer keeps.
 - **P4 Check once, then access the mapped memory many times.** Do the run-time checks at the time
@@ -90,7 +90,7 @@ Five principles:
 | Container | What holds this memory on the Rust side. There are 7 kinds, see section 5 |
 | View | How the code accesses the bytes after the mapping. There are 4 kinds, and they can combine, see section 6 |
 | Trusted method | A method of the wrapper layer whose body contains unsafe. You must record it, with the basis of its soundness |
-| Trusted field | A field whose value sets the range that a trusted method maps. Audit the internal functions that write these fields together with the trusted method |
+| Trusted field | A field whose value sets the range that a trusted method maps. It is private to the wrapper layer. The internal code only reads it. Only a wrapper method that also changes the mapped memory (for example, a reallocation) changes it |
 | Token | An address value that the code can store, compare and give back, but cannot dereference |
 | Library allocator | malloc, or the allocation hooks that the user registers. The library facts of section 3.1 decide which one |
 | Sound | However safe code calls these methods, no memory error occurs. The worst result is a panic |
@@ -105,14 +105,14 @@ function, the pointer level once for each pointer, and the type level once for e
 | Fact | Effect |
 |---|---|
 | Can the user register allocation hooks? | If yes, each visible allocation in the library goes through the library allocator, and it must be able to fail |
-| Non-local jumps: does the library use setjmp, or can a callback longjmp? | If yes, mark it. The framework handles it (7.3) |
-| Variadic interfaces | List each one. They go to a human decision (7.4) |
+| Non-local jumps: does the library call setjmp, or does its documentation say that a callback can longjmp? | If yes, mark it (7.3) |
+| Variadic interfaces | List each one (7.4) |
 | Operations that C promises to be thread-safe | Do not implement these operations with `Cell` or `Rc` (S11) |
 | Exported mutable global objects, errno | Use the framework items, for example `CShared<T>` and `set_errno` |
 
 ### 3.2 Function-level prefilter
 
-1. A variadic function: put it on the list for human decision. Do not design it further.
+1. A variadic function: mark it (7.4). Do not design it further.
 2. The parameters are only scalars and by-value structures without pointer fields: do only the
    scalar conversion (7.1). Stop here.
 3. A function with callbacks: list the objects that a callback can reach, and apply 7.2.
@@ -377,8 +377,8 @@ pub unsafe extern "C" fn digest_init(st: *mut DigestState) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn digest_update(st: *mut DigestState, input: *const u8, n: usize) {
     // SAFETY: by the C contract, st is initialized, input has n bytes, and the two do not overlap.
-    // A NULL argument (for input: with n > 0) is undefined behavior in C. Here, check first, then
-    // panic (and thus abort). Do not make a null reference.
+    // C crashes on a NULL argument (for input: with n > 0). Here, check first, then panic (and thus
+    // abort), which gives the same visible result. Do not make a null reference.
     let st = unsafe { st.as_mut() }.expect("NULL st");
     let input = unsafe { in_slice(input, n) }.ok().expect("NULL input");
     internal::digest_update(st, input);
@@ -486,7 +486,8 @@ for each block.
 **Example: refer to a dictionary.**
 
 ```c
-/* During each later ctx_compress, dict must stay valid and unchanged, and must not overlap dst.
+/* During each later ctx_compress, dict must stay valid and unchanged, and should not overlap dst
+ * (C does not check this).
  * A NULL dict removes the reference. */
 int ctx_ref_dict(ctx_t *c, const void *dict, size_t n);
 int ctx_compress(ctx_t *c, const void *src, size_t src_n, void *dst, size_t cap);
@@ -526,10 +527,8 @@ impl CtxHandle {
 
 // API wrapper: ctx_compress (the parameter checks are not shown)
 let h = unsafe { &mut *c };
-let dst_range = dst as usize..dst as usize + cap;
-if h.dict_range().is_some_and(|r| r.start < dst_range.end && dst_range.start < r.end) {
-    return ERR_OVERLAP;   // undefined behavior in C, so the code can refuse it (S1)
-}
+// dict can overlap dst. C does not check this, so do not refuse it: when h.dict_range() intersects
+// dst, map the two as one region (5.3, S1)
 // SAFETY: the C contract of ctx_ref_dict
 let dict = unsafe { h.dict() };
 // in-call mapping. An overlap with dict is permitted, because both are read-only
@@ -1090,7 +1089,7 @@ r.code()
 If C also reads back the bytes that it wrote, and the length is not trusted, write into a private
 buffer first. At the exit, copy out only the written part. The private buffer can only be a
 fixed-length buffer on the stack, and only when C has a known upper limit for the output length. If
-a heap allocation is necessary, the case goes to a human decision (S5).
+a heap allocation is necessary, mark the case for the main agent (S5).
 
 ## 7. Common rules and marks
 
@@ -1137,14 +1136,12 @@ pub unsafe extern "C" fn codec_set_mode(c: *mut Codec, mode: c_int) -> c_int {
 
 ### 7.3 Non-local jumps
 
-Only mark them. The error transport of the framework handles them. The design document gives three
-things: the callbacks that can longjmp, the places where the library uses setjmp, and the external
-precondition that the C caller has unwind tables. All exported functions and callback types use
-`extern "C-unwind"`.
+Only mark them: the callbacks that can longjmp, and the places where the library calls setjmp. The
+main agent decides how to handle them. Exported functions and callback types keep `extern "C"`.
 
 ### 7.4 Variadic functions
 
-Only mark them. They go to a human decision. Stable Rust cannot define a C variadic function.
+Only mark them. The main agent decides. Stable Rust cannot define a C variadic function.
 
 ## 8. Type-level handling
 
@@ -1245,7 +1242,6 @@ Only these deviations are permitted. Record each one.
   with allocation hooks.
 
 **Control flow:**
-- Change non-local jumps to unwinding plus closures (7.3).
 - A C destructor function becomes a destructor in the wrapper layer.
 - Where C calls back during a walk, use a cursor that gets the next item again, or collect tokens
   first (7.2).
@@ -1279,7 +1275,7 @@ Trusted fields: ...
 Recorded deviations: ...
 
 ## Summary
-The list of recorded deviations, the list of trusted fields, the items for human decision, the scenarios that need Miri tests
+The list of recorded deviations, the list of trusted fields, the marked items, the scenarios that need Miri tests
 ````
 
 For a function with only scalar parameters, write one line: `func_name: scalars only, check order ...`.
@@ -1295,9 +1291,8 @@ Each case causes undefined behavior, or behavior that is different from C.
 
 - **S1** Keep a caller address that is saved across calls only in the boundary part of the handle.
   Do not keep a reference. The internal code cannot touch it. Before you map it again, compare the
-  addresses with the writable parameters of this call to find an overlap. If C defines the
-  behavior for the overlap, exclude the overlap as C does. If the overlap is undefined behavior in
-  C, you can refuse it.
+  addresses with the writable parameters of this call to find an overlap. Handle an overlap as C
+  does, for example as one region (5.3). Never refuse it (P2).
 - **S2** Do not merge into one slice two ranges that touch end to start but do not intersect, unless
   you can prove that they are in the same allocation.
 - **S3** A setter that receives data of the same kind first copies the received data, then frees
@@ -1350,7 +1345,8 @@ Each case causes undefined behavior, or behavior that is different from C.
 - `scout/safe_wrapper/skeleton/`: the code skeleton of section 0, as files of `src/`. `api/<C file>.rs`
   and `internal/<C file>.rs` hold the functions that `<C file>.c` defines. `wrap/` holds the wrapper
   types. `internal/` holds only the types that `api` and `wrap` name, and the internal function
-  signatures with `todo!()` bodies. `internal/mod.rs` starts with `#![forbid(unsafe_code)]`.
+  signatures with `todo!()` bodies. `internal/mod.rs` starts with `#![forbid(unsafe_code)]`. Do not
+  turn off lints for the crate.
 
 To check the skeleton, make a library crate in `scratch/` with an empty `[workspace]` table. Copy the
 skeleton into its `src/`. Run `cargo check`, and fix the errors. Warnings are permitted.
