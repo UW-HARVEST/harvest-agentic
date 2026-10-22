@@ -29,6 +29,7 @@ pub(crate) fn invoke_claude(
         args.extend(["--model", model]);
     }
     args.extend(["--allowed-tools", "Bash(*)", "Write", "Edit"]);
+    args.extend(["--disallowed-tools", "WebFetch", "WebSearch"]);
     args.push("--dangerously-skip-permissions");
     if invocation.plan_files_enabled() {
         args.extend(["--append-system-prompt", &hint]);

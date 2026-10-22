@@ -45,13 +45,15 @@ hold both plain `TEST`s and `FUZZ_TEST`s:
 #include "gtest/gtest.h"
 
 // Differential property: C and Rust must agree on every generated input.
-void CompressEquivalent(int level, const std::vector<uint8_t>& input) {
-  EXPECT_EQ(RunC(level, input), RunRust(level, input));
+// kModeMin, kModeMax and kMaxInputSize are placeholders, not real values.
+// Take the bounds of `mode` from the C source of the API under test.
+void ProcessEquivalent(int mode, const std::vector<uint8_t>& input) {
+  EXPECT_EQ(RunC(mode, input), RunRust(mode, input));
 }
-FUZZ_TEST(CompressDifferential, CompressEquivalent)
-    .WithDomains(fuzztest::InRange(1, 12),
+FUZZ_TEST(ApiDifferential, ProcessEquivalent)
+    .WithDomains(fuzztest::InRange(kModeMin, kModeMax),
                  fuzztest::VectorOf(fuzztest::Arbitrary<uint8_t>())
-                     .WithMaxSize(64 * 1024));
+                     .WithMaxSize(kMaxInputSize));
 ```
 
 Choosing domains — describe *what inputs are legal*, do not filter after the fact:
@@ -63,7 +65,8 @@ Choosing domains — describe *what inputs are legal*, do not filter after the f
   so a single input does not get too slow.
 - Strings: `fuzztest::Arbitrary<std::string>()`, `fuzztest::Utf8String()`, or
   `fuzztest::InRegexp("...")` for simple formats.
-- Dependent parameters (e.g. level range depends on algorithm): wrap them in a
+- Dependent parameters (the legal range of one parameter depends on the value
+  of another): wrap them in a
   struct and build it with `fuzztest::StructOf` / `fuzztest::FlatMap`.
 - Avoid `fuzztest::Filter` over a low-acceptance predicate — most inputs get
   discarded and the campaign wastes its budget. Generate structured values directly.
@@ -92,7 +95,7 @@ Two build modes (use separate build directories — do not toggle the flag in pl
 
   ```
   RUST_LIB_PATH=<abs path to the Rust .so> \
-    ./verify_env/run_fuzz.sh CompressDifferential.CompressEquivalent
+    ./verify_env/run_fuzz.sh ApiDifferential.ProcessEquivalent
   ```
 
   Run this from the project directory. `verify_env/README.md` describes budgets,

@@ -41,7 +41,7 @@ it into every sub-agent prompt that runs tests:
 ```
 
 The C reference and the Rust translation both export the same public symbol
-names (e.g. `LZ4_compress_default`). That is why the C side is linked statically
+names. That is why the C side is linked statically
 and the Rust side is reached only through `dlopen`/`dlsym` — never link the Rust
 `.so` directly into the test binary.
 
@@ -51,8 +51,9 @@ Write fixed-input differential tests with GoogleTest:
 #include "gtest/gtest.h"
 
 // A fixed-input differential test: one specific case.
-TEST(CompressDifferential, EmptyInput) {
-  EXPECT_EQ(RunC(/*level=*/9, {}), RunRust(/*level=*/9, {}));
+// kSomeMode is a placeholder for a mode value from the C source.
+TEST(ApiDifferential, EmptyInput) {
+  EXPECT_EQ(RunC(kSomeMode, {}), RunRust(kSomeMode, {}));
 }
 ```
 

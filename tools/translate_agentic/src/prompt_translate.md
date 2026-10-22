@@ -206,7 +206,7 @@ Each subtask must satisfy TWO constraints:
 
 Subtask boundaries do NOT need to align with file boundaries. A large C file
 can be split into multiple subtasks by function group (e.g. "translate
-LZ4_compress_default and its callees" vs "translate LZ4_compress_HC and its
+`api_encode` and its callees" vs "translate `api_decode` and its
 callees"), as long as each subtask has well-defined inputs and outputs.
 
 To choose the function groups, use the **call groups** in the scout reports: sets of functions
