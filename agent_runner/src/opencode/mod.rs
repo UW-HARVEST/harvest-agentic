@@ -86,7 +86,8 @@ pub(crate) fn invoke_opencode(
         log_path,
         invocation.timeout_secs,
         "opencode",
-        &opencode_run_args(invocation, None, invocation.prompt),
+        &opencode_run_args(invocation, None),
+        Some(invocation.prompt),
         &env,
     )?;
 
@@ -186,7 +187,8 @@ pub(crate) fn invoke_opencode(
                     log_path,
                     remaining_secs,
                     "opencode",
-                    &opencode_run_args(invocation, Some(&session_id), OPENCODE_RESUME_PROMPT),
+                    &opencode_run_args(invocation, Some(&session_id)),
+                    Some(OPENCODE_RESUME_PROMPT),
                     &env,
                 )?;
             }
@@ -209,7 +211,6 @@ Then continue the work from the first unfinished step.";
 fn opencode_run_args<'a>(
     invocation: &AgentInvocation<'a>,
     session_id: Option<&'a str>,
-    prompt: &'a str,
 ) -> Vec<&'a str> {
     let mut args = vec!["run", "--format", "json", "--thinking"];
     args.extend([
@@ -223,7 +224,6 @@ fn opencode_run_args<'a>(
     if let Some(model) = invocation.model {
         args.extend(["--model", model]);
     }
-    args.push(prompt);
     args
 }
 

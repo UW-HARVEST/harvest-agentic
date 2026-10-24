@@ -37,7 +37,7 @@ pub(crate) fn invoke_claude(
     } else {
         ("claude", Vec::new())
     };
-    args.extend(["-p", invocation.prompt]);
+    args.push("-p");
     if let Some(model) = invocation.model {
         args.extend(["--model", model]);
     }
@@ -95,6 +95,7 @@ pub(crate) fn invoke_claude(
         invocation.timeout_secs,
         program,
         &args,
+        Some(invocation.prompt),
         &env,
     )
 }

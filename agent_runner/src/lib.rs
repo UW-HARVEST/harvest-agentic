@@ -229,14 +229,16 @@ struct BackendEnv {
 }
 
 /// Runs `program args` in the work dir under `timeout`, so the stage deadline
-/// ends it with exit code 124. Its output is copied, as it comes, to the
-/// per-agent log, the shared output log (if any) and our stdout.
+/// ends it with exit code 124. `prompt`, if given, is its stdin. Its output is
+/// copied, as it comes, to the per-agent log, the shared output log (if any)
+/// and our stdout.
 fn run_agent(
     invocation: &AgentInvocation<'_>,
     log_path: &Path,
     timeout_secs: u64,
     program: &str,
     args: &[&str],
+    prompt: Option<&str>,
     env: &BackendEnv,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
@@ -287,8 +289,19 @@ fn run_agent(
         }
     }
     sinks.push(("stdout".into(), Box::new(std::io::stdout())));
+    // The prompt goes on stdin, not on the command line: there, an agent's
+    // `pgrep -f`/`pkill -f` for a word of its task matches `timeout` and the
+    // CLI, and the agent kills its own run.
+    let stdin = match prompt {
+        Some(prompt) => {
+            let path = log_path.with_extension("prompt");
+            fs::write(&path, prompt)?;
+            Stdio::from(fs::File::open(&path)?)
+        }
+        None => Stdio::null(),
+    };
     end_with_parent(&mut cmd);
-    Ok(run_teed(cmd, sinks)?)
+    Ok(run_teed(cmd, stdin, sinks)?)
 }
 
 /// Makes the kernel send `timeout` SIGTERM when the thread that spawns it
@@ -320,17 +333,16 @@ fn end_with_parent(cmd: &mut Command) {
     }
 }
 
-/// Runs `cmd` with stdin closed and stdout and stderr merged into one pipe,
+/// Runs `cmd` with `stdin` and with stdout and stderr merged into one pipe,
 /// writing everything it prints to every sink as it arrives. Returns the
 /// command's own exit status.
 fn run_teed(
     mut cmd: Command,
+    stdin: Stdio,
     mut sinks: Vec<(String, Box<dyn Write>)>,
 ) -> std::io::Result<ExitStatus> {
     let (mut reader, writer) = std::io::pipe()?;
-    cmd.stdin(Stdio::null())
-        .stdout(writer.try_clone()?)
-        .stderr(writer);
+    cmd.stdin(stdin).stdout(writer.try_clone()?).stderr(writer);
     let mut child = cmd.spawn()?;
     // `cmd` holds our copies of the pipe's write end; the read below only
     // sees EOF once they are closed.
@@ -558,7 +570,7 @@ mod tests {
             ("broken".into(), Box::new(BrokenSink) as Box<dyn Write>),
             file_sink(&output_log),
         ];
-        let status = run_teed(cmd, sinks).expect("run");
+        let status = run_teed(cmd, Stdio::null(), sinks).expect("run");
         assert_eq!(status.code(), Some(3));
         assert_eq!(fs::read_to_string(&log).unwrap(), "first\nsecond\n");
         assert_eq!(fs::read_to_string(&output_log).unwrap(), "first\nsecond\n");

@@ -27,6 +27,7 @@ pub(crate) fn invoke_kiro(
             "--trust-all-tools",
             invocation.prompt,
         ],
+        None,
         &BackendEnv::default(),
     )
 }
