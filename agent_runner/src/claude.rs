@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitStatus;
 use tracing::info;
 
-use crate::{AgentInvocation, AgentPhase, BackendEnv, run_agent};
+use crate::{AgentInvocation, AgentPhase, BackendEnv, agent_env, run_agent};
 
 pub(crate) fn invoke_claude(
     invocation: &AgentInvocation<'_>,
@@ -73,6 +73,15 @@ pub(crate) fn invoke_claude(
             ("CLAUDE_CODE_SUBAGENT_MODEL", sub.to_string()),
             ("CLAUDE_CODE_SUBAGENT_MODEL_FORCE", "1".to_string()),
         ]);
+    }
+    // Claude Code runs each Bash command as `<prefix> '<command>'`, with a
+    // trailing ` -<flag>` of the prefix kept unquoted between them (verified in
+    // the 2.1.294 bundle): `harvest-shell -c <command>`, as with OpenCode.
+    if let Some(shell) = agent_env::install(invocation.case.root()) {
+        env.defaults.push((
+            "CLAUDE_CODE_SHELL_PREFIX",
+            format!("{} -c", shell.display()),
+        ));
     }
     // CCR routes the run through its local proxy; a run-config value must
     // not redirect it.

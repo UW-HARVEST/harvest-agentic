@@ -1,11 +1,12 @@
-//! Memory limits for the commands an OpenCode agent runs.
+//! Memory limits for the commands an OpenCode or Claude Code agent runs.
 //!
-//! OpenCode runs every bash tool call as `<shell> -c <command>`, and the
-//! project config points `shell` at `harvest-shell`. Each command then runs in
+//! Both run every bash tool call as `harvest-shell -c <command>`: OpenCode
+//! through the `shell` of its project config, Claude Code through
+//! `CLAUDE_CODE_SHELL_PREFIX`. Each command then runs in
 //! its own systemd scope under `harvest.slice`, which caps the memory and swap
 //! of all harvest agent commands on the machine together. When they run out,
 //! the OOM killer stops the largest command, usually the runaway one, and the
-//! agent is told why; OpenCode and the host keep running.
+//! agent is told why; the agent and the host keep running.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
