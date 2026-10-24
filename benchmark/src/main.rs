@@ -155,6 +155,7 @@ pub struct RunOptions {
     pub agent: Option<AgentKind>,
     pub model: Option<String>,
     pub subagent_model: Option<String>,
+    pub no_teamclaude: bool,
     pub no_plan: bool,
     pub workflow: bool,
     pub test_harness: TestHarness,
@@ -567,6 +568,9 @@ fn benchmark_single_program(
     let output_log_path = output_root_dir.join("output.log");
     let reference_modified_dir = meta_dir.join(stage_manifest::REFERENCE_MODIFIED_DIR);
     let mut effective_overrides = opts.config_overrides.clone();
+    if opts.no_teamclaude {
+        effective_overrides.push("teamclaude=false".to_owned());
+    }
     // Stage-uniform settings apply to every agentic stage running in this
     // invocation; use -c tools.<tool>.<key>=... for per-stage overrides.
     let stage_overrides = |overrides: &mut Vec<String>, tool: &str, stage: Stage| {
@@ -1287,6 +1291,7 @@ fn run(args: Args) -> HarvestResult<()> {
             .subagent_model
             .clone()
             .filter(|sub| Some(sub) != args.model.as_ref()),
+        no_teamclaude: args.no_teamclaude,
         no_plan: args.no_plan,
         workflow: args.workflow,
         test_harness: args.test_harness,

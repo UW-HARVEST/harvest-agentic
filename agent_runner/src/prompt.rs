@@ -126,6 +126,7 @@ mod tests {
             model: None,
             subagent_model: None,
             no_plan: false,
+            teamclaude: true,
             extra_env: &env,
             output_log_path: None,
             rust_toolchain: &toolchain,

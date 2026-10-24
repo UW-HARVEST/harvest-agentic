@@ -20,6 +20,7 @@ pub(crate) fn invoke_kiro(
         invocation,
         log_path,
         invocation.timeout_secs,
+        "kiro-cli",
         &[
             "chat",
             "--no-interactive",

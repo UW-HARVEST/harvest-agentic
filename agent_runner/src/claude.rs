@@ -11,20 +11,33 @@ pub(crate) fn invoke_claude(
     invocation: &AgentInvocation<'_>,
     log_path: &Path,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
+    let teamclaude = claude_uses_teamclaude(
+        invocation.teamclaude,
+        invocation.model,
+        invocation.subagent_model,
+    )?;
     let use_ccr = claude_uses_ccr(invocation.model);
     info!(
-        "Invoking Claude Code {} agent (model={}, subagent_model={}, no_plan={}, timeout={}s, ccr={}, extra_env={} vars)",
+        "Invoking Claude Code {} agent (model={}, subagent_model={}, no_plan={}, timeout={}s, ccr={}, teamclaude={}, extra_env={} vars)",
         invocation.phase.label(),
         invocation.model.unwrap_or("(cli default)"),
         invocation.subagent_model.unwrap_or("(main model)"),
         invocation.no_plan,
         invocation.timeout_secs,
         use_ccr,
+        teamclaude,
         invocation.extra_env.len()
     );
 
     let hint = compaction_hint(invocation.phase);
-    let mut args = vec!["-p", invocation.prompt];
+    // `teamclaude run` starts `claude` with the arguments after `--`, routed
+    // through its proxy.
+    let (program, mut args) = if teamclaude {
+        ("teamclaude", vec!["run", "--"])
+    } else {
+        ("claude", Vec::new())
+    };
+    args.extend(["-p", invocation.prompt]);
     if let Some(model) = invocation.model {
         args.extend(["--model", model]);
     }
@@ -67,7 +80,14 @@ pub(crate) fn invoke_claude(
         env.overrides
             .push(("ANTHROPIC_BASE_URL", "http://127.0.0.1:3456".to_string()));
     }
-    run_agent(invocation, log_path, invocation.timeout_secs, &args, &env)
+    run_agent(
+        invocation,
+        log_path,
+        invocation.timeout_secs,
+        program,
+        &args,
+        &env,
+    )
 }
 
 /// Compaction-recovery hint, injected per turn. Claude-only: the OpenCode
@@ -83,6 +103,48 @@ fn compaction_hint(phase: AgentPhase) -> String {
 
 pub(crate) fn claude_uses_ccr(model: Option<&str>) -> bool {
     model.is_some_and(|m| m.contains(','))
+}
+
+/// Whether Claude Code runs through TeamClaude: it does when `allowed` and
+/// the `teamclaude` command is on PATH. Errors when it does and a model uses
+/// CCR (`provider,model`), because TeamClaude sends every request of Claude
+/// Code to its own proxy.
+pub fn claude_uses_teamclaude(
+    allowed: bool,
+    model: Option<&str>,
+    subagent_model: Option<&str>,
+) -> Result<bool, String> {
+    teamclaude_route(allowed && on_path("teamclaude"), model, subagent_model)
+}
+
+fn teamclaude_route(
+    teamclaude: bool,
+    model: Option<&str>,
+    subagent_model: Option<&str>,
+) -> Result<bool, String> {
+    if teamclaude
+        && let Some(ccr) = [model, subagent_model]
+            .into_iter()
+            .find(|m| claude_uses_ccr(*m))
+            .flatten()
+    {
+        return Err(format!(
+            "the CCR model {ccr} cannot run through TeamClaude, which Claude Code uses when \
+             `teamclaude` is on PATH: give --no-teamclaude (config: teamclaude = false)"
+        ));
+    }
+    Ok(teamclaude)
+}
+
+/// Whether an executable file `command` is in a directory of PATH.
+fn on_path(command: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            fs::metadata(dir.join(command))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 pub(crate) fn write_claude_sandbox(case_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -119,5 +181,22 @@ mod tests {
             compaction_hint(AgentPhase::Conform),
             "After any context compaction, you MUST first read CONFORM.md."
         );
+    }
+
+    #[test]
+    fn teamclaude_rejects_ccr_models() {
+        assert_eq!(
+            teamclaude_route(true, Some("sonnet"), Some("haiku")),
+            Ok(true)
+        );
+        assert_eq!(teamclaude_route(true, None, None), Ok(true));
+        for (model, sub) in [
+            (Some("openrouter,a/b"), None),
+            (None, Some("openrouter,c/d")),
+        ] {
+            let err = teamclaude_route(true, model, sub).unwrap_err();
+            assert!(err.contains("openrouter,"), "{err}");
+            assert_eq!(teamclaude_route(false, model, sub), Ok(false));
+        }
     }
 }

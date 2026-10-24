@@ -151,6 +151,7 @@ impl Tool for VerifyFixAgentic {
             model: config.model.as_deref(),
             subagent_model: config.subagent_model.as_deref(),
             no_plan: config.no_plan,
+            teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,

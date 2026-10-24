@@ -85,6 +85,7 @@ pub(crate) fn invoke_opencode(
         invocation,
         log_path,
         invocation.timeout_secs,
+        "opencode",
         &opencode_run_args(invocation, None, invocation.prompt),
         &env,
     )?;
@@ -184,6 +185,7 @@ pub(crate) fn invoke_opencode(
                     invocation,
                     log_path,
                     remaining_secs,
+                    "opencode",
                     &opencode_run_args(invocation, Some(&session_id), OPENCODE_RESUME_PROMPT),
                     &env,
                 )?;

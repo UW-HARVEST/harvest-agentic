@@ -16,6 +16,7 @@ mod toolchain;
 
 pub use case_dir::CaseDir;
 use claude::claude_uses_ccr;
+pub use claude::claude_uses_teamclaude;
 use prompt::RegistryLimits;
 pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_test_corpus};
 
@@ -71,6 +72,7 @@ pub struct AgentInvocation<'a> {
     pub model: Option<&'a str>,
     pub subagent_model: Option<&'a str>,
     pub no_plan: bool,
+    pub teamclaude: bool,
     pub extra_env: &'a HashMap<String, String>,
     pub output_log_path: Option<&'a Path>,
     pub rust_toolchain: &'a RustToolchainContext,
@@ -213,15 +215,6 @@ fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std
     Ok(())
 }
 
-/// The command of the agent CLI.
-fn cli_name(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::OpenCode => "opencode",
-        AgentKind::Claude => "claude",
-        AgentKind::Kiro => "kiro-cli",
-    }
-}
-
 /// The exit code of `timeout` when the deadline ends the command.
 const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -242,13 +235,14 @@ fn run_agent(
     invocation: &AgentInvocation<'_>,
     log_path: &Path,
     timeout_secs: u64,
+    program: &str,
     args: &[&str],
     env: &BackendEnv,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let mut cmd = Command::new("timeout");
     cmd.arg(timeout_secs.to_string())
-        .arg(cli_name(invocation.agent))
+        .arg(program)
         .args(args)
         .env("OPENSSL_DIR", openssl_dir)
         .current_dir(invocation.case.workspace())

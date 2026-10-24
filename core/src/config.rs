@@ -121,6 +121,10 @@ pub struct Config {
     #[serde(default)]
     pub agentic_agent: AgentKind,
 
+    /// Run Claude Code through TeamClaude (`teamclaude run -- ...`) when the
+    /// `teamclaude` command is on PATH. No effect on the other agents.
+    pub teamclaude: bool,
+
     /// Filter describing which log messages should be output to stdout. This is in the
     /// `tracing_subscriber::filter::EnvFilter` format.
     pub log_filter: String,
@@ -157,6 +161,7 @@ impl Config {
             stages: Vec::new(),
             stage_input: None,
             agentic_agent: AgentKind::default(),
+            teamclaude: true,
             log_filter: "off".to_owned(),
             tools: Default::default(),
             unknown: Default::default(),

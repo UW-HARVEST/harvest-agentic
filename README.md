@@ -103,6 +103,12 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:3456`. Start CCR yourself
   beforehand (with the provider API keys exported in the same shell). Appending `[1m]` to the model name requests the 1M-context
   variant where the provider offers one.
+- TeamClaude: when the `teamclaude` command is on PATH, Harvest starts
+  Claude Code as `teamclaude run -- -p ...`, so the run uses the accounts of
+  the TeamClaude proxy. Start the proxy yourself beforehand
+  (`teamclaude server`). TeamClaude cannot route a CCR model, so a
+  `provider,model` model is then an error. `--no-teamclaude` (config:
+  `teamclaude = false`) starts `claude` directly, or through CCR, as above.
 
 **Kiro** (`--agent kiro`): legacy backend using per-project-kind prompts; kept for comparison.
 
@@ -143,6 +149,7 @@ harness build would otherwise report every test as a failure.
 | `--agent <A>` | `opencode`/`oc`, `claude`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. Not supported with Kiro. On Claude Code both models must use CCR or neither. |
+| `--no-teamclaude` | Claude only: start `claude` directly (or through CCR) also when `teamclaude` is on PATH. See "Claude Code" above |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
 | `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |

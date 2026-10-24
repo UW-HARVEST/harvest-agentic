@@ -62,7 +62,11 @@ pub fn effective_config(config: &Config) -> Result<serde_json::Value, serde_json
             Stage::Conform => section::<conform_agentic::Config>(config, &mut tools)?,
         }
     }
-    Ok(serde_json::json!({ "agentic_agent": config.agentic_agent, "tools": tools }))
+    Ok(serde_json::json!({
+        "agentic_agent": config.agentic_agent,
+        "teamclaude": config.teamclaude,
+        "tools": tools
+    }))
 }
 
 /// Performs the complete transpilation process using the scheduler.
@@ -160,6 +164,7 @@ mod tests {
         assert_eq!(tools["verify_fix_agentic"]["fuzz"], false);
         assert!(tools["verify_fix_agentic"].get("env").is_none());
         assert_eq!(value["agentic_agent"], "opencode");
+        assert_eq!(value["teamclaude"], true);
     }
 
     #[test]

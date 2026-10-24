@@ -138,6 +138,14 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub subagent_model: Option<String>,
 
+    /// Start Claude Code directly, or through CCR for a `provider,model`
+    /// model, also when the `teamclaude` command is on PATH. Without this
+    /// flag, Claude Code runs through TeamClaude (`teamclaude run -- ...`)
+    /// when it is installed, and a CCR model is then an error. No effect on
+    /// the other agents.
+    #[arg(long, requires = "agentic")]
+    pub no_teamclaude: bool,
+
     /// Grade and refine against a bench directory's *current* external test
     /// suite instead of the one the snapshot carries. Only applies when
     /// resuming (first stage verify or conform). Accepts a bench root
@@ -263,6 +271,15 @@ impl Args {
             self.model.as_deref(),
             self.subagent_model.as_deref(),
         )?;
+        // The Claude backend checks the resolved config too; this reports a CCR model that cannot
+        // run through TeamClaude once, before the run, instead of once per program.
+        if self.agent == Some(AgentKind::Claude) {
+            agent_runner::claude_uses_teamclaude(
+                !self.no_teamclaude && self.config_bool("teamclaude") != Some(false),
+                self.model.as_deref(),
+                self.subagent_model.as_deref(),
+            )?;
+        }
         // The translate stage checks the resolved config too (an agent set in a config file).
         for (set, flag) in translate_only_flags {
             if set {
@@ -303,6 +320,14 @@ impl Args {
             ));
         }
         Ok(())
+    }
+
+    /// The last `-c key=value` of a top-level boolean config key.
+    fn config_bool(&self, key: &str) -> Option<bool> {
+        self.config.iter().rev().find_map(|entry| {
+            let (name, value) = entry.split_once('=')?;
+            (name == key).then(|| value.parse().ok()).flatten()
+        })
     }
 }
 
@@ -371,6 +396,27 @@ mod tests {
         .unwrap();
         assert!(args.validate_stages(&args.stages()).is_err());
         assert!(parse(&["bench", "--subagent-model", "x", "in", "out"]).is_err());
+    }
+
+    #[test]
+    fn no_teamclaude_allows_ccr_models() {
+        // Whether TeamClaude is used without the flag depends on PATH; the combinations are
+        // tested in agent_runner.
+        for off in [&["--no-teamclaude"][..], &["-c", "teamclaude=false"]] {
+            let mut argv = vec![
+                "bench",
+                "--agentic=t",
+                "--agent",
+                "claude",
+                "--model",
+                "openrouter,a/b",
+            ];
+            argv.extend_from_slice(off);
+            argv.extend(["in", "out"]);
+            let args = parse(&argv).unwrap();
+            args.validate_stages(&args.stages()).unwrap();
+        }
+        assert!(parse(&["bench", "--no-teamclaude", "in", "out"]).is_err());
     }
 
     #[test]
