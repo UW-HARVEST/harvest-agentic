@@ -138,22 +138,48 @@ fn post_process(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cargo = CargoToml::open(&translated.join("Cargo.toml"))?;
     cargo.add_workspace();
-    match project_kind {
-        ProjectKind::Library => {
+    // The artifacts to lay out: (library, executable). A harvest-bench program takes the
+    // layout of the DARPA kind with the same artifacts.
+    let artifacts = match project_kind {
+        ProjectKind::Library => Some((true, false)),
+        ProjectKind::Executable => Some((false, true)),
+        ProjectKind::HarvestBench(program) => Some((program.lib.is_some(), program.bin.is_some())),
+        ProjectKind::Configurable => None,
+    };
+    match artifacts {
+        Some((true, false)) => {
             cargo.remove_bin();
             // Keep the agent's [lib].name; without one, use the name that Cargo would derive
             // from the package name ('-' becomes '_': a lib target name cannot contain '-').
             if let Some(name) = cargo.lib_name() {
-                cargo.set_lib(&name.replace('-', "_"));
+                cargo.set_lib(&name.replace('-', "_"), &["cdylib"]);
             }
             cargo.save()?;
             strip_for_lib(translated)?;
         }
-        ProjectKind::Executable => {
+        Some((false, true)) => {
             cargo.set_bin_driver();
             cargo.save()?;
         }
-        ProjectKind::Configurable => {
+        Some(_) => {
+            // A library and an executable. Each target is set up only when the agent produced
+            // it, so that whichever artifact exists builds and is graded; the tests of the
+            // other type fail as a missing artifact. Not covered: a compile error in either
+            // target fails the whole build, and executables auto-discovered in src/bin/ are
+            // not renamed.
+            if cargo.has_lib_target()
+                && let Some(name) = cargo.lib_name()
+            {
+                // The executable links the library, which therefore is also an rlib: a bin
+                // target cannot use a cdylib-only crate. Named as for a library alone.
+                cargo.set_lib(&name.replace('-', "_"), &["cdylib", "rlib"]);
+            }
+            if cargo.has_bin_target() {
+                cargo.set_bin_driver();
+            }
+            cargo.save()?;
+        }
+        None => {
             // The configurable prompt instructs the agent to produce both [lib] and [[bin]].
             // Only ensure workspace is present (already added above); leave the rest intact.
             cargo.save()?;
@@ -171,6 +197,9 @@ fn load_prompt(config: &Config, kind: &ProjectKind, agent: AgentKind) -> &'stati
             ProjectKind::Executable => PROMPT_KIRO_EXECUTABLE,
             ProjectKind::Library => PROMPT_KIRO_LIBRARY,
             ProjectKind::Configurable => PROMPT_KIRO_CONFIGURABLE,
+            // Kiro has no prompt for a program with both: it translates the library.
+            ProjectKind::HarvestBench(program) if program.lib.is_none() => PROMPT_KIRO_EXECUTABLE,
+            ProjectKind::HarvestBench(_) => PROMPT_KIRO_LIBRARY,
         },
     }
 }
@@ -340,5 +369,112 @@ impl ToolConfig for Config {
 impl Config {
     fn validate(&self) {
         unknown_field_warning(&format!("tools.{}", Self::KEY), &self.unknown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A crate as an agent leaves it: `[package]` and the given source files.
+    fn agent_crate(sources: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-toy\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        for source in sources {
+            let path = dir.path().join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        dir
+    }
+
+    /// A harvest-bench program, from its `program` block.
+    fn harvest_bench(program: &str) -> ProjectKind {
+        ProjectKind::HarvestBench(serde_json::from_str(program).unwrap())
+    }
+
+    const LIB_AND_BIN: &str = r#"{"lib": {}, "bin": {"name": "toy"}}"#;
+
+    fn post_processed(dir: &Path, kind: &ProjectKind) -> toml_edit::DocumentMut {
+        post_process(dir, kind).unwrap();
+        fs::read_to_string(dir.join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn crate_types(doc: &toml_edit::DocumentMut) -> Vec<&str> {
+        doc["lib"]["crate-type"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect()
+    }
+
+    fn bin_name(doc: &toml_edit::DocumentMut) -> Option<&str> {
+        doc.get("bin")?.as_array_of_tables()?.get(0)?["name"].as_str()
+    }
+
+    /// The crate after post-processing: Cargo.toml and the relative paths of all files.
+    fn result(dir: &Path) -> (String, Vec<PathBuf>) {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, dir, &mut files);
+        files.sort();
+        (fs::read_to_string(dir.join("Cargo.toml")).unwrap(), files)
+    }
+
+    #[test]
+    fn single_artifact_harvest_bench_programs_match_the_darpa_kinds() {
+        let sources = ["src/lib.rs", "src/main.rs", "tests/it.rs"];
+        for (program, darpa) in [
+            (r#"{"lib": {}}"#, ProjectKind::Library),
+            (r#"{"bin": {"name": "toy"}}"#, ProjectKind::Executable),
+        ] {
+            let (a, b) = (agent_crate(&sources), agent_crate(&sources));
+            post_process(a.path(), &harvest_bench(program)).unwrap();
+            post_process(b.path(), &darpa).unwrap();
+            assert_eq!(result(a.path()), result(b.path()), "{program}");
+        }
+    }
+
+    #[test]
+    fn library_and_executable_keeps_both_targets() {
+        let dir = agent_crate(&["src/lib.rs", "src/main.rs"]);
+        let doc = post_processed(dir.path(), &harvest_bench(LIB_AND_BIN));
+        assert_eq!(doc["lib"]["name"].as_str(), Some("my_toy"));
+        assert_eq!(crate_types(&doc), ["cdylib", "rlib"]);
+        assert_eq!(bin_name(&doc), Some("driver"));
+        assert!(dir.path().join("src/main.rs").exists(), "main.rs stripped");
+    }
+
+    #[test]
+    fn library_and_executable_without_main_adds_no_bin() {
+        let dir = agent_crate(&["src/lib.rs"]);
+        let doc = post_processed(dir.path(), &harvest_bench(LIB_AND_BIN));
+        assert_eq!(crate_types(&doc), ["cdylib", "rlib"]);
+        assert!(doc.get("bin").is_none());
+    }
+
+    #[test]
+    fn library_and_executable_without_lib_adds_no_lib() {
+        let dir = agent_crate(&["src/main.rs"]);
+        let doc = post_processed(dir.path(), &harvest_bench(LIB_AND_BIN));
+        assert!(doc.get("lib").is_none());
+        assert_eq!(bin_name(&doc), Some("driver"));
     }
 }

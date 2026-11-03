@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 full_source.workspace = true
+harvest-bench.workspace = true
 harvest_core.workspace = true
 load_raw_source.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

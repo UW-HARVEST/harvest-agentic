@@ -1,11 +1,20 @@
 use serde::Serialize;
 
+/// What a test exercises: the library or the executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestType {
+    Lib,
+    Bin,
+}
+
 /// Statistics for a a single test on a program
 #[derive(Debug, Clone, Serialize)]
 pub struct TestResult {
     pub filename: String,
     pub passed: bool,
     pub skipped: bool,
+    pub test_type: TestType,
 }
 
 /// Statistics for running many tests on a single program
@@ -44,6 +53,17 @@ impl ProgramEvalStats {
     /// Number of evaluated tests that failed
     pub fn failed_tests(&self) -> usize {
         self.evaluated_tests().saturating_sub(self.passed_tests)
+    }
+
+    /// (total, passed) over the test results of one type, counted like
+    /// `total_tests` and `passed_tests`: total includes skips, passed does not.
+    pub fn type_counts(&self, test_type: TestType) -> (usize, usize) {
+        let tests = self
+            .test_results
+            .iter()
+            .filter(|t| t.test_type == test_type);
+        let passed = tests.clone().filter(|t| t.passed && !t.skipped).count();
+        (tests.count(), passed)
     }
 
     /// Calculate success rate as a percentage
@@ -182,6 +202,25 @@ mod tests {
         // A translation that fails to build reports zero tests.
         assert!(!program("a", 0, 0, 0).all_tests_passed());
         assert!(!program("a", 5, 0, 5).all_tests_passed());
+    }
+
+    #[test]
+    fn type_counts_split_the_results_like_the_totals() {
+        let test = |passed, skipped, test_type| TestResult {
+            filename: String::new(),
+            passed,
+            skipped,
+            test_type,
+        };
+        let mut p = program("a", 3, 1, 1);
+        p.test_results = vec![
+            test(true, false, TestType::Lib),
+            test(true, true, TestType::Lib),
+            test(false, false, TestType::Bin),
+        ];
+        // Skips count in the total, not as passes.
+        assert_eq!(p.type_counts(TestType::Lib), (2, 1));
+        assert_eq!(p.type_counts(TestType::Bin), (1, 0));
     }
 
     #[test]

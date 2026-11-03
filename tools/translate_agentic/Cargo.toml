@@ -14,5 +14,8 @@ serde_json.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+toml_edit.workspace = true
+
 [lints]
 workspace = true

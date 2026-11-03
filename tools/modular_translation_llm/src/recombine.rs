@@ -54,7 +54,7 @@ pub fn recombine_decls(
     let source_file = match project_kind {
         ProjectKind::Executable => "src/main.rs",
         ProjectKind::Library => "src/lib.rs",
-        ProjectKind::Configurable => {
+        ProjectKind::Configurable | ProjectKind::HarvestBench(_) => {
             unreachable!("Configurable projects are not supported by this tool")
         }
     };

@@ -715,8 +715,10 @@ name = "build_project_spec"
 version = "0.1.0"
 dependencies = [
  "full_source",
+ "harvest-bench",
  "harvest_core",
  "load_raw_source",
+ "serde_json",
 ]
 
 [[package]]
@@ -1396,7 +1398,6 @@ name = "harvest-benchmark"
 version = "0.1.0"
 dependencies = [
  "agent_runner",
- "build_project_spec",
  "cargo_metadata",
  "clap",
  "csv",
@@ -3239,6 +3240,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
 ]
 

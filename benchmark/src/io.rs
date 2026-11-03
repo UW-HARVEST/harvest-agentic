@@ -1,5 +1,5 @@
 use crate::error::HarvestResult;
-use crate::stats::{ProgramEvalStats, SummaryStats};
+use crate::stats::{ProgramEvalStats, SummaryStats, TestType};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,10 +36,16 @@ pub fn write_csv_results(file_path: &PathBuf, results: &[ProgramEvalStats]) -> H
         "skipped_tests",
         "success_rate",
         "error_message",
+        "lib_total",
+        "lib_passed",
+        "bin_total",
+        "bin_passed",
     ])?;
 
     // Write data
     for result in results {
+        let (lib_total, lib_passed) = result.type_counts(TestType::Lib);
+        let (bin_total, bin_passed) = result.type_counts(TestType::Bin);
         wtr.write_record([
             &result.program_name,
             &result.translation_success.to_string(),
@@ -49,6 +55,10 @@ pub fn write_csv_results(file_path: &PathBuf, results: &[ProgramEvalStats]) -> H
             &result.skipped_tests.to_string(),
             &format!("{:.2}", result.success_rate()),
             result.error_message.as_deref().unwrap_or(""),
+            &lib_total.to_string(),
+            &lib_passed.to_string(),
+            &bin_total.to_string(),
+            &bin_passed.to_string(),
         ])?;
     }
 

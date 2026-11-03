@@ -98,6 +98,8 @@ impl std::fmt::Display for TestSuiteKind {
 /// held out from rounds 1 and 2, and making the suite a distinct
 /// representation lets the scheduler's dependency graph enforce that instead
 /// of relying on which files happen to sit in an agent's working directory.
+/// BuildProjectSpec also takes it, but reads only its program declaration, to
+/// form the project kind `HarvestBench(spec)`.
 pub struct ExternalTestSuite {
     /// The suite directories, as top-level entries (see [`TestSuiteKind::dirs`]).
     pub dir: RawDir,

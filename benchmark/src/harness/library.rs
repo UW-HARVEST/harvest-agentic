@@ -18,7 +18,7 @@
 
 use crate::error::HarvestResult;
 use crate::harness::TestCase;
-use crate::stats::TestResult;
+use crate::stats::{TestResult, TestType};
 use harvest_core::cargo_utils::{self, CargoToml};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -497,6 +497,7 @@ pub fn run_test_suite(
                 filename: test_case.filename.clone(),
                 passed: true,
                 skipped: true,
+                test_type: TestType::Lib,
             });
             continue;
         }
@@ -521,6 +522,7 @@ pub fn run_test_suite(
                     filename: test_case.filename.clone(),
                     passed: true,
                     skipped: false,
+                    test_type: TestType::Lib,
                 });
                 log::info!("✅ Test case {} passed", test_case.filename);
             }
@@ -529,6 +531,7 @@ pub fn run_test_suite(
                     filename: test_case.filename.clone(),
                     passed: false,
                     skipped: false,
+                    test_type: TestType::Lib,
                 });
                 let error = format_test_failure(&test_case.filename, &output);
                 error_messages.push(error.clone());
@@ -540,6 +543,7 @@ pub fn run_test_suite(
                     filename: test_case.filename.clone(),
                     passed: false,
                     skipped: false,
+                    test_type: TestType::Lib,
                 });
                 let error = format!("Test case {} failed: {}", test_case.filename, e);
                 error_messages.push(error.clone());

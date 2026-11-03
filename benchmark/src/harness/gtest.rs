@@ -10,10 +10,11 @@
 //! infrastructure, and grading on with fallback timeouts would silently
 //! distort scores).
 //!
-//! This module is the harvest-side adapter: build the translated crate as a
-//! cdylib, hand the suite to the runner's streaming API, render its events
-//! as harvest's log lines (the `✅/❌ Test … ` lines downstream tooling
-//! greps out of output.log), and map the final report onto harvest's
+//! This module is the harvest-side adapter: build the translated crate into
+//! the artifacts the suite's program declares (a cdylib, the `driver`
+//! executable, or both), hand the suite to the runner's streaming API, render
+//! its events as harvest's log lines (the `✅/❌ Test … ` lines downstream
+//! tooling greps out of output.log), and map the final report onto harvest's
 //! `TestResult` rows.
 //!
 //! Local development: builds normally use the git rev pinned in Cargo.lock;
@@ -22,9 +23,11 @@
 //! effect immediately, workspace-style.
 
 use crate::error::HarvestResult;
-use crate::harness::library;
-use crate::stats::TestResult;
-use harvest_bench::{run_suite_streaming, Event, InvocationMode, RunConfig, TestStatus};
+use crate::stats::{TestResult, TestType};
+use harvest_bench::{
+    load_program, run_suite_streaming, Artifacts, Dimension, Event, InvocationMode, ProgramSpec,
+    RunConfig, TestStatus,
+};
 use harvest_core::cargo_utils::CargoToml;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -36,7 +39,7 @@ pub const GTEST_SUITE_DIR: &str = full_source::TestSuiteKind::Gtest.dirs()[0];
 const GTEST_BUILD_SUBDIR: &str = "target/gtest_build";
 
 /// Validates a translated Rust project by building and running a GoogleTest
-/// suite against its compiled cdylib.
+/// suite against its compiled artifacts.
 ///
 /// `suite_dir` is the suite the snapshot carries
 /// (`.harvest/suite/gtest_suite/`) and is read in place: nothing is copied next
@@ -49,7 +52,6 @@ const GTEST_BUILD_SUBDIR: &str = "target/gtest_build";
 /// Tuple of (test_results, error_messages). One `TestResult` per gtest test,
 /// with `filename` set to the full `Suite.Test` name.
 pub fn run_gtest_validation(
-    program_name: &str,
     suite_dir: &Path,
     output_dir: &Path,
     timeout: u64,
@@ -57,36 +59,13 @@ pub fn run_gtest_validation(
     if !suite_dir.is_dir() {
         return Err(format!("gtest_suite directory not found at {}", suite_dir.display()).into());
     }
+    let (_, program) = load_program(suite_dir).map_err(|e| e.to_string())?;
 
-    // Rebuild the translated project as a cdylib (same preparation as library
-    // validation).
-    let mut cargo = CargoToml::open(&output_dir.join("Cargo.toml"))?;
-    cargo.add_workspace();
-    cargo.ensure_cdylib();
-    cargo.save()?;
-
-    log::info!("Rebuilding project as cdylib...");
-    let output = Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .current_dir(output_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run cargo build: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("cargo build --release failed: {}", stderr).into());
-    }
-    log::info!("✅ Cdylib build completed successfully");
-
-    let lib_path = library::locate_compiled_library(output_dir, program_name)?;
-    let lib_path = lib_path.canonicalize().unwrap_or(lib_path);
-    log::info!("Located library at: {}", lib_path.display());
+    let artifacts = build_artifacts(output_dir, &program)?;
 
     let config = RunConfig {
         suite_dir: suite_dir.to_path_buf(),
-        lib_path,
+        artifacts,
         build_dir: output_dir.join(GTEST_BUILD_SUBDIR),
         fallback_timeout: timeout,
     };
@@ -108,9 +87,87 @@ pub fn run_gtest_validation(
             filename: v.name,
             passed,
             skipped,
+            test_type: match v.test_type {
+                Dimension::Lib => TestType::Lib,
+                Dimension::Bin => TestType::Bin,
+            },
         });
     }
     Ok((test_results, error_messages))
+}
+
+/// Builds the translated crate and takes the artifacts the program declares
+/// from cargo's JSON messages: the crate's cdylib, and the executable of its
+/// bin target `driver` (the framework's name for it, see `set_bin_driver`).
+/// For a program with a library, a crate with a library target is first made
+/// to build a cdylib (same preparation as library validation). An artifact
+/// the build does not produce is left out: the runner then fails only the
+/// tests of its type.
+fn build_artifacts(output_dir: &Path, program: &ProgramSpec) -> HarvestResult<Artifacts> {
+    let mut cargo = CargoToml::open(&output_dir.join("Cargo.toml"))?;
+    cargo.add_workspace();
+    if program.has(Dimension::Lib) && cargo.has_lib_target() {
+        cargo.ensure_cdylib();
+    }
+    cargo.save()?;
+
+    log::info!("Rebuilding project...");
+    let output = Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--message-format=json")
+        .current_dir(output_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run cargo build: {}", e))?;
+    // The compiler's messages are in the JSON on stdout, not on stderr.
+    let mut errors = Vec::new();
+    let mut artifacts = Vec::new();
+    for message in cargo_metadata::Message::parse_stream(output.stdout.as_slice()) {
+        match message? {
+            cargo_metadata::Message::CompilerArtifact(a) => artifacts.push(a),
+            cargo_metadata::Message::CompilerMessage(m)
+                if m.message.level == cargo_metadata::diagnostic::DiagnosticLevel::Error =>
+            {
+                errors.extend(m.message.rendered)
+            }
+            _ => {}
+        }
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "cargo build --release failed: {}{}",
+            errors.concat(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    log::info!("\u{2705} Build completed successfully");
+
+    // Dependencies' artifacts are in the stream too: keep the crate's own.
+    let manifest = output_dir.join("Cargo.toml").canonicalize()?;
+    let own = || artifacts.iter().filter(|a| a.manifest_path == manifest);
+    let mut found = Artifacts::default();
+    if program.has(Dimension::Lib) {
+        found.lib = own()
+            .filter(|a| a.target.is_cdylib())
+            .flat_map(|a| &a.filenames)
+            .find(|f| f.extension() == Some(std::env::consts::DLL_EXTENSION))
+            .map(|f| f.clone().into_std_path_buf());
+    }
+    if program.has(Dimension::Bin) {
+        found.bin = own()
+            .find(|a| a.target.name == "driver")
+            .and_then(|a| a.executable.clone())
+            .map(|e| e.into_std_path_buf());
+    }
+    for dim in [Dimension::Lib, Dimension::Bin] {
+        if let Some(path) = found.get(dim) {
+            log::info!("Located {} artifact at: {}", dim, path.display());
+        }
+    }
+    Ok(found)
 }
 
 /// Renders runner events as harvest's log lines. The `✅/❌ Test … ` and
@@ -132,6 +189,12 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
     let mut noteworthy: Vec<String> = Vec::new();
 
     move |event: &Event| match event {
+        Event::ArtifactMissing { artifact } => {
+            emit(format!(
+                "\u{26a0}\u{fe0f}  No {0} artifact: the {0} tests run against a placeholder and count as failed",
+                artifact
+            ));
+        }
         Event::SuiteBuildStarted { .. } => {
             emit("Configuring and building GoogleTest suite...".to_string());
         }
@@ -161,7 +224,7 @@ fn harvest_event_renderer_to(mut emit: impl FnMut(String)) -> impl FnMut(&Event)
                 "Execution plan: {} batch invocation(s), {} per-case invocation(s)",
                 batch_total, case_total
             ));
-            emit("Validating library outputs against GoogleTest suite...".to_string());
+            emit("Validating outputs against GoogleTest suite...".to_string());
         }
         Event::InvocationStarted { invocation, .. } => match invocation.mode {
             InvocationMode::Suite => {
@@ -274,6 +337,7 @@ mod tests {
     fn verdict(name: &str, status: TestStatus) -> TestVerdict {
         TestVerdict {
             name: name.to_string(),
+            test_type: Dimension::Lib,
             status,
             failure: String::new(),
             time_secs: None,
@@ -305,6 +369,7 @@ mod tests {
                 index: 0,
                 total: 1,
                 invocation: inv,
+                test_type: None,
             });
             for v in verdicts {
                 render(&Event::TestFinished { verdict: v });
@@ -314,6 +379,7 @@ mod tests {
                 total: 1,
                 invocation: inv,
                 outcome: out,
+                test_type: None,
             });
         }
         lines
@@ -387,6 +453,7 @@ mod tests {
                 index: 0,
                 total: 2,
                 invocation: &failing,
+                test_type: None,
             });
             render(&Event::TestFinished { verdict: &bad });
             render(&Event::InvocationFinished {
@@ -394,11 +461,13 @@ mod tests {
                 total: 2,
                 invocation: &failing,
                 outcome: &bad_out,
+                test_type: None,
             });
             render(&Event::InvocationStarted {
                 index: 1,
                 total: 2,
                 invocation: &clean,
+                test_type: None,
             });
             render(&Event::TestFinished { verdict: &good });
             render(&Event::InvocationFinished {
@@ -406,6 +475,7 @@ mod tests {
                 total: 2,
                 invocation: &clean,
                 outcome: &good_out,
+                test_type: None,
             });
         }
         // The failure belongs to the first batch only.
@@ -415,5 +485,18 @@ mod tests {
             "{:?}",
             lines
         );
+    }
+
+    #[test]
+    fn missing_artifacts_are_warned() {
+        let mut lines = Vec::new();
+        {
+            let mut render = harvest_event_renderer_to(|line| lines.push(line));
+            render(&Event::ArtifactMissing {
+                artifact: Dimension::Bin,
+            });
+        }
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].contains("No bin artifact"), "{:?}", lines);
     }
 }

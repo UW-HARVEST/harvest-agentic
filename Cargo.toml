@@ -20,6 +20,7 @@ agent_runner = { path = "agent_runner" }
 translate_agentic = { path = "tools/translate_agentic" }
 verify_fix_agentic = { path = "tools/verify_fix_agentic" }
 conform_agentic = { path = "tools/conform_agentic" }
+harvest-bench = { git = "https://github.com/UW-HARVEST/harvest-bench", rev = "85bfc17b6326ab16d11d2389c2795eab2a5414f9" }
 libc = "0.2.177"
 log = "0.4.28"
 serde = { version = "1.0.228", features = ["derive"] }

@@ -204,7 +204,7 @@ impl ModularTranslationLLM {
         let project_kind_str = match project_kind {
             ProjectKind::Executable => "executable",
             ProjectKind::Library => "library",
-            ProjectKind::Configurable => {
+            ProjectKind::Configurable | ProjectKind::HarvestBench(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "modular translation does not yet support ProjectKind::Configurable",
@@ -272,7 +272,7 @@ impl ModularTranslationLLM {
         let project_kind_str = match project_kind {
             ProjectKind::Executable => "executable",
             ProjectKind::Library => "library",
-            ProjectKind::Configurable => "configurable",
+            ProjectKind::Configurable | ProjectKind::HarvestBench(_) => "configurable",
         };
 
         let type_code: Vec<String> = type_translations
@@ -349,7 +349,7 @@ impl ModularTranslationLLM {
         let project_kind_str = match project_kind {
             ProjectKind::Executable => "executable",
             ProjectKind::Library => "library",
-            ProjectKind::Configurable => "configurable",
+            ProjectKind::Configurable | ProjectKind::HarvestBench(_) => "configurable",
         };
 
         let type_code: Vec<String> = type_translations
@@ -410,7 +410,7 @@ impl ModularTranslationLLM {
         let project_kind_str = match project_kind {
             ProjectKind::Executable => "executable",
             ProjectKind::Library => "library",
-            ProjectKind::Configurable => "configurable",
+            ProjectKind::Configurable | ProjectKind::HarvestBench(_) => "configurable",
         };
 
         let request = build_request(

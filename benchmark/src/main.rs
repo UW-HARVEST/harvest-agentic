@@ -17,8 +17,7 @@ use crate::io::{
 };
 use crate::ir_utils::{cargo_build_result, external_test_suite, raw_cargo_package, raw_source};
 use crate::logger::TeeLogger;
-use crate::stats::{ProgramEvalStats, SummaryStats, TestResult};
-use build_project_spec::{detect_project_kind, ProjectKind};
+use crate::stats::{ProgramEvalStats, SummaryStats, TestResult, TestType};
 use clap::Parser;
 use harvest_benchmark::quality;
 use harvest_core::config::{AgentKind, Stage};
@@ -365,14 +364,12 @@ enum ValidationHarness {
 
 /// Resolves which validation harness grades `suite_root`.
 ///
-/// `library_auto` is the caller's auto-mode preference for library validation
-/// when no gtest suite applies: a fresh bench run consults the detected C
-/// project kind, while a snapshot re-grade only has the suite directories to
-/// go by. Explicit `--test-harness lib|bin` overrides it either way.
+/// In auto mode a gtest suite wins; without one, a cando2 `runner/` means
+/// library validation, otherwise the driver binary runs against test_vectors.
+/// Explicit `--test-harness lib|bin` overrides it.
 fn select_validation_harness(
     requested: TestHarness,
     suite_root: &Path,
-    library_auto: bool,
 ) -> Result<ValidationHarness, String> {
     let gtest_available = matches!(
         load_test_suite::detect_kind(suite_root, None),
@@ -397,7 +394,7 @@ fn select_validation_harness(
     let use_library = match requested {
         TestHarness::Lib => true,
         TestHarness::Bin => false,
-        TestHarness::Auto | TestHarness::Gtest => library_auto,
+        TestHarness::Auto | TestHarness::Gtest => runner_dir_exists(suite_root),
     };
     Ok(if use_library {
         ValidationHarness::Library
@@ -438,6 +435,7 @@ fn run_test_validation(
                 filename: test_case.filename.clone(),
                 passed: true,
                 skipped: true,
+                test_type: TestType::Bin,
             });
             continue;
         }
@@ -461,6 +459,7 @@ fn run_test_validation(
                     filename: test_case.filename.clone(),
                     passed: true,
                     skipped: false,
+                    test_type: TestType::Bin,
                 });
                 log::info!("✅ Test case {} passed", test_case.filename);
             }
@@ -469,6 +468,7 @@ fn run_test_validation(
                     filename: test_case.filename.clone(),
                     passed: false,
                     skipped: false,
+                    test_type: TestType::Bin,
                 });
                 let error = format!("Test case {} failed: {}", test_case.filename, e);
                 error_messages.push(error);
@@ -510,16 +510,6 @@ fn benchmark_single_program(
     // Get program output directory
     let output_dir = output_root_dir.join(&program_name);
     log::info!("Output directory: {}", output_dir.display());
-
-    // Detect project kind from the C source root (same heuristic as build_project_spec).
-    let project_kind = detect_project_kind(&test_case_dir);
-    log::info!(
-        "Detected project type: {}",
-        project_kind
-            .as_ref()
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    );
 
     // Parse JSON test vectors, when the suite has them. gtest-only test cases
     // define their test set in the suite instead.
@@ -697,19 +687,7 @@ fn benchmark_single_program(
     // saw, re-emitted from the IR, so grading never depends on the bench
     // directory still being in place.
     let graded_suite_root = stage_manifest::suite_dir(&output_dir);
-    // Auto-mode library preference, from the detected C project kind:
-    // - Library projects always use cando2 (runner + test_vectors via FFI).
-    // - Configurable projects can be tested either way; pick library validation
-    //   only when a `runner/` exists, otherwise fall back to running the
-    //   driver binary against test_vectors (executable-style tests).
-    // - Executable and unknown project kinds run the binary directly.
-    let library_auto = match project_kind {
-        Some(ProjectKind::Library) => true,
-        Some(ProjectKind::Configurable) => runner_dir_exists(&graded_suite_root),
-        _ => false,
-    };
-    let validation = match select_validation_harness(test_harness, &graded_suite_root, library_auto)
-    {
+    let validation = match select_validation_harness(test_harness, &graded_suite_root) {
         Ok(v) => v,
         Err(error) => {
             log::error!("{}", error);
@@ -719,12 +697,7 @@ fn benchmark_single_program(
     };
     let (test_results, error_messages) = match validation {
         ValidationHarness::Gtest { suite_dir } => {
-            match harness::gtest::run_gtest_validation(
-                &program_name,
-                &suite_dir,
-                &output_dir,
-                timeout,
-            ) {
+            match harness::gtest::run_gtest_validation(&suite_dir, &output_dir, timeout) {
                 Ok(r) => {
                     // gtest defines its own test set; the vector count no longer applies.
                     result.total_tests = r.0.len();
@@ -956,13 +929,7 @@ fn test_existing_program(
     };
     result.total_tests = test_cases.len();
 
-    // Auto-mode library preference: a snapshot re-grade has no C project kind
-    // to consult, so the presence of the suite's runner/ decides.
-    let validation = match select_validation_harness(
-        test_harness,
-        &suite_root,
-        runner_dir_exists(&suite_root),
-    ) {
+    let validation = match select_validation_harness(test_harness, &suite_root) {
         Ok(v) => v,
         Err(error) => {
             result.error_message = Some(error);
@@ -971,7 +938,7 @@ fn test_existing_program(
     };
     let (test_results, error_messages) = if let ValidationHarness::Gtest { suite_dir } = &validation
     {
-        match harness::gtest::run_gtest_validation(&program_name, suite_dir, program_dir, timeout) {
+        match harness::gtest::run_gtest_validation(suite_dir, program_dir, timeout) {
             Ok(r) => {
                 result.rust_build_success = true;
                 // gtest defines its own test set; the vector count no longer applies.
@@ -1356,7 +1323,7 @@ mod tests {
     #[test]
     fn auto_prefers_gtest_when_present() {
         let dir = suite(&["gtest_suite", "runner", "test_vectors"]);
-        let v = select_validation_harness(TestHarness::Auto, dir.path(), true).unwrap();
+        let v = select_validation_harness(TestHarness::Auto, dir.path()).unwrap();
         match v {
             ValidationHarness::Gtest { suite_dir } => {
                 assert!(suite_dir.ends_with("gtest_suite"));
@@ -1366,14 +1333,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_uses_library_preference_without_gtest() {
-        let dir = suite(&["runner", "test_vectors"]);
+    fn auto_without_gtest_follows_the_runner_dir() {
+        let lib = suite(&["runner", "test_vectors"]);
         assert!(matches!(
-            select_validation_harness(TestHarness::Auto, dir.path(), true).unwrap(),
+            select_validation_harness(TestHarness::Auto, lib.path()).unwrap(),
             ValidationHarness::Library
         ));
+        let bin = suite(&["test_vectors"]);
         assert!(matches!(
-            select_validation_harness(TestHarness::Auto, dir.path(), false).unwrap(),
+            select_validation_harness(TestHarness::Auto, bin.path()).unwrap(),
             ValidationHarness::Binary
         ));
     }
@@ -1381,7 +1349,7 @@ mod tests {
     #[test]
     fn forced_gtest_without_suite_is_an_error() {
         let dir = suite(&["runner", "test_vectors"]);
-        let err = select_validation_harness(TestHarness::Gtest, dir.path(), true).unwrap_err();
+        let err = select_validation_harness(TestHarness::Gtest, dir.path()).unwrap_err();
         assert!(err.contains("gtest_suite"), "unexpected error: {err}");
     }
 
@@ -1389,11 +1357,11 @@ mod tests {
     fn explicit_lib_and_bin_override_gtest() {
         let dir = suite(&["gtest_suite", "runner", "test_vectors"]);
         assert!(matches!(
-            select_validation_harness(TestHarness::Lib, dir.path(), false).unwrap(),
+            select_validation_harness(TestHarness::Lib, dir.path()).unwrap(),
             ValidationHarness::Library
         ));
         assert!(matches!(
-            select_validation_harness(TestHarness::Bin, dir.path(), true).unwrap(),
+            select_validation_harness(TestHarness::Bin, dir.path()).unwrap(),
             ValidationHarness::Binary
         ));
     }

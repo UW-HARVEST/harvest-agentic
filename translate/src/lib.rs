@@ -88,7 +88,9 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
     // produces the crate, so that the run can write it back out and its output
     // is a self-contained snapshot. Loading it is not the same as revealing it:
     // only the conform stage declares it as an input, which is what holds it
-    // out of the other stages.
+    // out of the other stages. The agentic translate stage's BuildProjectSpec
+    // takes it too, but reads only a GoogleTest suite's program declaration,
+    // to form the project kind `HarvestBench(spec)`.
     let suite = load_test_suite::configured_input_path(&config)
         .filter(|path| load_test_suite::has_suite(path))
         .map(|_| scheduler.queue(LoadTestSuite));
@@ -97,7 +99,8 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
         // The initial CargoPackage comes from the translate stage when it
         // runs, otherwise from a previous run's snapshot.
         let package = if config.stages.contains(&Stage::Translate) {
-            let project_spec = scheduler.queue_after(BuildProjectSpec, &[load_src]);
+            let spec_inputs: Vec<_> = std::iter::once(load_src).chain(suite).collect();
+            let project_spec = scheduler.queue_after(BuildProjectSpec, &spec_inputs);
             scheduler.queue_after(TranslateAgentic, &[load_src, project_spec])
         } else {
             let snapshot = config.stage_input.as_deref().ok_or(
@@ -180,5 +183,44 @@ mod tests {
             serde_json::json!({"model": "m"})
         );
         assert_eq!(value["modular"], false);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn the_suite_program_declaration_decides_the_project_kind() {
+        use build_project_spec::ProjectSpec;
+        use std::fs;
+        // A GoogleTest suite makes the input harvest-bench's: its declaration, not the
+        // CMakeLists.txt heuristic (which says Executable), gives the kind.
+        let bench = harvest_core::test_util::tempdir().unwrap();
+        fs::create_dir_all(bench.path().join("test_case")).unwrap();
+        fs::create_dir_all(bench.path().join("gtest_suite")).unwrap();
+        fs::write(
+            bench.path().join("test_case/CMakeLists.txt"),
+            "add_executable(toyexe main.c)\n",
+        )
+        .unwrap();
+        fs::write(
+            bench.path().join("gtest_suite/manifest.json"),
+            r#"{"program": {"lib": {}, "bin": {"name": "toy"}}}"#,
+        )
+        .unwrap();
+        let mut config = Config::mock();
+        config.input = bench.path().join("test_case");
+        config.tools.insert(
+            "load_test_suite".to_owned(),
+            serde_json::json!({"input_path": bench.path()}),
+        );
+        let config = Arc::new(config);
+        let collector = diagnostics::Collector::initialize(&config).unwrap();
+        let mut runner = ToolRunner::new(collector.reporter());
+        let mut scheduler = Scheduler::default();
+        let mut ir = HarvestIR::default();
+        let src = scheduler.queue(LoadRawSource::new(&config.input));
+        let suite = scheduler.queue(LoadTestSuite);
+        let spec = scheduler.queue_after(BuildProjectSpec, &[src, suite]);
+        scheduler.run_all(&mut runner, &mut ir, config).unwrap();
+        let kind = ir.get::<ProjectSpec>(spec).unwrap().kind.to_string();
+        assert_eq!(kind, "HarvestBench(lib+bin)");
     }
 }

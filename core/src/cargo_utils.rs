@@ -112,17 +112,20 @@ impl CargoToml {
         }
     }
 
-    /// Sets `[lib]` with the given `name` and `crate-type = ["cdylib"]`, overwriting any
+    /// Sets `[lib]` with the given `name` and `crate_types` (e.g. `["cdylib"]`), overwriting any
     /// existing `crate-type`. Use [`ensure_cdylib`](CargoToml::ensure_cdylib) instead when
     /// other crate types must be preserved.
-    pub fn set_lib(&mut self, name: &str) {
+    pub fn set_lib(&mut self, name: &str, crate_types: &[&str]) {
         let lib = self
             .doc
             .entry("lib")
             .or_insert_with(|| Item::Table(Table::new()));
         if let Some(t) = lib.as_table_mut() {
             t.insert("name", toml_edit::value(name));
-            t.insert("crate-type", toml_edit::value(cdylib_array()));
+            t.insert(
+                "crate-type",
+                toml_edit::value(Array::from_iter(crate_types.iter().copied())),
+            );
         }
     }
 
@@ -144,6 +147,21 @@ impl CargoToml {
         let mut arr = toml_edit::ArrayOfTables::new();
         arr.push(bin);
         self.doc.insert("bin", Item::ArrayOfTables(arr));
+    }
+
+    /// Whether the crate has a library target: a `[lib].path`, or a `src/lib.rs`.
+    pub fn has_lib_target(&self) -> bool {
+        self.doc.get("lib").and_then(|l| l.get("path")).is_some()
+            || self.crate_dir().join("src/lib.rs").exists()
+    }
+
+    /// Whether the crate has an executable target: a `[[bin]]` section, or a `src/main.rs`.
+    pub fn has_bin_target(&self) -> bool {
+        self.doc.get("bin").is_some() || self.crate_dir().join("src/main.rs").exists()
+    }
+
+    fn crate_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
     }
 
     /// Removes all `[[bin]]` sections.
