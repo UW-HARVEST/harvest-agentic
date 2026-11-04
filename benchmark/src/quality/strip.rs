@@ -152,7 +152,7 @@ const R: &str = r#"unsafe { raw }"#;
 
     #[test]
     fn non_ascii_text_keeps_byte_offsets() {
-        let src = "// 中文注释\nfn f() { let s = \"é\"; unsafe { g() } }";
+        let src = "// non-ASCII: ✓ → ∑\nfn f() { let s = \"é\"; unsafe { g() } }";
         let out = stripped(src);
         assert_eq!(out.text.len(), src.len());
         assert_eq!(out.text.find("{ g()"), src.find("{ g()"));

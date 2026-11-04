@@ -18,12 +18,15 @@ pub enum AgentKind {
 }
 
 /// One agentic pipeline stage. Stages compose in pipeline order
-/// (translate < verify < conform); a run executes an ordered subset.
+/// (translate < verify < quality < conform); a run executes an ordered subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
     Translate,
     Verify,
+    /// Safety and idiomaticity refactoring of a translated crate, guarded by the regression tests
+    /// of the verify stage when the crate has them.
+    Quality,
     Conform,
 }
 
@@ -32,6 +35,7 @@ impl fmt::Display for Stage {
         match self {
             Stage::Translate => write!(f, "translate"),
             Stage::Verify => write!(f, "verify"),
+            Stage::Quality => write!(f, "quality"),
             Stage::Conform => write!(f, "conform"),
         }
     }
@@ -44,9 +48,10 @@ impl FromStr for Stage {
         match s.to_lowercase().as_str() {
             "translate" | "t" => Ok(Stage::Translate),
             "verify" | "v" => Ok(Stage::Verify),
+            "quality" | "q" => Ok(Stage::Quality),
             "conform" | "c" => Ok(Stage::Conform),
             other => Err(format!(
-                "unknown stage: {other} (expected: translate/t, verify/v, conform/c)"
+                "unknown stage: {other} (expected: translate/t, verify/v, quality/q, conform/c)"
             )),
         }
     }

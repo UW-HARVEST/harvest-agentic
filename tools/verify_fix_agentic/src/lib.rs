@@ -49,6 +49,15 @@ const VE_RUN_FUZZ_SH: &str = include_str!("verify_env_template/run_fuzz.sh");
 const VE_RUN_TESTS_SH: &str = include_str!("verify_env_template/run_tests.sh");
 const VE_MEMORY_SCOPE_SH: &str = include_str!("verify_env_template/memory_scope.sh");
 const VE_README: &str = include_str!("verify_env_template/README.md");
+
+/// The run scripts of verify_env (file name, text). They run the test binary and the fuzz
+/// campaigns under memory and time limits. The quality stage runs the verify stage's tests with
+/// the current version of them.
+pub const RUNNER_SCRIPTS: [(&str, &str); 3] = [
+    ("run_tests.sh", VE_RUN_TESTS_SH),
+    ("run_fuzz.sh", VE_RUN_FUZZ_SH),
+    ("memory_scope.sh", VE_MEMORY_SCOPE_SH),
+];
 const VE_README_FUZZ: &str = include_str!("verify_env_template/README_fuzz.md");
 
 // Vendored FuzzTest reference docs (Apache-2.0), materialized under

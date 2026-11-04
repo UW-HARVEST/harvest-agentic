@@ -16,6 +16,7 @@ use load_raw_source::LoadRawSource;
 use load_test_suite::LoadTestSuite;
 use load_translated_package::LoadTranslatedPackage;
 use modular_translation_llm::ModularTranslationLlm;
+use quality_agentic::QualityAgentic;
 use raw_source_to_cargo_llm::RawSourceToCargoLlm;
 use runner::ToolRunner;
 use scheduler::Scheduler;
@@ -59,6 +60,7 @@ pub fn effective_config(config: &Config) -> Result<serde_json::Value, serde_json
         match stage {
             Stage::Translate => section::<translate_agentic::Config>(config, &mut tools)?,
             Stage::Verify => section::<verify_fix_agentic::Config>(config, &mut tools)?,
+            Stage::Quality => section::<quality_agentic::Config>(config, &mut tools)?,
             Stage::Conform => section::<conform_agentic::Config>(config, &mut tools)?,
         }
     }
@@ -110,6 +112,11 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
         };
         let package = if config.stages.contains(&Stage::Verify) {
             scheduler.queue_after(VerifyFixAgentic, &[package, load_src])
+        } else {
+            package
+        };
+        let package = if config.stages.contains(&Stage::Quality) {
+            scheduler.queue_after(QualityAgentic, &[package, load_src])
         } else {
             package
         };

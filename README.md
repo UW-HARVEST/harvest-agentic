@@ -42,7 +42,13 @@ later stage can resume from an earlier run's output directory.
    comparison environment using the C as the oracle (GoogleTest with FuzzTest
    by default; `--no-fuzz` drops FuzzTest; libloading as the legacy method), compares C and
    Rust outputs byte-for-byte, and fixes the Rust code until the two agree.
-3. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). Experimental,
+3. **Quality** (`tools/quality_agentic`, stage `quality`/`q`). Experimental:
+   bare `--agentic` never runs it. An agent refactors the crate toward safe,
+   idiomatic Rust (fewer operations that need `unsafe`, fewer lints) without
+   changing its behavior, with the tests that the verify stage left in the
+   crate as the regression gate. Claude and OpenCode only. See
+   `tools/quality_agentic/README.md`.
+4. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). Experimental,
    research use only: not part of the standard translation pipeline, and bare
    `--agentic` never runs it. A third agent is given the external test suite
    and refines the crate until it passes, to study the gap between internal
@@ -70,7 +76,11 @@ cargo run --bin=benchmark --release -- --agentic=v --agent claude --model sonnet
 cargo run --bin=benchmark --release -- --agentic=v --agent claude --model opus \
   ./out_lz4_1_cs5_t ./out_lz4_1_cs5_t_co5_v
 
-# 3. Experimental research stage: conform on a verified snapshot
+# 3. Experimental: safety and idiomaticity refactoring of a verified snapshot
+cargo run --bin=benchmark --release -- --agentic=q --agent oc --model opencode-go/mimo-v2.6-flash \
+  ./out_lz4_1_cs5_tv ./out_lz4_1_cs5_tv_q
+
+# 4. Experimental research stage: conform on a verified snapshot
 #    (not part of the standard pipeline; all three stages in one run also works):
 cargo run --bin=benchmark --release -- --agentic=c --agent claude --model sonnet \
   ./out_lz4_1_cs5_tv ./out_lz4_1_cs5_tvc
@@ -145,7 +155,7 @@ harness build would otherwise report every test as a failure.
 
 | Flag | Meaning |
 |------|---------|
-| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`conform` is an experimental research stage). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
+| `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `quality`/`q`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`quality` and `conform` are experimental research stages). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
 | `--agent <A>` | `opencode`/`oc`, `claude`, or `kiro` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. Not supported with Kiro. On Claude Code both models must use CCR or neither. |

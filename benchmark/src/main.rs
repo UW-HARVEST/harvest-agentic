@@ -630,11 +630,14 @@ fn benchmark_single_program(
             effective_overrides.push("tools.verify_fix_agentic.fuzz=false".to_owned());
         }
     }
+    if opts.has(Stage::Quality) {
+        stage_overrides(&mut effective_overrides, "quality_agentic", Stage::Quality);
+    }
     if opts.has(Stage::Conform) {
         stage_overrides(&mut effective_overrides, "conform_agentic", Stage::Conform);
     }
 
-    // Run the stage pipeline (translate/verify/conform, or the non-agentic
+    // Run the stage pipeline (translate/verify/quality/conform, or the non-agentic
     // translators), starting from the C source or the snapshot.
     let translation_result = translate_c_directory_to_rust_project(
         &test_case_dir,
@@ -1208,7 +1211,7 @@ fn run(args: Args) -> HarvestResult<()> {
     // Build the per-program work list. INPUT_DIR is what the first stage
     // consumes: bench test cases for translate (and the non-agentic modes),
     // or a previous run's snapshot root when resuming from verify.
-    let resume_from_snapshot = matches!(stages.first(), Some(Stage::Verify | Stage::Conform));
+    let resume_from_snapshot = stages.first().is_some_and(|s| *s != Stage::Translate);
     let mut program_dirs = if resume_from_snapshot {
         translated_program_dirs(input_dir)?
     } else if input_dir.join("test_case").is_dir() {

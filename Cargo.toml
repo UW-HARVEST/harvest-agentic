@@ -1,5 +1,5 @@
 [workspace]
-members = ["benchmark", "core", "tools/full_source", "tools/build_project_spec", "tools/load_raw_source", "tools/load_translated_package", "tools/load_test_suite", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm", "tools/quantize_rust_spans", "tools/fix_declarations_llm", "agent_runner", "tools/translate_agentic", "tools/verify_fix_agentic", "tools/conform_agentic", "tools/translate_agentic/safe_wrapper_rt"]
+members = ["benchmark", "core", "tools/full_source", "tools/build_project_spec", "tools/load_raw_source", "tools/load_translated_package", "tools/load_test_suite", "tools/raw_source_to_cargo_llm", "tools/try_cargo_build", "translate", "tools/c_ast", "tools/modular_translation_llm", "tools/quantize_rust_spans", "tools/fix_declarations_llm", "agent_runner", "tools/translate_agentic", "tools/verify_fix_agentic", "tools/quality_agentic", "tools/conform_agentic", "tools/translate_agentic/safe_wrapper_rt"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ quantize_rust_spans = { path = "tools/quantize_rust_spans" }
 agent_runner = { path = "agent_runner" }
 translate_agentic = { path = "tools/translate_agentic" }
 verify_fix_agentic = { path = "tools/verify_fix_agentic" }
+quality_agentic = { path = "tools/quality_agentic" }
 conform_agentic = { path = "tools/conform_agentic" }
 harvest-bench = { git = "https://github.com/UW-HARVEST/harvest-bench", rev = "85bfc17b6326ab16d11d2389c2795eab2a5414f9" }
 libc = "0.2.177"

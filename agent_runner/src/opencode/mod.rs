@@ -25,6 +25,7 @@ impl AgentPhase {
         match self {
             AgentPhase::Translate => "harvest-translate",
             AgentPhase::Verify => "harvest-verify",
+            AgentPhase::Quality => "harvest-quality",
             AgentPhase::Conform => "harvest-conform",
         }
     }
@@ -33,6 +34,7 @@ impl AgentPhase {
         match self {
             AgentPhase::Translate => "Harvest agentic translation backend",
             AgentPhase::Verify => "Harvest agentic verification backend",
+            AgentPhase::Quality => "Harvest agentic quality backend",
             AgentPhase::Conform => "Harvest agentic conformance backend",
         }
     }

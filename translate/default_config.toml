@@ -22,3 +22,5 @@ max_tokens = 10000
 [tools.translate_agentic]
 
 [tools.verify_fix_agentic]
+
+[tools.quality_agentic]

@@ -24,6 +24,7 @@ pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_
 pub enum AgentPhase {
     Translate,
     Verify,
+    Quality,
     /// Third-stage refinement: an already-translated project is given the
     /// external test suite (gtest / tractor vectors) and refined until every
     /// external test passes. Runs standalone, decoupled from translate/verify.
@@ -35,6 +36,7 @@ impl AgentPhase {
         match self {
             AgentPhase::Translate => "translation",
             AgentPhase::Verify => "verification",
+            AgentPhase::Quality => "quality",
             AgentPhase::Conform => "conformance",
         }
     }
@@ -43,6 +45,7 @@ impl AgentPhase {
         match self {
             AgentPhase::Translate => "translation.log",
             AgentPhase::Verify => "verify.log",
+            AgentPhase::Quality => "quality.log",
             AgentPhase::Conform => "conform.log",
         }
     }
@@ -53,6 +56,7 @@ impl AgentPhase {
         match self {
             AgentPhase::Translate => &["PLAN.md"],
             AgentPhase::Verify => &["PLAN.md", "HYPOTHESES.md"],
+            AgentPhase::Quality => &["QUALITY.md"],
             AgentPhase::Conform => &["CONFORM.md"],
         }
     }
@@ -372,11 +376,44 @@ fn run_teed(
     child.wait()
 }
 
+/// The framework's `.gitignore` entries: build outputs, scratch and worktrees stay untracked.
+const GITIGNORE_ENTRIES: [&str; 6] = [
+    "target/",
+    "build*/",
+    "cbuild/",
+    "scratch/",
+    "wt/",
+    ".opencode/",
+];
+
+/// Adds the framework's `.gitignore` entries that an existing repository lacks: snapshots made
+/// before an entry was introduced (`scratch/`) would otherwise commit what it should hide.
+fn complete_gitignore(work_dir: &Path) -> std::io::Result<()> {
+    let path = work_dir.join(".gitignore");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&str> = GITIGNORE_ENTRIES
+        .into_iter()
+        .filter(|entry| !text.lines().any(|line| line.trim() == *entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for entry in missing {
+        text.push_str(entry);
+        text.push('\n');
+    }
+    fs::write(path, text)
+}
+
 /// Prepare the agent working directory as a git repository. A fresh
 /// directory gets `git init`, a local identity (agents run without a global
 /// git config), a `.gitignore` that keeps build outputs and worktrees
 /// untracked, and a baseline commit. An existing repository only has stale
-/// worktree metadata pruned, so a resumed stage keeps its history.
+/// worktree metadata pruned and its `.gitignore` completed, so a resumed stage
+/// keeps its history.
 pub fn ensure_workdir_git(work_dir: &Path) {
     let git = |args: &[&str]| -> Result<ExitStatus, std::io::Error> {
         Command::new("git")
@@ -393,6 +430,12 @@ pub fn ensure_workdir_git(work_dir: &Path) {
 
     if work_dir.join(".git").exists() {
         ok(&["worktree", "prune"], "worktree prune");
+        if let Err(e) = complete_gitignore(work_dir) {
+            warn!(
+                "failed to complete .gitignore in {}: {e}",
+                work_dir.display()
+            );
+        }
         return;
     }
     match git(&["init", "-q", "-b", "main"]) {
@@ -420,10 +463,11 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         &["config", "user.email", "harvest-agent@invalid"],
         "config user.email",
     );
-    if let Err(e) = fs::write(
-        work_dir.join(".gitignore"),
-        "# Framework-written: build outputs, scratch and worktrees stay untracked.\ntarget/\nbuild*/\ncbuild/\nscratch/\nwt/\n.opencode/\n",
-    ) {
+    let gitignore = format!(
+        "# Framework-written: build outputs, scratch and worktrees stay untracked.\n{}\n",
+        GITIGNORE_ENTRIES.join("\n")
+    );
+    if let Err(e) = fs::write(work_dir.join(".gitignore"), gitignore) {
         warn!("failed to write .gitignore in {}: {e}", work_dir.display());
     }
     ok(&["add", "-A"], "add");
@@ -527,6 +571,27 @@ mod tests {
         // Unsupported setups.
         assert!(eff(AgentKind::Kiro, None, Some("x")).is_err());
         assert!(eff(AgentKind::Claude, Some("sonnet"), Some("openrouter,a/b")).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn resumed_repository_gets_missing_gitignore_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("src.txt"), "content").expect("write file");
+        ensure_workdir_git(dir.path());
+        // A snapshot from before `scratch/` was ignored.
+        fs::write(dir.path().join(".gitignore"), "# old\ntarget/\nwt/").expect("write gitignore");
+        ensure_workdir_git(dir.path());
+        let text = fs::read_to_string(dir.path().join(".gitignore")).expect("read");
+        assert_eq!(
+            text,
+            "# old\ntarget/\nwt/\nbuild*/\ncbuild/\nscratch/\n.opencode/\n"
+        );
+        ensure_workdir_git(dir.path());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitignore")).expect("read"),
+            text
+        );
     }
 
     fn file_sink(path: &Path) -> (String, Box<dyn Write>) {

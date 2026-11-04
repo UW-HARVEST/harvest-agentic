@@ -1408,6 +1408,7 @@ dependencies = [
  "load_test_suite",
  "log",
  "proc-macro2",
+ "quality_agentic",
  "regex",
  "serde",
  "serde_json",
@@ -1452,6 +1453,7 @@ dependencies = [
  "load_test_suite",
  "load_translated_package",
  "modular_translation_llm",
+ "quality_agentic",
  "raw_source_to_cargo_llm",
  "serde",
  "serde_json",
@@ -2193,6 +2195,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quality_agentic"
+version = "0.1.0"
+dependencies = [
+ "agent_runner",
+ "full_source",
+ "harvest_core",
+ "include_dir",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "verify_fix_agentic",
 ]
 
 [[package]]

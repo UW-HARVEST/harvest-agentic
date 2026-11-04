@@ -57,12 +57,12 @@ pub enum TestPart {
     about = "Runs benchmarks by translating C projects to Rust and validating them with test suites.\n\
              The agentic pipeline is stage-composable: --agentic[=STAGES] selects which stages run,\n\
              and INPUT_DIR is whatever the first selected stage consumes (a bench test-case root for\n\
-             translate; a previous run's output root for verify/conform)."
+             translate; a previous run's output root for verify/quality/conform)."
 )]
 pub struct Args {
     /// Input directory. Its meaning follows the first stage of the run:
     /// for translate (and the non-agentic modes) it is a bench test-case root;
-    /// for verify/conform it is a previous run's output root, whose program
+    /// for verify/quality/conform it is a previous run's output root, whose program
     /// directories are self-contained snapshots (see .harvest/). With --test
     /// it is the output to re-grade: an output root, or one program snapshot.
     pub input_dir: PathBuf,
@@ -106,10 +106,11 @@ pub struct Args {
     pub modular: bool,
 
     /// Run the agentic pipeline. The optional value selects the stages, in
-    /// pipeline order (aliases: t, v, c): `--agentic=translate` freezes a
+    /// pipeline order (aliases: t, v, q, c): `--agentic=translate` freezes a
     /// translator snapshot, `--agentic=verify` resumes from one,
-    /// `--agentic=conform` refines against the external suite. Bare
-    /// `--agentic` means translate,verify.
+    /// `--agentic=quality` refactors toward safe, idiomatic Rust under the
+    /// verify stage's tests, `--agentic=conform` refines against the external
+    /// suite. Bare `--agentic` means translate,verify.
     #[arg(
         long,
         conflicts_with = "modular",
@@ -315,9 +316,13 @@ impl Args {
         if self.test_case.is_some() && matches!(stages.first(), None | Some(Stage::Translate)) {
             return Err(format!(
                 "--test-case only applies when resuming from a snapshot, i.e. when the first \
-                 stage is verify or conform (got --agentic={})",
+                 stage is not translate (got --agentic={})",
                 stages_str()
             ));
+        }
+        if has(Stage::Quality) {
+            quality_agentic::check_agent(self.agent.unwrap_or_default())
+                .map_err(|e| format!("--agentic={}: {e}", stages_str()))?;
         }
         Ok(())
     }
@@ -352,6 +357,25 @@ mod tests {
         assert_eq!(args.stages(), [Stage::Translate, Stage::Verify]);
         let args = parse(&["bench", "--agentic=c", "in", "out"]).unwrap();
         assert_eq!(args.stages(), [Stage::Conform]);
+    }
+
+    #[test]
+    fn quality_stage_resumes_and_rejects_kiro() {
+        let args = parse(&["bench", "--agentic=q,v", "in", "out"]).unwrap();
+        assert_eq!(args.stages(), [Stage::Verify, Stage::Quality]);
+        args.validate_stages(&args.stages()).unwrap();
+        let args = parse(&[
+            "bench",
+            "--agentic=quality",
+            "--test-case",
+            "tc",
+            "in",
+            "out",
+        ])
+        .unwrap();
+        args.validate_stages(&args.stages()).unwrap();
+        let args = parse(&["bench", "--agentic=t,q", "--agent", "kiro", "in", "out"]).unwrap();
+        assert!(args.validate_stages(&args.stages()).is_err());
     }
 
     #[test]

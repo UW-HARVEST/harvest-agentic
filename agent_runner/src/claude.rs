@@ -188,6 +188,10 @@ mod tests {
             "After any context compaction, you MUST first read PLAN.md and HYPOTHESES.md."
         );
         assert_eq!(
+            compaction_hint(AgentPhase::Quality),
+            "After any context compaction, you MUST first read QUALITY.md."
+        );
+        assert_eq!(
             compaction_hint(AgentPhase::Conform),
             "After any context compaction, you MUST first read CONFORM.md."
         );
