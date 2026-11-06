@@ -1404,6 +1404,7 @@ dependencies = [
  "full_source",
  "harvest-bench",
  "harvest_core",
+ "harvest_readability",
  "harvest_translate",
  "load_test_suite",
  "log",
@@ -1435,6 +1436,16 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "harvest_readability"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn",
 ]
 
 [[package]]

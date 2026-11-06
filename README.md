@@ -177,19 +177,26 @@ are rejected when that stage is not part of the run.
 
 ## Code quality metrics
 
-After the tests, the benchmark measures every translated crate for safety
-and idiomaticity, following the automated metrics of DARPA TRACTOR's test and evaluation.
+After the tests, the benchmark measures the safety and idiomaticity of every
+translated crate with three groups of counts. The first two follow the
+automated metrics of DARPA TRACTOR's test and evaluation.
 
 - **Safety: operations that require an `unsafe` context** (raw-pointer
   dereferences, calls to unsafe functions, uses of mutable or extern statics,
   union field accesses, inline assembly). DARPA counts them with a patched
   rustc; Harvest gets the same count from the stock compiler by blanking
   every `unsafe {` keyword in a copy and compiling it.
-- **Idiomaticity: rustc warnings and clippy lints** of the correctness,
+- **Clippy metrics: rustc warnings and clippy lints** of the correctness,
   suspicious, complexity, perf and style groups, counted as DARPA does: the
   levels are set on the command line, so the crate's own `#[allow]`
   attributes still apply. Also clippy's cognitive complexity of every
   function.
+- **Readability: formal redundancy** (`benchmark/readability`): `as` casts,
+  cast chains, raw pointer types in signatures and elsewhere, `extern "C"`
+  functions that are not exported, `current_block` state variables, type
+  aliases repeated with a numeric suffix, uses of C integer types, and raw
+  pointer arithmetic calls. Each is counted on its own; the last two need a
+  crate that compiles. `.harvest/readability_hits.tsv` lists every hit.
 
 ## Examples
 

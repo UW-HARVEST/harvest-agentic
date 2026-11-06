@@ -1,0 +1,17 @@
+[package]
+name = "harvest_readability"
+version = "0.1.0"
+edition = "2024"
+description = "Counts of formal redundancy in Rust source"
+license = "MIT"
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde.workspace = true
+syn = { version = "2", features = ["full", "visit"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,23 +1,28 @@
 //! Code quality of a translated crate, graded alongside its tests: safety
-//! (operations that require `unsafe`) and idiomaticity (rustc warnings,
-//! clippy lints, cognitive complexity). Both follow DARPA TRACTOR's automated
-//! metrics; see [`safety`] and [`idiom`] for the methods.
+//! (operations that require `unsafe`), clippy metrics (rustc warnings,
+//! clippy lints, cognitive complexity) and readability (counts of formal
+//! redundancy). Safety and the clippy metrics follow DARPA TRACTOR's
+//! automated metrics; see [`safety`], [`clippy`] and [`readability`] for the
+//! methods.
 //!
 //! Measurements run on scratch copies of the snapshot's package and never
-//! modify it. Each program gets `.harvest/quality.json` (the full report)
-//! and `.harvest/unsafe_ops.tsv` (one row per unsafe operation, for audit);
+//! modify it. Each program gets `.harvest/quality.json` (the full report),
+//! `.harvest/unsafe_ops.tsv` (one row per unsafe operation, for audit) and
+//! `.harvest/readability_hits.tsv` (one row per readability hit);
 //! the run root gets `quality.csv` with one headline row per program. A
 //! measurement that cannot be made is recorded as such and never affects the
 //! test grade.
 
-pub mod idiom;
+pub mod clippy;
+pub mod readability;
 mod report;
 pub mod safety;
 mod scratch;
 pub mod source;
 mod strip;
 
-use idiom::IdiomReport;
+use clippy::ClippyReport;
+use readability::ReadabilityReport;
 use safety::SafetyReport;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -26,6 +31,8 @@ use std::path::{Path, PathBuf};
 pub const REPORT_FILE: &str = "quality.json";
 /// Unsafe operations one per row, in the snapshot's `.harvest/`.
 pub const UNSAFE_OPS_FILE: &str = "unsafe_ops.tsv";
+/// Readability hits one per row, in the snapshot's `.harvest/`.
+pub const READABILITY_HITS_FILE: &str = "readability_hits.tsv";
 /// Headline row per program, at the run's output root.
 pub const SUMMARY_CSV: &str = "quality.csv";
 
@@ -104,7 +111,8 @@ pub struct QualityReport {
     /// the denominator of the per-1000-lines rates.
     pub rust_code_lines: usize,
     pub safety: Outcome<SafetyReport>,
-    pub idiomaticity: Outcome<IdiomReport>,
+    pub clippy: Outcome<ClippyReport>,
+    pub readability: ReadabilityReport,
 }
 
 impl QualityReport {
@@ -116,10 +124,11 @@ impl QualityReport {
 
 /// Measures the package of the snapshot program directory `program_dir`.
 pub fn measure(program_dir: &Path) -> QualityReport {
-    let (rust_code_lines, safety, idiomaticity) = match prepare(program_dir) {
-        Err(e) => (0, Err(e.clone()), Err(e)),
+    let (rust_code_lines, safety, clippy, syntax, types) = match prepare(program_dir) {
+        Err(e) => (0, Err(e.clone()), Err(e.clone()), Err(e.clone()), Err(e)),
         Ok((scratch, pkg)) => {
-            let idiomaticity = idiom::measure(&scratch, &pkg);
+            let clippy = clippy::measure(&scratch, &pkg);
+            let types = readability::types(&scratch, &pkg);
             // Only the files the crate compiles count: the package directory
             // also holds files it does not, such as agent tooling.
             let files = pkg.compiled_sources().and_then(|paths| {
@@ -136,18 +145,24 @@ pub fn measure(program_dir: &Path) -> QualityReport {
                 Ok(files) => (
                     files.iter().map(|f| f.code_lines).sum(),
                     safety::measure(&scratch, &pkg, &files),
-                    idiomaticity,
+                    clippy,
+                    Ok(readability::syntax(&files)),
+                    types,
                 ),
-                Err(e) => (0, Err(e), idiomaticity),
+                Err(e) => (0, Err(e.clone()), clippy, Err(e), types),
             }
         }
     };
     QualityReport {
-        schema_version: 1,
+        schema_version: 2,
         rustc: scratch::rustc_version(program_dir),
         rust_code_lines,
         safety: safety.into(),
-        idiomaticity: idiomaticity.into(),
+        clippy: clippy.into(),
+        readability: ReadabilityReport {
+            syntax: syntax.into(),
+            types: types.into(),
+        },
     }
 }
 
@@ -172,7 +187,7 @@ fn prepare(program_dir: &Path) -> Result<(scratch::ScratchArea, scratch::Package
 /// run's outcome.
 pub fn grade_programs(program_dirs: &[PathBuf], csv_path: Option<&Path>) {
     log::info!("\n{}", "=".repeat(80));
-    log::info!("Code quality (safety and idiomaticity)");
+    log::info!("Code quality (safety, clippy metrics, readability)");
     log::info!("{}", "=".repeat(80));
     let mut rows = Vec::new();
     for dir in program_dirs {
@@ -218,11 +233,15 @@ mod tests {
     #[test]
     fn rates_are_per_thousand_code_lines() {
         let r = QualityReport {
-            schema_version: 1,
+            schema_version: 2,
             rustc: None,
             rust_code_lines: 2000,
             safety: Outcome::NotRun { reason: "x".into() },
-            idiomaticity: Outcome::NotRun { reason: "x".into() },
+            clippy: Outcome::NotRun { reason: "x".into() },
+            readability: ReadabilityReport {
+                syntax: Outcome::NotRun { reason: "x".into() },
+                types: Outcome::NotRun { reason: "x".into() },
+            },
         };
         assert_eq!(r.per_kloc(500), Some(250.0));
         let empty = QualityReport {
@@ -238,6 +257,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let report = measure(dir.path());
         assert!(matches!(report.safety, Outcome::NotRun { .. }));
-        assert!(matches!(report.idiomaticity, Outcome::NotRun { .. }));
+        assert!(matches!(report.clippy, Outcome::NotRun { .. }));
+        assert!(matches!(report.readability.syntax, Outcome::NotRun { .. }));
+        assert!(matches!(report.readability.types, Outcome::NotRun { .. }));
     }
 }

@@ -1,5 +1,6 @@
-//! Idiomaticity: rustc warnings and clippy lints, DARPA TRACTOR's automated
-//! idiomaticity metric, and clippy's cognitive complexity per function.
+//! Clippy metrics: rustc warnings and clippy lints, DARPA TRACTOR's
+//! automated idiomaticity metric, and clippy's cognitive complexity per
+//! function.
 //!
 //! DARPA runs clippy once per lint group (correctness, suspicious,
 //! complexity, perf, style) with `-A clippy::all` and the group switched on,
@@ -45,28 +46,28 @@ pub struct ComplexityStats {
     pub histogram: BTreeMap<usize, usize>,
 }
 
-/// Idiomaticity summary of one package.
+/// Clippy metrics of one package.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct IdiomReport {
+pub struct ClippyReport {
     pub lints: LintCounts,
     pub cognitive_complexity: ComplexityStats,
 }
 
 /// Measures `pkg`, which it compiles but does not modify.
-pub fn measure(scratch: &ScratchArea, pkg: &Package) -> Result<IdiomReport, MeasureError> {
+pub fn measure(scratch: &ScratchArea, pkg: &Package) -> Result<ClippyReport, MeasureError> {
     let tables = LintTables::load(pkg)?;
     let mut args = vec!["-A".to_owned(), "clippy::all".to_owned()];
     for group in DARPA_GROUPS {
         args.extend(["-W".to_owned(), format!("clippy::{group}")]);
     }
-    Ok(IdiomReport {
-        lints: count_lints(pkg, &tables, clippy(pkg, &args, None)?)?,
+    Ok(ClippyReport {
+        lints: count_lints(pkg, &tables, run(pkg, &args, None)?)?,
         cognitive_complexity: cognitive_complexity(pkg, scratch)?,
     })
 }
 
 /// Runs `cargo clippy` over the package's default targets.
-fn clippy(
+pub(super) fn run(
     pkg: &Package,
     clippy_args: &[String],
     conf_dir: Option<&Path>,
@@ -107,6 +108,17 @@ fn count_lints(
             }
         }
     }
+    check_run(pkg, &run, errors)?;
+    Ok(counts)
+}
+
+/// The failure of a clippy run, if any: the compile errors found in its
+/// diagnostics, or a cargo failure that left no diagnostics.
+pub(super) fn check_run(
+    pkg: &Package,
+    run: &super::scratch::CargoRun,
+    errors: Vec<String>,
+) -> Result<(), MeasureError> {
     if !errors.is_empty() {
         return Err(MeasureError::DoesNotCompile(errors));
     }
@@ -117,7 +129,7 @@ fn count_lints(
             run.stderr
         )));
     }
-    Ok(counts)
+    Ok(())
 }
 
 /// What a coded diagnostic of a clippy run counts as.
@@ -163,7 +175,7 @@ fn cognitive_complexity(
     )
     .map_err(MeasureError::not_run("write clippy config"))?;
     let args = ["-A", "clippy::all", "-W", "clippy::cognitive_complexity"].map(str::to_owned);
-    let run = clippy(pkg, &args, Some(&conf_dir))?;
+    let run = run(pkg, &args, Some(&conf_dir))?;
     let values: Vec<usize> = run
         .messages
         .iter()

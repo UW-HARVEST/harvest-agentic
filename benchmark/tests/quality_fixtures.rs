@@ -89,7 +89,7 @@ fn a_lint_the_library_denies_does_not_hide_the_binary() {
     let s = m.safety.as_result().unwrap();
     assert_eq!(s.unsafe_ops, 1);
     assert_eq!(s.ops[0].file, "src/helper.rs");
-    let lints = &m.idiomaticity.as_result().unwrap().lints;
+    let lints = &m.clippy.as_result().unwrap().lints;
     assert_eq!(lints.clippy_by_lint["needless_return"], 1);
 }
 
@@ -132,7 +132,7 @@ pub fn branchy(a: u32) -> u32 { if a > 1 { if a > 2 { 3 } else { 4 } } else { 5 
     );
 
     let plain = measure(&plain);
-    let p = plain.idiomaticity.as_result().unwrap();
+    let p = plain.clippy.as_result().unwrap();
     assert_eq!(p.lints.clippy_by_lint["needless_return"], 1);
     assert_eq!(p.lints.clippy_by_lint["approx_constant"], 1);
     assert_eq!(p.lints.clippy_by_group["style"], 1);
@@ -141,7 +141,7 @@ pub fn branchy(a: u32) -> u32 { if a > 1 { if a > 2 { 3 } else { 4 } } else { 5 
     assert_eq!(p.lints.rustc_by_lint["unused_variables"], 1);
 
     let silenced = measure(&silenced);
-    let s = silenced.idiomaticity.as_result().unwrap();
+    let s = silenced.clippy.as_result().unwrap();
     assert_eq!(s.lints.clippy_lints, 0);
     assert_eq!(s.lints.rustc_warnings, 0);
 
@@ -166,7 +166,7 @@ fn a_crate_that_does_not_compile_is_reported_not_counted() {
         "{:?}",
         m.safety
     );
-    assert!(matches!(m.idiomaticity, Outcome::DoesNotCompile { .. }));
+    assert!(matches!(m.clippy, Outcome::DoesNotCompile { .. }));
 }
 
 #[test]
@@ -232,11 +232,7 @@ fn a_relative_program_path_measures_like_an_absolute_one() {
     let m = measure(&root);
     assert_eq!(m.rust_code_lines, 3, "only the compiled lib.rs");
     assert_eq!(
-        m.idiomaticity
-            .as_result()
-            .unwrap()
-            .cognitive_complexity
-            .functions,
+        m.clippy.as_result().unwrap().cognitive_complexity.functions,
         1
     );
     assert_eq!(m.safety.as_result().unwrap().unsafe_ops, 0);

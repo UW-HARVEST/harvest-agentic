@@ -1,7 +1,8 @@
 //! Static reading of a crate's Rust source: how many code lines each file
 //! holds, the rewrite that exposes their unsafe operations, where
-//! each function body lies, and the unsafe operations the compiler generates
-//! that no source rewrite can expose.
+//! each function body lies, the unsafe operations the compiler generates
+//! that no source rewrite can expose, and the syntax items of the readability
+//! counts.
 //!
 //! Everything here is lexical or syntactic (`proc-macro2` tokens, `syn`
 //! items); nothing compiles. [`analyze`] lexes each file once and parses it
@@ -10,6 +11,7 @@
 //! can be matched against compiler messages directly.
 
 use super::strip::{strip_unsafe_blocks, Stripped};
+use harvest_readability::{is_export_attr, FileScan};
 use proc_macro2::{TokenStream, TokenTree};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -28,6 +30,9 @@ pub struct AnalyzedFile {
     /// stay unattributed rather than being guessed).
     pub fn_index: FnIndex,
     pub compiler_generated: CompilerGenerated,
+    /// The syntax items of the readability counts; None when the file does
+    /// not parse.
+    pub readability: Option<FileScan>,
 }
 
 /// Lexes `text`, the file at `rel_path`, once, parses the tokens once, and
@@ -43,6 +48,7 @@ pub fn analyze(rel_path: String, text: &str) -> AnalyzedFile {
                 stripped: Err(e.to_string()),
                 fn_index: FnIndex::default(),
                 compiler_generated: CompilerGenerated::default(),
+                readability: None,
             }
         }
     };
@@ -53,12 +59,14 @@ pub fn analyze(rel_path: String, text: &str) -> AnalyzedFile {
     // The rewrite edits the original text: blanking keeps every offset.
     let stripped = strip_unsafe_blocks(text, tokens.clone());
     let mut fn_index = FnIndex::default();
+    let mut readability = None;
     if let Ok(ast) = syn::parse2::<syn::File>(tokens) {
         ItemScan {
             fn_index: &mut fn_index,
             found: &mut compiler_generated,
         }
         .visit_file(&ast);
+        readability = Some(harvest_readability::scan_file(&rel_path, &ast));
     }
     AnalyzedFile {
         rel_path,
@@ -66,6 +74,7 @@ pub fn analyze(rel_path: String, text: &str) -> AnalyzedFile {
         stripped: Ok(stripped),
         fn_index,
         compiler_generated,
+        readability,
     }
 }
 
@@ -191,21 +200,6 @@ impl<'ast> Visit<'ast> for ItemScan<'_> {
             self.found.derived_partial_eq += 1;
         }
         syn::visit::visit_item_enum(self, e);
-    }
-}
-
-/// `#[no_mangle]`, `#[export_name = "…"]`, `#[unsafe(no_mangle)]`,
-/// `#[unsafe(export_name = "…")]`.
-fn is_export_attr(attr: &syn::Attribute) -> bool {
-    let is_export = |path: &syn::Path| path.is_ident("no_mangle") || path.is_ident("export_name");
-    match &attr.meta {
-        syn::Meta::Path(p) => is_export(p),
-        syn::Meta::NameValue(nv) => is_export(&nv.path),
-        syn::Meta::List(list) if list.path.is_ident("unsafe") => {
-            matches!(list.tokens.clone().into_iter().next(),
-                     Some(TokenTree::Ident(id)) if id == "no_mangle" || id == "export_name")
-        }
-        syn::Meta::List(_) => false,
     }
 }
 
