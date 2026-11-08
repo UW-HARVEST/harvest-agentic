@@ -27,7 +27,8 @@ Your task:
    fix the Rust code in src/ and re-run until the test passes
 7. Keep going until all public functions match
 8. If the project has a main binary, run both the C binary and the Rust binary
-   with the same inputs and compare their stdout byte-for-byte. Fix any differences.
+   with the same argv, stdin and input files, and compare their stdout, stderr,
+   exit status and written files byte-for-byte. Fix any differences.
 9. Compare `nm -D` on the C .so and the Rust .so. Every symbol the C .so
    exports, the Rust .so must also export with the exact same name. This
    includes symbols created by preprocessor macros. If the C .so exports it,

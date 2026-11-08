@@ -22,6 +22,18 @@ under test has them:
   different code paths. Give the parameter a domain (below) so the fuzzer varies it and
   the coverage guidance can drive each branch.
 - **Any other parameter that is fuzzable** — any additional inputs that the API consumes and that can vary in a meaningful way.
+- **The executable's argv, stdin, and input files** — build a `harvest::Run`
+  from the property's parameters and compare `harvest::RunBoth`. The child
+  processes give the fuzzer no coverage feedback, so this property generates
+  around your seeds: give it good seeds and vocabulary domains (option names
+  times values, commands times arguments), and vary argv as well as stdin.
+  Keep two times `Run::timeout_secs` below the per-input time limit. Leave
+  out an input only when it has side effects outside the working directory,
+  has nondeterministic output, or makes the C run time out. Do not leave out
+  inputs only because they can be slow: the C timeout already catches them.
+  A Rust run that times out when the C run does not is a divergence. To
+  reach library code that only the executable registers, escape arbitrary
+  bytes into its input syntax (for example a quoted literal).
 
 Pick the mechanism per area of the API. Broad valid-path areas belong in
 `FUZZ_TEST` properties, because the fuzzer explores them far beyond what

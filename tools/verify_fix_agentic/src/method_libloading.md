@@ -27,8 +27,8 @@ Then do the actual verification:
    assert outputs match byte-for-byte.
 5. Cover every row of the surface files from Step 2. Each `CONFIGS.md` row
    gets a differential test, and each `ERRORS.md` row gets a rejection test.
-   The rejection test asserts that both sides return the same error code or
-   sentinel value, not only that both sides fail. Also test the generic
+   The rejection test asserts that both sides give the same error code,
+   sentinel value, or exit status and message, not only that both sides fail. Also test the generic
    boundaries from Step 2: null pointers, zero and oversized lengths, values
    one step past a valid range, and enum arguments with no valid variant.
 6. Run `cargo test` and investigate any mismatches. Every time a test exposes a
@@ -36,11 +36,12 @@ Then do the actual verification:
 7. When you find a Rust function that produces different output than C, fix the
    Rust code in `src/` and re-run until the test passes. Update the matching
    hypothesis to `fixed` after the Edit.
-8. Keep going until all public functions match.
-9. If the project has a main binary, run both the C binary and the Rust binary
-   with the same inputs and compare their stdout byte-for-byte. Fix any
-   differences.
-10. Re-run the symbol comparison from `SYMBOLS.md` after your last change. The
-    diff must be empty before you finish. When you resolve a missing symbol,
-    follow the Step 2 rule: add the export if the implementation exists, or
-    translate the missing C source. Never add a stub.
+8. For the executable, write tests that run the C executable (from the same
+   CMake build) and the Rust `driver` on the same argv, stdin and input files,
+   each in a fresh working directory at the same path, and compare stdout,
+   stderr, exit status and written files byte-for-byte.
+9. Keep going until every public entry point matches.
+10. Re-run the comparison from `SYMBOLS.md` after your last change. The
+    diff must be empty before you finish. When you resolve a missing entry,
+    follow the Step 2 rule: add the export or the wiring if the implementation
+    exists, or translate the missing C source. Never add a stub.

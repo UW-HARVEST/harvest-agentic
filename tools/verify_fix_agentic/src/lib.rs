@@ -819,6 +819,8 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         ));
         assert!(cml.contains("\"${HARVEST_C_SRC}/src/*.c\""));
         assert!(cml.contains("GTest::gtest_main"));
+        // GoogleTest's main() must win over a main() in the C sources.
+        assert!(cml.find("GTest::gtest_main").unwrap() < cml.find("PRIVATE c_under_test").unwrap());
         assert!(!cml.to_ascii_lowercase().contains("fuzz"));
         assert!(!workspace.join("verify_env/build_fuzz.sh").exists());
         assert!(!workspace.join("verify_env/run_fuzz.sh").exists());

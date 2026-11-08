@@ -49,6 +49,8 @@ target_compile_options(c_under_test PRIVATE -w)
 add_executable(verification_tests verification_tests.cc)
 target_include_directories(verification_tests PRIVATE
      "${HARVEST_C_SRC}/include")
-target_link_libraries(verification_tests PRIVATE c_under_test ${CMAKE_DL_LIBS})
+# The test framework links first, so its main() is the one the linker takes,
+# also when a C source file defines main() for the program's executable.
 {TEST_LINK}
+target_link_libraries(verification_tests PRIVATE c_under_test ${CMAKE_DL_LIBS})
 gtest_discover_tests(verification_tests)

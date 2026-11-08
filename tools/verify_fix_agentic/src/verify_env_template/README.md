@@ -1,19 +1,26 @@
 # verify_env — differential verification environment
 
 A ready-to-use GoogleTest environment for comparing the original C reference
-against the translated Rust. The C reference (`inputs/c_src`) is compiled into the
-test binary; the translated Rust cdylib is loaded as a black box via `dlopen`.
+against the translated Rust, for each kind of public surface the program has:
+
+- **Library**: the C reference (`inputs/c_src`) is compiled into the test
+  binary; the translated Rust `.so` is loaded as a black box via `dlopen`.
+- **Executable**: the C executable and the Rust executable run as child
+  processes on the same input.
 
 ## Files
 
 - `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `inputs/c_src/src/*.c`
-  into the test binary, links, and registers tests. Normally unedited; the one
-  spot you may need to touch is the `target_compile_definitions(c_under_test ...)`
-  line if the C reference needs build flags this scaffold did not pick up.
+  into the test binary, links, and registers tests. Normally unedited; the
+  spots you may need to touch are the `target_compile_definitions(c_under_test ...)`
+  line if the C reference needs build flags this scaffold did not pick up, and
+  `C_UNDER_TEST_SOURCES` if a C file (for example the one with `main()`) does
+  not belong to the library.
 - `verification_tests.cc` — the test file you write. Declare the C functions in
   the `extern "C"` block; resolve the Rust ones via `harvest::RustLib`.
-- `harvest_diff.h` — differential-comparison helpers (buffer fill pattern,
-  normalized observation struct).
+- `harvest_diff.h` — differential-comparison helpers: buffer fill pattern and
+  normalized observation struct for library calls; `Run` and `RunBoth` for
+  executable runs.
 - `rust_lib.h` — loads the translated `.so` (path from `RUST_LIB_PATH`) with
   `RTLD_LOCAL` and resolves symbols.
 - `build.sh` — build in unit-test mode.
@@ -24,27 +31,44 @@ test binary; the translated Rust cdylib is loaded as a black box via `dlopen`.
 
 ## Build and run
 
-Run these commands from the translated project directory:
+Run these commands from the translated project directory. Skip the lines for
+a kind of surface the program does not have.
 
 ```bash
-# 1. Build the translated Rust cdylib:
+# 1. Build the translated Rust (the .so and the `driver` executable):
 cargo build --release
-#    -> target/release/lib<crate>.so
+#    -> target/release/lib<crate>.so, target/release/driver
 
-# 2. Build the test binary:
+# 2. Build the C reference executable with the C project's own build. Turn on
+#    the CMake option that builds the executable if it is off by default:
+cmake -S inputs/c_src -B verify_env/build-c-bin -DCMAKE_BUILD_TYPE=Release
+cmake --build verify_env/build-c-bin -j2
+
+# 3. Build the test binary:
 ./verify_env/build.sh
 
-# 3. Run the tests, pointing RUST_LIB_PATH at the built cdylib:
-RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" ./verify_env/run_tests.sh
+# 4. Run the tests, pointing the variables at the built artifacts:
+RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
+C_BIN_PATH="$(pwd)/verify_env/build-c-bin/<executable>" \
+RUST_BIN_PATH="$(pwd)/target/release/driver" \
+  ./verify_env/run_tests.sh
 
 # GoogleTest flags go after the script name:
-RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
-  ./verify_env/run_tests.sh --gtest_filter='Suite.Case*'
+RUST_LIB_PATH=... ./verify_env/run_tests.sh --gtest_filter='Suite.Case*'
 ```
 
-The C and Rust sides export the same public symbol names; that is why the C side
-is linked statically and the Rust side is reached only through `dlopen`/`dlsym`.
-A symbol the Rust `.so` fails to export shows up immediately as a failed lookup.
+The C and Rust libraries export the same public symbol names; that is why the C
+side is linked statically and the Rust side is reached only through
+`dlopen`/`dlsym`. A symbol the Rust `.so` fails to export shows up immediately
+as a failed lookup.
+
+`harvest::RunBoth(run)` runs both executables on the same `harvest::Run`
+(argv, stdin, input files) and returns both results: exit status or signal,
+stdout, stderr, and the output files that you name. The two runs use the same
+working directory and `HOME` paths, emptied before each run, so paths in the
+output are the same. They also get a fixed environment (`LC_ALL=C`,
+`TZ=UTC`) and the same `argv[0]`. A test that uses `RunBoth` fails when
+`C_BIN_PATH` or `RUST_BIN_PATH` is not set.
 
 ## Memory and time limits
 

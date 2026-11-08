@@ -5,6 +5,16 @@ ground truth — the Rust code must produce byte-identical results.
 - `inputs/c_src` contains the original C source code
 - `src/` contains the Rust translation
 
+The public surface of the program has one or both of two kinds, and you verify
+each kind that it has in the same way:
+
+- **Library**: the exported functions. A call's inputs are its arguments; its
+  results are the return value, the output buffers, and `errno`.
+- **Executable**: the program that a C file with `main()` builds (the Rust
+  executable is `driver`). A run's inputs are argv, stdin, input files, and
+  the environment; its results are stdout, stderr, the exit status, and the
+  files that it writes.
+
 The concrete mechanism you use to compare C against Rust — how you build each
 side and where you write the comparison — is described in **Step 3** below.
 Everything before it (PLAN.md, the HYPOTHESES.md discipline, the surface
@@ -60,7 +70,8 @@ These rules govern verification. They must survive every compaction unchanged.
 
 ### Ground truth
 - The C code is the authoritative reference. Rust outputs must match C
-  byte-for-byte (binary stdout AND every public function output).
+  byte-for-byte on the whole public surface: every library call result, and
+  every executable run result (stdout, stderr, exit status, written files).
 - If C and Rust diverge, fix Rust. NEVER modify C.
 
 ### Cargo features (FRAMEWORK CONTRACT — also enforced at the final build)
@@ -91,14 +102,15 @@ These rules govern verification. They must survive every compaction unchanged.
 - `SYMBOLS.md`, `CONDITIONALS.md`, `ERRORS.md`, and `CONFIGS.md` are the test
   plan. Every `CONFIGS.md` row gets a differential test. Every `ERRORS.md`
   row gets a rejection test that asserts both sides return the same error
-  code or sentinel value.
+  code, sentinel value, or exit status and message.
 - Every region in `CONDITIONALS.md` is settled: conditional compilation in
   Rust, or a resolution to one branch with recorded evidence.
 - An untested row or an inactive-branch judgment carries evidence: an
   experiment, a definition-site grep, or a premise in `CONDITIONALS.md`.
   Reading alone is not evidence.
-- Verification is complete only when the `nm -D` symbol diff is empty, every
-  row has a passing test under every listed configuration, every
+- Verification is complete only when `SYMBOLS.md` has no open missing entry
+  (for the library, the `nm -D` symbol diff is empty), every row has a
+  passing test under every listed configuration, every
   `CONDITIONALS.md` region is settled, and the final cross-review finds no
   gap. Green tests on inputs you picked yourself are not completion.
 
@@ -190,7 +202,10 @@ turn looks like a summary rather than concrete work. In that case:
 
 Before you write any test, produce four files in the working directory.
 Together they are the test plan: tests cover their rows, and the completion
-gate checks them. Build the C reference and the Rust `.so` first. Generate
+gate checks them. Build the C reference and the Rust artifacts first: the
+library `.so` and the executable, for each kind the program has. Run the two
+executables on the same few inputs: such a smoke test finds gross divergences
+before any test exists. Generate
 each file with a separate sub-agent. Each sub-agent reads `inputs/c_src` and the
 built artifacts, writes exactly one file, and gets the working-directory
 boundary rules from the Invariants section.
@@ -199,15 +214,18 @@ Dispatch in two waves. Dispatch `SYMBOLS.md` and `CONDITIONALS.md` in
 parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
 `CONFIGS.md`, and the cfg completeness check in parallel.
 
-1. `SYMBOLS.md`: the symbol surface. Run `nm -D` on both `.so` files. List
-   every public symbol of the C `.so`, and mark every symbol the Rust `.so`
-   does not export. For each missing symbol, record which case holds: the
-   implementation exists in Rust but is not exported, or the C source was
-   never translated. This sub-agent reports the diff. It does not change any
-   code. When the diff is not empty, dispatch a separate sub-agent to resolve
-   it (add the export, or translate the missing C source). Do not stub a
-   missing symbol to empty the diff. A stub that claims behavior is worse
-   than a missing symbol.
+1. `SYMBOLS.md`: the entry-point surface. For the library, run `nm -D` on
+   both `.so` files, list every public symbol of the C `.so`, and mark every
+   symbol the Rust `.so` does not export. For the executable, list every
+   option, subcommand, and in-program command from the C argument parser and
+   help text, and mark every one the Rust executable does not accept. For
+   each missing entry, record which case holds: the implementation exists in
+   Rust but is not reachable (not exported, not wired to the parser), or the
+   C source was never translated. This sub-agent reports the diff. It does
+   not change any code. When the diff is not empty, dispatch a separate
+   sub-agent to resolve it (add the export or the wiring, or translate the
+   missing C source). Do not stub a missing entry to empty the diff. A stub
+   that claims behavior is worse than a missing entry.
 2. `CONDITIONALS.md`: the conditional-compilation surface. Collect every
    macro that `#if`, `#else` and other variants reference in `inputs/c_src`, deduplicated. Skip
    macros used only in system headers. Classify each macro:
@@ -234,12 +252,13 @@ parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
    the macro at build time. Do not decide that a branch is inactive from
    reading alone.
 3. `ERRORS.md`: the rejection surface of the C code. Grep the C source for
-   every distinct way a function rejects an input: error-return macros,
+   every distinct way an entry point rejects an input: error-return macros,
    `return NULL`, negative sentinels, error enums, `assert`, range checks,
-   null checks, and size limits. Write one row per distinct rejection:
+   null checks, size limits, and the executable's error messages and exit
+   statuses. Write one row per distinct rejection:
 
-   | # | function | trigger (the exact invalid input) | expected C result |
-   |---|----------|------------------------------------|-------------------|
+   | # | entry point | trigger (the exact invalid input) | expected C result |
+   |---|-------------|------------------------------------|-------------------|
 
    Derive each row from what the C code checks. Do not invent rows and do not
    copy them from documentation alone. Three error branches in one function
@@ -250,7 +269,7 @@ parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
 4. `CONFIGS.md`: the configuration surface. It is the mirror of `ERRORS.md`
    for valid inputs. Enumerate the axes the C code branches on. Use the
    feature-class macros from `CONDITIONALS.md` as configuration axes. Cover
-   every option, mode, or flag the public API can set. Cover every input
+   every option, mode, or flag that the public API or the command line can set. Cover every input
    shape the code special-cases: size classes, empty, one, many, boundary
    values, element types. Cover every public entry point, including the
    lowest-level ones and not only the convenience wrappers. Write one row per
@@ -272,7 +291,9 @@ the generic boundaries even when no row lists them: null pointers, zero and
 oversized lengths, values one step past a valid range, and enum arguments
 with no valid variant. The C code takes any int where an API declares an
 enum, and answers such calls through its default or error branch. Rust must
-answer the same way.
+answer the same way. For the executable, the generic boundaries are no
+arguments, unknown options, missing and extra option values, empty stdin,
+and input without a final newline.
 
 A row you cannot test stays in the table, unchecked, with a note. The note
 carries evidence: an experiment that did not trigger the row, or a premise
@@ -292,8 +313,8 @@ Work through this checklist before you declare verification complete. Passing
 tests on the inputs you happened to pick are not completion. Re-read this
 list after your last fix.
 
-- [ ] The `nm -D` symbol diff between the C `.so` and the Rust `.so` is empty.
-      `SYMBOLS.md` has no open missing-symbol rows.
+- [ ] `SYMBOLS.md` has no open missing-entry rows. For the library, the
+      `nm -D` symbol diff between the C `.so` and the Rust `.so` is empty.
 - [ ] A review sub-agent compared `HYPOTHESES.md`, the test files, and the
       four surface files. It checked that every row has a test, that every
       test maps back to a row or a logged hypothesis, that every
