@@ -127,8 +127,26 @@ pub(super) fn log_report(r: &QualityReport) {
             .join(", "),
         Err(why) => why,
     };
+    let groups = [&r.readability.syntax, &r.readability.types];
+    let measured: Vec<usize> = groups
+        .iter()
+        .filter_map(|o| o.as_result().ok())
+        .map(|c| c.items.values().sum())
+        .collect();
+    let total = match measured.len() {
+        0 => String::new(),
+        n => {
+            let total = measured.iter().sum();
+            let partial = if n < groups.len() {
+                ", items not measured excluded"
+            } else {
+                ""
+            };
+            format!("{total} in total ({}{partial}); ", rate(r.per_kloc(total)))
+        }
+    };
     log::info!(
-        "  Readability: {}; needing types: {}",
+        "  Readability: {total}{}; needing types: {}",
         line(&r.readability.syntax),
         line(&r.readability.types)
     );
