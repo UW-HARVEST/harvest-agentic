@@ -104,12 +104,12 @@ When in doubt, re-read this section.
   exists, it lists the options and their values under `configurable_variables`.
   Example: `{"WORD_SIZE": ["32", "64"], "ENABLE_EXTRA": [true, false]}` gives
   the features `WORD_SIZE_32`, `WORD_SIZE_64` and `ENABLE_EXTRA`.
-- The harness builds the default configuration with plain
-  `cargo build --release`: the `default` features MUST select the C default
-  configuration (the CMake defaults, or the `test` preset of
-  `CMakePresets.json` when there is one). It builds every other configuration
-  with `cargo build --release --no-default-features --features <list>`, the
-  list naming the options set in that configuration.
+- The translation MUST be correct in every configuration: every value of
+  every option.
+- The `default` features select the CMake defaults; the harness can replace
+  their option features. Every other configuration is built with
+  `cargo build --release --no-default-features --features <list>`, one
+  feature for each option it sets.
 - The default build and every configuration build must compile.
 
 ### Cargo manifest target names

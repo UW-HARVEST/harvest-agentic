@@ -9,7 +9,7 @@ ground truth — the Rust code must produce byte-identical results.
   to understand the build system. Build it with:
   ```
   cmake -S inputs/c_src -B scratch/c-build \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
   cmake --build scratch/c-build
   ```
 - Find the resulting .so files in scratch/c-build
@@ -37,13 +37,13 @@ Your task:
 Add `libloading = "0.8"` to [dev-dependencies] in Cargo.toml.
 Do NOT modify anything in inputs/c_src.
 
-If configurations are listed below, you MUST verify each one:
-- Clean and rebuild C with the listed cmake flags
-- Rebuild Rust with the matching Cargo features: the default features for the default
-  configuration, `--no-default-features --features <list>` for any other
+If the C project has build options (`inputs/c_src/configuration.json` lists them and
+their values when it exists), the Rust must be correct for every value of every option.
+Verify each configuration you can:
+- Clean and rebuild C with the option values as cmake `-D` flags
+- Rebuild Rust with `--no-default-features --features <list>`, the features matching
+  the option values. Do not rely on the `default` features: the harness can change them
 - Re-run integration tests and fix any mismatches before moving to the next configuration
-
-{ALL_CONFIGURATIONS}
 
 IMPORTANT: Use timeouts for all commands. No single build or test command should
 run longer than 600 seconds. If a test takes too long, skip it and move on to

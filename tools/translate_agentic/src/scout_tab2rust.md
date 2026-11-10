@@ -10,8 +10,8 @@ Scout 1 may write in `shared/tab2rust/`. The translation sub-agents use the buil
 
 1. Build:
    `python3 inputs/agent_skills/tab2rust/scripts/tab2rust.py build inputs/c_src --out shared/tab2rust/c-build`.
-   If the build fails, add the CMake options of `inputs/c_src/CMakePresets.json` or
-   `inputs/c_src/CMakeLists.txt` as `-DNAME=VALUE` and try again. If it fails again, skip the rest
+   If the build fails, add the CMake options of `inputs/c_src/CMakeLists.txt` as
+   `-DNAME=VALUE` and try again. If it fails again, skip the rest
    of this part and give the error in your reply.
 2. Detect:
    `python3 inputs/agent_skills/tab2rust/scripts/tab2rust.py detect inputs/c_src --binary <library from step 1> --json shared/tab2rust/report.json > shared/tab2rust/report.txt`.

@@ -9,8 +9,8 @@ mod stats;
 use crate::cli::{Args, TestHarness, TestPart};
 use crate::error::HarvestResult;
 use crate::harness::{
-    build_config, cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, prepare_run_dir,
-    validate_binary_output, TestCase,
+    build_config, cleanup_benchmarks, default_config, parse_benchmark_dir, parse_test_vectors,
+    prepare_run_dir, validate_binary_output, TestCase,
 };
 use crate::io::{
     collect_program_dirs, ensure_output_directory, log_failing_programs, log_found_programs,
@@ -465,9 +465,6 @@ fn run_test_validation(
                 let error = format!("Test case {} failed: {}", test_case.filename, e);
                 error_messages.push(error);
                 log::info!("❌ Test case {} failed: {}", test_case.filename, e);
-                test_case
-                    .write_to_disk(crate_dir)
-                    .expect("failed to write test case to disk");
             }
         }
     }
@@ -682,6 +679,13 @@ fn benchmark_single_program(
     // saw, re-emitted from the IR, so grading never depends on the bench
     // directory still being in place.
     let graded_suite_root = stage_manifest::suite_dir(&output_dir);
+    if let Err(e) = default_config::select_graded_default(&output_dir) {
+        let error = format!("Failed to select the default configuration: {e}");
+        log::error!("{error}");
+        result.rust_build_success = false;
+        result.error_message = Some(error);
+        return result;
+    }
     let validation = match select_validation_harness(test_harness, &graded_suite_root) {
         Ok(v) => v,
         Err(error) => {
@@ -924,6 +928,12 @@ fn test_existing_program(
     };
     result.total_tests = test_cases.len();
 
+    if let Err(e) = default_config::select_graded_default(program_dir) {
+        let error = format!("Failed to select the default configuration: {e}");
+        log::error!("{error}");
+        result.error_message = Some(error);
+        return result;
+    }
     let validation = match select_validation_harness(test_harness, &suite_root) {
         Ok(v) => v,
         Err(error) => {

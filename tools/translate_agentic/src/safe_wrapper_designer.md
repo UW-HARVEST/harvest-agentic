@@ -18,8 +18,8 @@ Rules:
 - Do not read the body of a data initializer of more than about 50 lines.
 - If `scout/safe_wrapper/DESIGN.md` exists, read it first, and add to it.
 - Write a large file in parts. Each write must stay below the output token limit.
-- First, build the C library with cmake in `scratch/sw-build/`, with the options of
-  `inputs/c_src/CMakePresets.json`. Write `nm -D --defined-only` of the library to
+- First, build the C library with cmake in `scratch/sw-build/`, with the CMake defaults.
+  Write `nm -D --defined-only` of the library to
   `scout/safe_wrapper/EXPORTS.txt`. The exported functions are the functions in this file.
 - This run makes one crate. The three layers of section 1 are its modules `api`, `wrap` and
   `internal`. Where this document says "crate" for a layer, read "module".

@@ -9,7 +9,7 @@ understand the build system, then:
 
 ```
 cmake -S inputs/c_src -B scratch/c-build \
-  -DCMAKE_POSITION_INDEPENDENT_CODE=ON {CMAKE_BUILD_FLAGS} && \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
 cmake --build scratch/c-build
 ```
 

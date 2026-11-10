@@ -164,6 +164,29 @@ impl CargoToml {
         self.path.parent().unwrap_or(Path::new("."))
     }
 
+    /// The names declared in `[features]`, `default` included.
+    pub fn feature_names(&self) -> Vec<String> {
+        self.doc
+            .get("features")
+            .and_then(Item::as_table_like)
+            .map(|t| t.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The entries of `[features].default`; empty when there is none.
+    pub fn default_features(&self) -> Vec<String> {
+        self.doc
+            .get("features")
+            .and_then(|f| f.get("default"))
+            .and_then(Item::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Removes all `[[bin]]` sections.
     pub fn remove_bin(&mut self) {
         self.doc.remove("bin");
@@ -285,8 +308,7 @@ impl CargoToml {
         }
     }
 
-    /// Sets `[features].default` to the given list. Reserved for multi-config support.
-    #[allow(dead_code)]
+    /// Sets `[features].default` to the given list, creating `[features]` if needed.
     pub fn set_default_features(&mut self, features: &[String]) {
         let feat = self
             .doc
@@ -387,6 +409,17 @@ mod tests {
         let f = write_temp("[package]\nname = \"hello\"\n");
         let cargo = CargoToml::open(f.path()).unwrap();
         assert_eq!(cargo.package_name(), Some("hello".to_string()));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn default_features_absent() {
+        let f = write_temp("[package]\nname = \"p\"\n");
+        let mut cargo = CargoToml::open(f.path()).unwrap();
+        assert!(cargo.feature_names().is_empty());
+        assert!(cargo.default_features().is_empty());
+        cargo.set_default_features(&[]);
+        assert_eq!(cargo.feature_names(), ["default"]);
     }
 
     #[test]

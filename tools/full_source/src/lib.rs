@@ -101,7 +101,8 @@ impl std::fmt::Display for TestSuiteKind {
 /// BuildProjectSpec also takes it, but reads only its program declaration, to
 /// form the project kind `HarvestBench(spec)`.
 pub struct ExternalTestSuite {
-    /// The suite directories, as top-level entries (see [`TestSuiteKind::dirs`]).
+    /// The suite directories, as top-level entries (see [`TestSuiteKind::dirs`]), and the
+    /// program's `CMakePresets.json` when it has one.
     pub dir: RawDir,
     pub kind: TestSuiteKind,
 }

@@ -2,6 +2,7 @@
 /// for example, parsing code for benchmark-specific configs.
 /// Currently, that is just the MITLL tractor benchmarks.
 pub mod build_config;
+pub mod default_config;
 pub mod gtest;
 pub mod library;
 
@@ -9,7 +10,7 @@ use crate::runner;
 use crate::stats::ProgramEvalStats;
 use crate::HarvestResult;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,31 +19,26 @@ use std::time::Duration;
 
 /// Represents the expected stdout pattern in a test case
 /// Used for tractor test cases
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Deserialize, Clone)]
 pub struct StdoutPattern {
     pub pattern: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[serde(default)]
     pub is_regex: bool,
 }
 
 /// Represents a test case with command arguments, input, and expected output
 /// Used for tractor test cases
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Deserialize, Clone)]
 pub struct TestCase {
     #[serde(default)]
     pub argv: Vec<String>,
     #[serde(default)]
     pub stdin: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub stdout: StdoutPattern,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub rc: Option<i32>,
     /// Present means the vector is skipped; its value (a note, a number or a bool) is not used.
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub has_ub: Option<serde_json::Value>,
     /// The vector's path relative to `test_vectors/`: `<config>/<name>.json`, or
@@ -55,30 +51,6 @@ impl TestCase {
     /// The build configuration the vector runs against: the first component of `filename`.
     pub fn config(&self) -> &str {
         self.filename.split('/').next().unwrap_or_default()
-    }
-
-    /// Writes the TestCase to a JSON file on disk, at {output_dir}/failed_tests/{filename}
-    pub fn write_to_disk(&self, output_dir: &Path) -> HarvestResult<()> {
-        let file_path = output_dir.join("failed_tests").join(&self.filename);
-        let dir = file_path.parent().unwrap_or(output_dir);
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("Failed to create directory {}: {}", dir.display(), e))?;
-
-        log::info!("Saving failed test case to {}", file_path.display());
-
-        let mut json_str = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize TestCase to JSON: {}", e))?;
-        json_str.push('\n'); // To be consistent with original test vector styling
-
-        fs::write(&file_path, json_str).map_err(|e| {
-            format!(
-                "Failed to write TestCase to file {}: {}",
-                file_path.display(),
-                e
-            )
-        })?;
-
-        Ok(())
     }
 }
 

@@ -5,12 +5,16 @@ that prepares the working directory. A configuration other than `default` lists
 its build options in `configuration.json`; the grader builds it with
 `cargo build --release --no-default-features --features <list>`, where a boolean
 option `NAME` is the feature `NAME` and an option `NAME` with value `v` is the
-feature `NAME_v`. The grader builds the `driver` binary in each configuration
+feature `NAME_v`. When `{SUITE}/CMakePresets.json` exists, its `test` preset is
+the `default` configuration, and the harness puts its features in your `default`
+features before grading. Build it with them, as below.
+The grader builds the `driver` binary in each configuration
 and, for each vector, runs it in a fresh directory with the vector's `argv`,
 `stdin` and `env`, and compares stdout to the expected pattern. Reproduce it:
 
 ```bash
-RUSTUP_TOOLCHAIN={TOOLCHAIN} cargo build --release          # -> target/release/driver
+RUSTUP_TOOLCHAIN={TOOLCHAIN} cargo build --release [--no-default-features --features <the test preset's features>]
+# -> target/release/driver
 ./target/release/driver <argv...>  < <stdin>          # compare stdout to the vector
 ```
 

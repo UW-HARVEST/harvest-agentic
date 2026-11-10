@@ -78,10 +78,10 @@ These rules govern verification. They must survive every compaction unchanged.
 - A build-time option `NAME` of the C project is the feature `NAME` when it is
   boolean, and the feature `NAME_v` for each string or integer value `v`, case
   kept (`inputs/c_src/configuration.json`, when present, lists the options).
-- The grader builds the default configuration with plain
-  `cargo build --release`, so the `default` features must select the C default
-  configuration. It builds every other configuration with
-  `cargo build --release --no-default-features --features <list>`.
+- The `default` features select the CMake defaults, but the harness can
+  replace their option features. Build each configuration you test with
+  `cargo build --release --no-default-features --features <list>`, as the
+  grader does.
 - If `Cargo.toml` names its features differently, the grader fails. That is a
   Cargo.toml bug, not a test-command bug — fix the Cargo.toml.
 - `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
@@ -91,14 +91,16 @@ These rules govern verification. They must survive every compaction unchanged.
 - Do NOT modify anything in `inputs/c_src`.
 
 ### Configuration coverage
-- Every configuration listed under "Configurations to verify" in this task
-  must be checked. For each one:
-    1. Clean and rebuild C with the listed cmake flags.
+- The build options and their legal values are in `inputs/c_src/configuration.json`
+  (`configurable_variables`) when it exists, and otherwise in the CMake files
+  and documentation of `inputs/c_src`. Test every configuration: the grader
+  can test any of them. When there are too many combinations, test every
+  value of each option at least once and record the choice in `CONFIGS.md`.
+  For each configuration you test:
+    1. Clean and rebuild C with the option values as cmake `-D` flags.
     2. Rebuild Rust with the matching Cargo features (see the Cargo features
        contract above).
     3. Re-run integration tests and fix any mismatches before moving on.
-
-{ALL_CONFIGURATIONS}
 
 ### Surface coverage and completion
 - `SYMBOLS.md`, `CONDITIONALS.md`, `ERRORS.md`, and `CONFIGS.md` are the test
@@ -112,7 +114,7 @@ These rules govern verification. They must survive every compaction unchanged.
   Reading alone is not evidence.
 - Verification is complete only when `SYMBOLS.md` has no open missing entry
   (for the library, the `nm -D` symbol diff is empty), every row has a
-  passing test under every listed configuration, every
+  passing test under every configuration you test, every
   `CONDITIONALS.md` region is settled, and the final cross-review finds no
   gap. Green tests on inputs you picked yourself are not completion.
 

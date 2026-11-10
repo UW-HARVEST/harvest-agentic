@@ -18,6 +18,9 @@
 //! `test_case/` alongside `gtest_suite/` or `runner/` + `test_vectors/`) — not
 //! the `test_case/` subdirectory that the rest of the pipeline takes as its
 //! C-source input.
+//!
+//! The suite also takes the program directory's [`PRESETS_FILE`], whose `test`
+//! preset is the vectors' `default` configuration.
 
 use full_source::{ExternalTestSuite, TestSuiteKind};
 use harvest_core::config::unknown_field_warning;
@@ -106,6 +109,9 @@ pub fn detect_kind(
     })
 }
 
+/// The CMake presets file of a Test-Corpus program directory.
+pub const PRESETS_FILE: &str = "CMakePresets.json";
+
 pub struct LoadTestSuite;
 
 impl Tool for LoadTestSuite {
@@ -134,8 +140,8 @@ impl Tool for LoadTestSuite {
         )?;
         let kind = detect_kind(&input_path, config.harness)?;
 
-        // Load only the suite directories, as top-level entries.
-        let wanted: Vec<&str> = kind.dirs().to_vec();
+        // Load only the suite directories and the presets file, as top-level entries.
+        let wanted: Vec<&str> = kind.dirs().iter().copied().chain([PRESETS_FILE]).collect();
         let (dir, directories, files) = RawDir::populate_from_toplevel_selected(
             read_dir(&input_path)?,
             &|name| wanted.iter().any(|d| OsStr::new(d) == name),

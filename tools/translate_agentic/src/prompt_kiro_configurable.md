@@ -14,8 +14,9 @@ You MUST preserve this configurability using **Cargo features** named after the
 option, case kept: a boolean option `NAME` is the feature `NAME`; an option `NAME`
 with a string or integer value `v` is the feature `NAME_v`. When
 `inputs/c_src/configuration.json` exists, it lists the options and their values.
-The `default` features MUST select the C default configuration: the harness builds
-it with plain `cargo build --release`, and every other configuration with
+The translation MUST be correct in every configuration: every value of every option.
+The `default` features select the CMake defaults; the harness can replace their option
+features. Every other configuration is built with
 `cargo build --release --no-default-features --features <list>`.
 Use `#[cfg(feature = "...")]` to conditionally compile modules and set constants.
 The default build and every configuration build must compile.

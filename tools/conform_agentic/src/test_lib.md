@@ -6,12 +6,16 @@ configuration other than `default` lists its build options in
 `configuration.json`; the grader builds it with
 `cargo build --release --no-default-features --features <list>`, where a boolean
 option `NAME` is the feature `NAME` and an option `NAME` with value `v` is the
-feature `NAME_v`. The grader builds your crate as a `cdylib` in each
+feature `NAME_v`. When `{SUITE}/CMakePresets.json` exists, its `test` preset is
+the `default` configuration, and the harness puts its features in your `default`
+features before grading. Build it with them, as below.
+The grader builds your crate as a `cdylib` in each
 configuration and, for each vector, runs the compiled runner, which loads YOUR
 `.so`. Reproduce it for the `default` configuration:
 
 ```bash
-RUSTUP_TOOLCHAIN={TOOLCHAIN} cargo build --release          # cdylib -> target/release/lib<crate>.so
+RUSTUP_TOOLCHAIN={TOOLCHAIN} cargo build --release [--no-default-features --features <the test preset's features>]
+# cdylib -> target/release/lib<crate>.so
 cp -r {SUITE}/runner scratch/runner   # the suite is read-only: build a copy
 RUSTUP_TOOLCHAIN={TOOLCHAIN} cargo build --release --manifest-path scratch/runner/Cargo.toml
 # The runner loads <root>/translated_rust/target/release/lib<name>.so, with the

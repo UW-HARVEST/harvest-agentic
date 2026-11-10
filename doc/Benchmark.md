@@ -74,7 +74,7 @@ The expected directory structure of the `INPUT_DIR` of `benchmark` is as follows
 ├── 002_stdin_echo
 └── ...
 ```
-This mirrors the format used in the TRACTOR benchmark repository (e.g., `Test-Corpus/Public-Tests/B01_synthetic`). Each `test_vectors/<config>/` holds the vectors of one build configuration: `default` is built with `cargo build --release`, any other with the Cargo features of its `configuration.json`. The layout is mostly self-explanatory, but additional documentation can be found in the TRACTOR repository’s README.
+This mirrors the format used in the TRACTOR benchmark repository (e.g., `Test-Corpus/Public-Tests/B01_synthetic`). Each `test_vectors/<config>/` holds the vectors of one build configuration: `default` is built with `cargo build --release`, any other with the Cargo features of its `configuration.json`. When the program directory has a `CMakePresets.json`, its `test` preset is the `default` configuration: before grading, the benchmark replaces, in the crate's `default` features, the features of each option that the preset sets with the preset's value, and fails the build when the crate does not declare that feature. The translate and verify agents do not see the preset. The layout is mostly self-explanatory, but additional documentation can be found in the TRACTOR repository’s README.
 
 
 ### Output Format
@@ -90,8 +90,6 @@ The output directory structure of the `OUTPUT_DIR` of `benchmark` is as follows:
 │       └── main.rs
 │   ├── c_src
 │   │   └── main.c
-│   ├── failed_tests
-│   │   └── test01.json
 │   ├── results.err
 ├── 002_stdin_echo/
 └── ...
@@ -102,5 +100,4 @@ The output directory structure of the `OUTPUT_DIR` of `benchmark` is as follows:
 - `quality.csv`: Code-quality summary, one row per program: unsafe operations (safety), clippy lints / rustc warnings (clippy metrics) and the readability counts. Each program's full report is in its `.harvest/quality.json`, with the unsafe operations listed in `.harvest/unsafe_ops.tsv`. See "Code quality metrics" in the root README.  
 - `Cargo.toml` and `src`: The translated rust code.   
 - `c_src`: The original C source code, exactly copied from the input.  
-- `failed_tests`: Any test cases that failed (copied from the input)  
 - `results.err`: Error messages for any failing test cases.  

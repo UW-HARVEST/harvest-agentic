@@ -8,7 +8,6 @@
 
 use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
 use full_source::{CargoPackage, RawSource};
-use harvest_core::cmake_presets::{TestConfig, find_test_config};
 use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
@@ -123,18 +122,12 @@ impl Tool for VerifyFixAgentic {
             config.test_corpus_root.as_deref(),
         )?;
 
-        // Look near the original input dir; the case_dir tempdir does not contain
-        // CMakePresets.json because raw_source only mirrors `test_case/` content.
-        let test_config = find_test_config(&context.config.input);
         let workflow_hint = if config.workflow && agent == AgentKind::Claude {
             "You must use a workflow.\n\n"
         } else {
             ""
         };
-        let prompt = load_verify_prompt(&config, agent)
-            .replace("{CMAKE_BUILD_FLAGS}", &test_config.cmake_flags)
-            .replace("{ALL_CONFIGURATIONS}", &render_configurations(&test_config))
-            .replace("{WORKFLOW_HINT}", workflow_hint);
+        let prompt = load_verify_prompt(&config, agent).replace("{WORKFLOW_HINT}", workflow_hint);
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
@@ -363,17 +356,6 @@ fn load_verify_prompt(config: &Config, agent: AgentKind) -> String {
         }
         AgentKind::Kiro => PROMPT_KIRO_VERIFY.to_owned(),
     }
-}
-
-/// Render `TestConfig` as the markdown block that the verify prompt expects in
-/// place of `{ALL_CONFIGURATIONS}`. Empty when there are no project knobs to
-/// switch — in that case the conditional "If configurations are listed below"
-/// section silently no-ops.
-fn render_configurations(cfg: &TestConfig) -> String {
-    if cfg.is_empty() {
-        return String::new();
-    }
-    format!("Configurations to verify:\n{}", cfg.as_markdown_bullet())
 }
 
 /// Comparison mechanism the verification prompt describes.

@@ -13,6 +13,7 @@
 //!   Cargo.toml  Cargo.lock  src/  tests/  …   the crate; == the frozen CargoPackage,
 //!                                             with the agents' reports (PLAN.md, ...)
 //!   target/                                   cargo build output
+//!   translated_rust/  translated_tools/       cando2 grading output (not part of the crate)
 //!   .harvest/
 //!     stage.json                              this manifest
 //!     c_src/                                  C source (RawSource), rewritten every stage
@@ -66,6 +67,10 @@ pub const REFERENCE_MODIFIED_DIR: &str = "reference_modified";
 /// which, for a suite that rounds 1 and 2 hold out, would be a leak.
 pub const SUITE_DIR_NAMES: &[&str] = &["gtest_suite", "runner", "test_vectors"];
 
+/// The directories that the cando2 grader writes next to the crate: the compiled library and
+/// its own sources. Reserved for the same reason as [`SUITE_DIR_NAMES`].
+pub const GRADING_ARTIFACT_NAMES: &[&str] = &["translated_rust", "translated_tools"];
+
 /// Returns the `.harvest/` directory of a snapshot program directory.
 pub fn meta_dir(program_dir: &Path) -> PathBuf {
     program_dir.join(HARVEST_META_DIR)
@@ -87,12 +92,14 @@ pub fn is_snapshot(program_dir: &Path) -> bool {
 }
 
 /// True when `name` is a top-level entry the frozen package excludes: the
-/// framework's own directory, cargo's build output, and any external test
-/// material (see [`SUITE_DIR_NAMES`]).
+/// framework's own directory, cargo's build output, any external test
+/// material (see [`SUITE_DIR_NAMES`]), and what grading leaves behind (see
+/// [`GRADING_ARTIFACT_NAMES`]).
 pub fn is_reserved_toplevel(name: &std::ffi::OsStr) -> bool {
     [HARVEST_META_DIR, BUILD_DIR]
         .iter()
         .chain(SUITE_DIR_NAMES)
+        .chain(GRADING_ARTIFACT_NAMES)
         .any(|reserved| name == std::ffi::OsStr::new(reserved))
 }
 
@@ -256,6 +263,8 @@ mod tests {
             "gtest_suite",
             "runner",
             "test_vectors",
+            "translated_rust",
+            "translated_tools",
         ] {
             assert!(
                 is_reserved_toplevel(std::ffi::OsStr::new(reserved)),

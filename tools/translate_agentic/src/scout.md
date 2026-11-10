@@ -25,8 +25,8 @@ Find these facts for the files of your group:
 1. Inventory: each `.c` and `.h` file, its line count, and its role in one line.
 2. Project type: library (exported functions), program (`main()`), or both.
 3. Public API: the exported functions and types.
-4. Build configurability: the options and cache variables in `inputs/c_src/CMakeLists.txt`,
-   `inputs/c_src/CMakePresets.json` and `inputs/c_src/configuration.json`, the source files that they select, and the `#if` switches that they
+4. Build configurability: the options and cache variables in `inputs/c_src/CMakeLists.txt`
+   and `inputs/c_src/configuration.json`, the source files that they select, and the `#if` switches that they
    control. These become Cargo features.
 5. Symbol renames: macros that change linker symbols, for example `#define foo NAMESPACE(foo)`.
 6. Call groups: functions that call each other, also across files. Find the call sites with `grep`.
