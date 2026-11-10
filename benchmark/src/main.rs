@@ -210,9 +210,10 @@ pub fn run_all_benchmarks(
     program_runs: &[ProgramRun],
     output_dir: &Path,
     opts: &RunOptions,
-) -> HarvestResult<Vec<ProgramEvalStats>> {
+) -> HarvestResult<(Vec<ProgramEvalStats>, QualityReports)> {
     // Process all examples
     let mut results = Vec::new();
+    let mut quality_reports = Vec::new();
     let total_examples = program_runs.len();
 
     for (i, program_run) in program_runs.iter().enumerate() {
@@ -220,11 +221,19 @@ pub fn run_all_benchmarks(
         log::info!("Processing example {} of {}", i + 1, total_examples);
         log::info!("{}", "=".repeat(80));
 
-        results.push(benchmark_single_program(program_run, output_dir, opts));
+        let result = benchmark_single_program(program_run, output_dir, opts);
+        if result.translation_success {
+            let report = quality::grade_program(&output_dir.join(&result.program_name));
+            quality_reports.push((result.program_name.clone(), report));
+        }
+        results.push(result);
     }
 
-    Ok(results)
+    Ok((results, quality_reports))
 }
+
+/// The code quality report of each program, by name.
+type QualityReports = Vec<(String, quality::QualityReport)>;
 
 /// Writes the read-only reference inputs the IR is carrying into the output
 /// program directory, replacing whatever was there.
@@ -883,6 +892,15 @@ fn translated_program_dirs(path: &Path) -> HarvestResult<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// Writes the run's code quality summary CSV; a failure is logged, as quality never changes a
+/// run's outcome.
+fn write_quality_csv(path: &Path, reports: &QualityReports) {
+    match quality::write_summary_csv(path, reports) {
+        Ok(()) => log::info!("  Quality summary: {}", path.display()),
+        Err(e) => log::warn!("  Failed to write {}: {e}", path.display()),
+    }
+}
+
 fn test_existing_program(
     program_dir: &Path,
     timeout: u64,
@@ -1135,27 +1153,38 @@ fn run(args: Args) -> HarvestResult<()> {
         log::info!("Test-only mode: {}", test_path.display());
         let program_dirs =
             test_program_dirs(test_path, args.filter.as_deref(), args.exclude.as_deref())?;
-        if parts.contains(&TestPart::Correctness) {
-            let results: Vec<ProgramEvalStats> = program_dirs
-                .iter()
-                .map(|dir| test_existing_program(dir, args.timeout, args.test_harness))
-                .collect();
-            let csv_output_path = test_path.join("results.csv");
+        let correctness = parts.contains(&TestPart::Correctness);
+        let quality = parts.contains(&TestPart::Quality);
+        let mut results = Vec::new();
+        let mut quality_reports = Vec::new();
+        for dir in &program_dirs {
+            if correctness {
+                results.push(test_existing_program(dir, args.timeout, args.test_harness));
+            }
+            if quality {
+                let name = dir.file_name().unwrap_or_default().to_string_lossy();
+                quality_reports.push((name.into_owned(), quality::grade_program(dir)));
+            }
+        }
+        let csv_output_path = test_path.join("results.csv");
+        if correctness {
             write_csv_results(&csv_output_path, &results)?;
-            let summary_stats = SummaryStats::from_results(&results);
-            log_summary_stats(&summary_stats);
-            log::info!("\nOutput Files:");
-            log::info!("  Tested translated projects: {}", test_path.display());
+            log_summary_stats(&SummaryStats::from_results(&results));
+        }
+        if quality {
+            quality::log_summary(&quality::QualitySummary::from_reports(&quality_reports));
+        }
+        log::info!("\nOutput Files:");
+        log::info!("  Tested translated projects: {}", test_path.display());
+        if correctness {
             log::info!("  CSV results: {}", csv_output_path.display());
             log::info!("  Error logs: results.err files in each translated project directory");
-            log_failing_programs(&results);
         }
-        if parts.contains(&TestPart::Quality) {
-            // Grading a single snapshot needs no summary next to its crate.
-            let csv = (!stage_manifest::is_snapshot(test_path))
-                .then(|| test_path.join(quality::SUMMARY_CSV));
-            quality::grade_programs(&program_dirs, csv.as_deref());
+        // Grading a single snapshot needs no quality summary next to its crate.
+        if quality && !stage_manifest::is_snapshot(test_path) {
+            write_quality_csv(&test_path.join(quality::SUMMARY_CSV), &quality_reports);
         }
+        log_failing_programs(&results);
         log::info!("\nTest-only processing complete.");
         return Ok(());
     }
@@ -1252,29 +1281,22 @@ fn run(args: Args) -> HarvestResult<()> {
         no_fuzz: args.no_fuzz,
         force: args.force,
     };
-    let results = run_all_benchmarks(&program_runs, output_dir, &opts)?;
+    let (results, quality_reports) = run_all_benchmarks(&program_runs, output_dir, &opts)?;
     let csv_output_path = output_dir.join("results.csv");
     write_csv_results(&csv_output_path, &results)?;
 
     let summary_stats = SummaryStats::from_results(&results);
     log_summary_stats(&summary_stats);
+    quality::log_summary(&quality::QualitySummary::from_reports(&quality_reports));
 
     log::info!("\nOutput Files:");
     log::info!("  Translated projects: {}", output_dir.display());
     log::info!("  CSV results: {}", csv_output_path.display());
     log::info!("  Error logs: results.err files in each translated project directory");
+    write_quality_csv(&output_dir.join(quality::SUMMARY_CSV), &quality_reports);
 
     // Print examples with issues
     log_failing_programs(&results);
-
-    // Correctness is graded per program above; code quality follows for
-    // every crate that was produced.
-    let translated: Vec<PathBuf> = results
-        .iter()
-        .filter(|r| r.translation_success)
-        .map(|r| output_dir.join(&r.program_name))
-        .collect();
-    quality::grade_programs(&translated, Some(&output_dir.join(quality::SUMMARY_CSV)));
 
     log::info!(
         "\nProcessing complete! Check the CSV file and individual project directories for detailed results."

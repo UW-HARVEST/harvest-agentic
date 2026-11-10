@@ -177,9 +177,9 @@ are rejected when that stage is not part of the run.
 
 ## Code quality metrics
 
-After the tests, the benchmark measures the safety and idiomaticity of every
-translated crate with three groups of counts. The first two follow the
-automated metrics of DARPA TRACTOR's test and evaluation.
+After each program's tests, the benchmark measures the safety and
+idiomaticity of its crate with three groups of counts. The first two
+groups follow the automated metrics of DARPA TRACTOR's test and evaluation.
 
 - **Safety: operations that require an `unsafe` context** (raw-pointer
   dereferences, calls to unsafe functions, uses of mutable or extern statics,

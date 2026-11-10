@@ -25,7 +25,9 @@ use clippy::ClippyReport;
 use readability::ReadabilityReport;
 use safety::SafetyReport;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+pub use report::{log_summary, write_summary_csv, QualitySummary};
 
 /// Full report, in the snapshot's `.harvest/`.
 pub const REPORT_FILE: &str = "quality.json";
@@ -181,35 +183,21 @@ fn prepare(program_dir: &Path) -> Result<(scratch::ScratchArea, scratch::Package
     Ok((scratch, pkg))
 }
 
-/// Measures every program directory, writes each one's report, logs a
-/// summary line per program, and writes the run's summary CSV to `csv_path`
-/// if given. Failures are logged, never returned: quality never changes a
-/// run's outcome.
-pub fn grade_programs(program_dirs: &[PathBuf], csv_path: Option<&Path>) {
-    log::info!("\n{}", "=".repeat(80));
-    log::info!("Code quality (safety, clippy metrics, readability)");
-    log::info!("{}", "=".repeat(80));
-    let mut rows = Vec::new();
-    for dir in program_dirs {
-        let name = dir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        log::info!("Measuring code quality of {name}...");
-        let report = measure(dir);
-        if let Err(e) = report::write(dir, &report) {
-            log::warn!("  Failed to write the quality report of {name}: {e}");
-        }
-        report::log_report(&report);
-        rows.push((name, report));
+/// Measures the program in `program_dir`, writes its report into the
+/// snapshot's `.harvest/` and logs its summary lines. Failures are logged,
+/// never returned: quality never changes a run's outcome.
+pub fn grade_program(program_dir: &Path) -> QualityReport {
+    let name = program_dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let report = measure(program_dir);
+    if let Err(e) = report::write(program_dir, &report) {
+        log::warn!("  Failed to write the quality report of {name}: {e}");
     }
-    if let Some(csv_path) = csv_path {
-        match report::write_summary_csv(csv_path, &rows) {
-            Ok(()) => log::info!("  Quality summary: {}", csv_path.display()),
-            Err(e) => log::warn!("  Failed to write {}: {e}", csv_path.display()),
-        }
-    }
+    log::info!("\nCode quality of {name}:");
+    report::log_report(&report);
+    report
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! The measurement's outputs: each snapshot's `.harvest/quality.json`,
 //! `.harvest/unsafe_ops.tsv` and `.harvest/readability_hits.tsv`, the run's
-//! `quality.csv` with one headline row per program, and the three summary
-//! lines logged per program.
+//! `quality.csv` with one headline row per program, the three summary
+//! lines logged per program, and the run's pooled summary.
 
 use super::readability::ItemCounts;
 use super::{Outcome, QualityReport, READABILITY_HITS_FILE, REPORT_FILE, UNSAFE_OPS_FILE};
@@ -288,15 +288,94 @@ const SUMMARY_COLUMNS: [&str; 29] = [
 ];
 
 /// One headline row per program.
-pub(super) fn write_summary_csv(
-    path: &Path,
-    rows: &[(String, QualityReport)],
-) -> std::io::Result<()> {
+pub fn write_summary_csv(path: &Path, rows: &[(String, QualityReport)]) -> std::io::Result<()> {
     let w = csv::Writer::from_path(path)?;
     let rows = rows
         .iter()
         .map(|(name, report)| SummaryRow::new(name, report));
     write_table(w, rows, &SUMMARY_COLUMNS)
+}
+
+/// Code quality pooled over a run's programs: each metric sums its counts and
+/// the code lines of the programs where it was measured, so a rate weights
+/// each program by its size.
+#[derive(Debug, Default)]
+pub struct QualitySummary {
+    programs: usize,
+    rust_code_lines: usize,
+    safety: Pooled,
+    clippy_lints: Pooled,
+    rustc_warnings: usize,
+    readability: Pooled,
+}
+
+/// One metric summed over the programs where it was measured.
+#[derive(Debug, Default)]
+struct Pooled {
+    programs: usize,
+    count: usize,
+    code_lines: usize,
+}
+
+impl Pooled {
+    fn add(&mut self, count: usize, code_lines: usize) {
+        self.programs += 1;
+        self.count += count;
+        self.code_lines += code_lines;
+    }
+
+    fn per_kloc(&self) -> Option<f64> {
+        (self.code_lines > 0).then(|| self.count as f64 * 1000.0 / self.code_lines as f64)
+    }
+}
+
+impl QualitySummary {
+    pub fn from_reports(reports: &[(String, QualityReport)]) -> Self {
+        let mut summary = Self {
+            programs: reports.len(),
+            ..Self::default()
+        };
+        for (_, r) in reports {
+            let lines = r.rust_code_lines;
+            summary.rust_code_lines += lines;
+            if let Some(s) = r.safety.result() {
+                summary.safety.add(s.unsafe_ops, lines);
+            }
+            if let Some(c) = r.clippy.result() {
+                summary.clippy_lints.add(c.lints.clippy_lints, lines);
+                summary.rustc_warnings += c.lints.rustc_warnings;
+            }
+            if let (Some(syntax), Some(types)) =
+                (r.readability.syntax.result(), r.readability.types.result())
+            {
+                let items = syntax.items.values().chain(types.items.values()).sum();
+                summary.readability.add(items, lines);
+            }
+        }
+        summary
+    }
+}
+
+/// Logs the run's code quality summary.
+pub fn log_summary(summary: &QualitySummary) {
+    let n = summary.programs;
+    let line = |what: &str, p: &Pooled| {
+        format!(
+            "  {what}: {} ({}; measured in {}/{n} programs)",
+            p.count,
+            rate(p.per_kloc()),
+            p.programs
+        )
+    };
+    log::info!("\nCode Quality (pooled over the programs measured):");
+    log::info!("  Rust code lines: {}", summary.rust_code_lines);
+    log::info!("{}", line("Unsafe operations", &summary.safety));
+    log::info!(
+        "{}, {} rustc warnings",
+        line("Clippy lints", &summary.clippy_lints),
+        summary.rustc_warnings
+    );
+    log::info!("{}", line("Readability items", &summary.readability));
 }
 
 #[cfg(test)]
