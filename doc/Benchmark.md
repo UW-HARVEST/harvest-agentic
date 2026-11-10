@@ -67,13 +67,14 @@ The expected directory structure of the `INPUT_DIR` of `benchmark` is as follows
 │   │   └── src
 │   │       └── main.c
 │   └── test_vectors
-│       ├── test1.json
-│       ├── ...
-│       └── test3.json
+│       └── default
+│           ├── test1.json
+│           ├── ...
+│           └── test3.json
 ├── 002_stdin_echo
 └── ...
 ```
-This mirrors the format used in the TRACTOR benchmark repository (e.g., `Test-Corpus/Public-Tests/B01_synthetic`). The layout is mostly self-explanatory, but additional documentation can be found in the TRACTOR repository’s README.
+This mirrors the format used in the TRACTOR benchmark repository (e.g., `Test-Corpus/Public-Tests/B01_synthetic`). Each `test_vectors/<config>/` holds the vectors of one build configuration: `default` is built with `cargo build --release`, any other with the Cargo features of its `configuration.json`. The layout is mostly self-explanatory, but additional documentation can be found in the TRACTOR repository’s README.
 
 
 ### Output Format

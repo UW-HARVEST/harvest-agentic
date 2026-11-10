@@ -97,27 +97,20 @@ When in doubt, re-read this section.
 ### AFTER ANY COMPACTION: `cat PLAN.md` is your FIRST action before anything.
 
 ### Cargo features
-- Feature names exposed to the build harness are the **bare lowercase VALUE**
-  of each CMake cache variable, NOT the variable name nor a prefix-decorated
-  form. The harness invokes
-  `cargo build --features <value1>,<value2>,...` with those bare values.
-- Suppose the CMake cache has `OPT_A=foo`, `OPT_B=bar`, `OPT_C=2k` (a value
-  starting with a digit).
-  RIGHT — bare values directly:
-      [features]
-      foo = []
-      bar = []
-      "2k" = []
-  ALSO ACCEPTABLE — prefixed gate + bare alias (useful when Cargo dislikes
-  a bare name; the alias keeps the harness contract intact):
-      [features]
-      opt_c_2k = []
-      "2k" = ["opt_c_2k"]
-  WRONG — prefixed without an alias to the bare value:
-      opt_a_foo = []           # NO — harness passes `--features foo,bar,2k`
-      opt_b_bar = []           # NO — and gets "package does not contain
-      opt_c_2k  = []           # NO   these features"
-- ALL feature combinations must compile (`cargo build --release --features <combo>`).
+- A build-time option of the C project (a CMake option or cache variable)
+  becomes Cargo features named after the option, case kept: a boolean option
+  `NAME` is the feature `NAME`; an option `NAME` with a string or integer
+  value `v` is the feature `NAME_v`. When `inputs/c_src/configuration.json`
+  exists, it lists the options and their values under `configurable_variables`.
+  Example: `{"WORD_SIZE": ["32", "64"], "ENABLE_EXTRA": [true, false]}` gives
+  the features `WORD_SIZE_32`, `WORD_SIZE_64` and `ENABLE_EXTRA`.
+- The harness builds the default configuration with plain
+  `cargo build --release`: the `default` features MUST select the C default
+  configuration (the CMake defaults, or the `test` preset of
+  `CMakePresets.json` when there is one). It builds every other configuration
+  with `cargo build --release --no-default-features --features <list>`, the
+  list naming the options set in that configuration.
+- The default build and every configuration build must compile.
 
 ### Cargo manifest target names
 - `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
@@ -383,14 +376,13 @@ like a summary rather than concrete work. In that case:
 ## Step 4: Compile check
 
 Run `cargo build --release` and fix any errors until it compiles.
-If the project has Cargo features, verify ALL feature combinations compile:
-run `cargo build --release --features <combo>` for each one. The exact feature
-names to test are the bare lowercase CMake cache values (see Invariants).
+If the project has Cargo features, also run the configuration builds of the
+Cargo features contract (see Invariants) and fix them until they compile.
 
 Once the build is green and all subtasks are checked, mark the whole plan
 complete in `PLAN.md` with a final note.
 
-Your job ends when every feature combo's `cargo build` is green.
+Your job ends when every configuration's `cargo build` is green.
 A separate verification agent runs after you and owns ALL execution-based
 correctness checking. Doing that work here wastes turns. Trust the next agent. Stop at green compile.
 

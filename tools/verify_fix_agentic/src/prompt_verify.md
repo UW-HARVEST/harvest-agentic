@@ -74,14 +74,16 @@ These rules govern verification. They must survive every compaction unchanged.
   every executable run result (stdout, stderr, exit status, written files).
 - If C and Rust diverge, fix Rust. NEVER modify C.
 
-### Cargo features (FRAMEWORK CONTRACT — also enforced at the final build)
-- The build harness invokes `cargo build --features <v1>,<v2>,...` using the
-  bare lowercase VALUES of the CMake cache variables for each configuration.
-- If `Cargo.toml`'s `[features]` section uses prefixed names (e.g.
-  `opt_a_foo = []` with no `foo` alias), the harness will fail. That is a
-  Cargo.toml bug, not a test-command bug — fix the Cargo.toml so it exposes
-  the bare values (either as primary names or as aliases pointing to the
-  internal prefixed gates).
+### Cargo features (FRAMEWORK CONTRACT — enforced by the grader)
+- A build-time option `NAME` of the C project is the feature `NAME` when it is
+  boolean, and the feature `NAME_v` for each string or integer value `v`, case
+  kept (`inputs/c_src/configuration.json`, when present, lists the options).
+- The grader builds the default configuration with plain
+  `cargo build --release`, so the `default` features must select the C default
+  configuration. It builds every other configuration with
+  `cargo build --release --no-default-features --features <list>`.
+- If `Cargo.toml` names its features differently, the grader fails. That is a
+  Cargo.toml bug, not a test-command bug — fix the Cargo.toml.
 - `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
   Hyphens cause manifest parse failure. Fix Cargo.toml if you see them.
 
@@ -92,8 +94,8 @@ These rules govern verification. They must survive every compaction unchanged.
 - Every configuration listed under "Configurations to verify" in this task
   must be checked. For each one:
     1. Clean and rebuild C with the listed cmake flags.
-    2. Rebuild Rust with the matching Cargo features
-       (`cargo build --release --no-default-features --features <list>`).
+    2. Rebuild Rust with the matching Cargo features (see the Cargo features
+       contract above).
     3. Re-run integration tests and fix any mismatches before moving on.
 
 {ALL_CONFIGURATIONS}

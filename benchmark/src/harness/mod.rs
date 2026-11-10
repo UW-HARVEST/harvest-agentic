@@ -1,6 +1,7 @@
 /// This module `harness` is intended to contain code that is specific to a particular set of benchmarks,
 /// for example, parsing code for benchmark-specific configs.
 /// Currently, that is just the MITLL tractor benchmarks.
+pub mod build_config;
 pub mod gtest;
 pub mod library;
 
@@ -9,6 +10,7 @@ use crate::stats::ProgramEvalStats;
 use crate::HarvestResult;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,35 +34,35 @@ pub struct TestCase {
     pub argv: Vec<String>,
     #[serde(default)]
     pub stdin: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub stdout: StdoutPattern,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub rc: Option<usize>,
+    pub rc: Option<i32>,
+    /// Present means the vector is skipped; its value (a note, a number or a bool) is not used.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub has_ub: Option<String>,
+    pub has_ub: Option<serde_json::Value>,
+    /// The vector's path relative to `test_vectors/`: `<config>/<name>.json`, or
+    /// `<config>/<name>/cando_vector.json` for a directory vector.
     #[serde(skip)] // Don't serialize/deserialize this field as it's not part of the JSON
     pub filename: String,
 }
 
 impl TestCase {
-    /// Writes the TestCase to a JSON file on disk
-    /// Creates the directory structure {output_dir}/failed_tests/ and
-    /// writes to {output_dir}/failed_tests/{filename}
+    /// The build configuration the vector runs against: the first component of `filename`.
+    pub fn config(&self) -> &str {
+        self.filename.split('/').next().unwrap_or_default()
+    }
+
+    /// Writes the TestCase to a JSON file on disk, at {output_dir}/failed_tests/{filename}
     pub fn write_to_disk(&self, output_dir: &Path) -> HarvestResult<()> {
-        let failed_tests_dir = output_dir.join("failed_tests");
-
-        // Create the failed_tests directory if it doesn't exist
-        fs::create_dir_all(&failed_tests_dir).map_err(|e| {
-            format!(
-                "Failed to create directory {}: {}",
-                failed_tests_dir.display(),
-                e
-            )
-        })?;
-
-        let file_path = failed_tests_dir.join(&self.filename);
+        let file_path = output_dir.join("failed_tests").join(&self.filename);
+        let dir = file_path.parent().unwrap_or(output_dir);
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("Failed to create directory {}: {}", dir.display(), e))?;
 
         log::info!("Saving failed test case to {}", file_path.display());
 
@@ -135,26 +137,19 @@ pub fn parse_benchmark_dir(input_dir: &Path) -> HarvestResult<(PathBuf, PathBuf)
         .into());
     }
 
-    // Accept test_case/src (normal layout) or test_case/app (configurable
-    // layout). Test cases that ship a GoogleTest suite promise only that
-    // test_case/ is a CMake project producing a shared library, so the
-    // src/app convention is not enforced for them (e.g. libsodium keeps the
-    // upstream `test_case/libsodium/**` layout).
-    let has_src = test_case_dir.join("src").is_dir();
-    let has_app = test_case_dir.join("app").is_dir();
+    // test_case/ is a CMake project; its source layout is free (src/, app/,
+    // sources at the top as in chibicc, or an upstream tree as in libsodium).
+    if !test_case_dir.join("CMakeLists.txt").is_file() {
+        return Err(format!(
+            "Required test_case/CMakeLists.txt not found: {}",
+            test_case_dir.display()
+        )
+        .into());
+    }
     let has_gtest = matches!(
         load_test_suite::detect_kind(input_dir, None),
         Ok(full_source::TestSuiteKind::Gtest)
     );
-    if !has_src && !has_app && !has_gtest {
-        return Err(format!(
-            "Required test_case/src or test_case/app directory not found under: {} \
-             (and no {}/ beside test_case/)",
-            test_case_dir.display(),
-            crate::harness::gtest::GTEST_SUITE_DIR
-        )
-        .into());
-    }
 
     // JSON vectors are optional for test cases that ship a GoogleTest suite
     // instead (gtest_suite/); everything else still requires test_vectors/.
@@ -167,47 +162,111 @@ pub fn parse_benchmark_dir(input_dir: &Path) -> HarvestResult<(PathBuf, PathBuf)
     }
 
     // Return the test_case root so downstream tools can find metadata files
-    // (e.g., CMakeLists.txt) while still containing the src/ subtree.
+    // (e.g., CMakeLists.txt) beside the sources.
     Ok((test_case_dir, test_vectors_dir))
 }
 
-/// Reads all files in a directory and parses them as TestCase JSON files
-/// These sorts of files can be found in the test_vectors/ directory of the benchmark
+/// The JSON of a directory vector (`test_vectors/<config>/<name>/`).
+const CANDO_VECTOR_FILE: &str = "cando_vector.json";
+
+/// Reads the test vectors of every build configuration. Each `test_vectors/<config>/` holds
+/// `<name>.json` vectors and `<name>/cando_vector.json` directory vectors, and, for a
+/// configuration other than `default`, its `configuration.json`.
 pub fn parse_test_vectors<P: AsRef<Path>>(directory_path: P) -> HarvestResult<Vec<TestCase>> {
     let dir_path = directory_path.as_ref();
-
-    // Read directory entries
-    let entries = fs::read_dir(dir_path)
-        .map_err(|e| format!("Failed to read directory {}: {}", dir_path.display(), e))?;
-
-    // Process each file and collect successful test cases
     let mut test_cases = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            format!(
-                "Failed to read directory entry in {}: {}",
-                dir_path.display(),
-                e
-            )
-        })?;
-        let file_path = entry.path();
-
-        // Only accept plain .json files (exclude backups like .json.bak, directories, etc.)
-        if file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext != "json")
-            .unwrap_or(true)
-        {
+    for config in sorted_entries(dir_path)? {
+        if !config.is_dir() {
             continue;
         }
-
-        // Try to parse the file as a test case JSON
-        if let Ok(test_case) = parse_test_case_json(&file_path) {
+        for entry in sorted_entries(&config)? {
+            let file = if entry.is_dir() {
+                entry.join(CANDO_VECTOR_FILE)
+            } else {
+                entry
+            };
+            let is_vector = file.extension().is_some_and(|ext| ext == "json")
+                && file
+                    .file_name()
+                    .is_some_and(|n| n != build_config::CONFIGURATION_FILE)
+                && file.is_file();
+            if !is_vector {
+                continue;
+            }
+            let mut test_case = parse_test_case_json(&file)?;
+            test_case.filename = file
+                .strip_prefix(dir_path)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .into_owned();
             test_cases.push(test_case);
         }
     }
     Ok(test_cases)
+}
+
+fn sorted_entries(dir: &Path) -> HarvestResult<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    Ok(entries)
+}
+
+/// Prepares a fresh working directory for one vector, as the Test-Corpus runner does: a
+/// directory vector's `setup` script runs first, with `DEFAULT_RUN_DIR` (the fresh directory),
+/// `WORKING_DIR_FILE` (where it may write another directory to run in) and, when the vector has
+/// `resources/`, `TEST_RESOURCES`. Returns the fresh directory, to keep alive while the vector
+/// runs, and the directory to run in.
+pub fn prepare_run_dir(
+    vectors_dir: &Path,
+    test_case: &TestCase,
+) -> HarvestResult<(tempfile::TempDir, PathBuf)> {
+    let run_dir = tempfile::tempdir()?;
+    let run_path = run_dir.path().to_path_buf();
+    let vector = vectors_dir.join(&test_case.filename);
+    let setup = vector.with_file_name("setup");
+    if !test_case.filename.ends_with(CANDO_VECTOR_FILE) || !setup.is_file() {
+        return Ok((run_dir, run_path));
+    }
+    // A suite copy does not keep the executable bit: run the script by its #! line.
+    let script = fs::read_to_string(&setup)?;
+    let mut interpreter = script
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+        .ok_or_else(|| format!("{} has no #! line", setup.display()))?
+        .split_whitespace();
+    let working_dir_file = tempfile::NamedTempFile::new()?;
+    let mut cmd = Command::new(interpreter.next().unwrap_or("/bin/sh"));
+    cmd.args(interpreter)
+        .arg(&setup)
+        .current_dir(&run_path)
+        .env("DEFAULT_RUN_DIR", &run_path)
+        .env("WORKING_DIR_FILE", working_dir_file.path());
+    let resources = vector.with_file_name("resources");
+    if resources.is_dir() {
+        cmd.env("TEST_RESOURCES", &resources);
+    }
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed: {}\n{}",
+            setup.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let working_dir = fs::read_to_string(working_dir_file.path())?;
+    let working_dir = working_dir.trim();
+    let cwd = if working_dir.is_empty() {
+        run_path
+    } else {
+        PathBuf::from(working_dir)
+    };
+    Ok((run_dir, cwd))
 }
 
 /// Clean up build artifacts from successfully translated Rust projects
@@ -273,12 +332,13 @@ pub fn cleanup_benchmarks(results: &[ProgramEvalStats], output_dir: &Path) {
 pub fn validate_binary_output(
     binary_path: &Path,
     test_case: &TestCase,
+    cwd: &Path,
     timeout_seconds: Option<u64>,
 ) -> HarvestResult<()> {
     let timeout = Duration::from_secs(timeout_seconds.unwrap_or(10));
 
     // Run the binary
-    let output = runner::run_binary_with_timeout(binary_path, test_case, timeout)
+    let output = runner::run_binary_with_timeout(binary_path, test_case, cwd, timeout)
         .map_err(|e| format!("Failed to run binary {}: {}", binary_path.display(), e))?;
 
     let actual_stdout = String::from_utf8_lossy(&output.stdout);
@@ -330,37 +390,31 @@ mod tests {
         root
     }
 
-    #[test]
-    fn cando2_layout_is_accepted() {
-        let dir = bench_dir(&["test_case/src", "test_vectors"]);
-        assert!(parse_benchmark_dir(dir.path()).is_ok());
+    /// A bench program directory whose test_case/ is a CMake project.
+    fn cmake_bench_dir(subdirs: &[&str]) -> tempfile::TempDir {
+        let root = bench_dir(&[&["test_case"], subdirs].concat());
+        fs::write(root.path().join("test_case/CMakeLists.txt"), "").unwrap();
+        root
     }
 
     #[test]
-    fn configurable_app_layout_is_accepted() {
-        let dir = bench_dir(&["test_case/app", "test_vectors"]);
-        assert!(parse_benchmark_dir(dir.path()).is_ok());
-    }
-
-    #[test]
-    fn gtest_case_without_src_is_accepted() {
-        // The libsodium shape: test_case/ keeps the upstream layout (no src/
-        // or app/), and the test set lives in gtest_suite/.
-        let dir = bench_dir(&["test_case/libsodium/crypto_box", "gtest_suite"]);
+    fn cmake_project_is_accepted() {
+        // Any source layout: chibicc keeps its sources at the top of test_case/.
+        let dir = cmake_bench_dir(&["test_vectors"]);
         assert!(parse_benchmark_dir(dir.path()).is_ok());
     }
 
     #[test]
     fn gtest_case_needs_no_test_vectors() {
-        let dir = bench_dir(&["test_case/src", "gtest_suite"]);
+        let dir = cmake_bench_dir(&["gtest_suite"]);
         assert!(parse_benchmark_dir(dir.path()).is_ok());
     }
 
     #[test]
-    fn missing_src_without_gtest_is_rejected() {
-        let dir = bench_dir(&["test_case/libsodium", "test_vectors"]);
+    fn missing_cmakelists_is_rejected() {
+        let dir = bench_dir(&["test_case/src", "test_vectors"]);
         let err = parse_benchmark_dir(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("src"), "unexpected error: {err}");
+        assert!(err.contains("CMakeLists.txt"), "unexpected error: {err}");
     }
 
     #[test]
@@ -372,8 +426,55 @@ mod tests {
 
     #[test]
     fn missing_vectors_without_gtest_is_rejected() {
-        let dir = bench_dir(&["test_case/src"]);
+        let dir = cmake_bench_dir(&[]);
         let err = parse_benchmark_dir(dir.path()).unwrap_err().to_string();
         assert!(err.contains("test_vectors"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn vectors_are_read_per_build_configuration() {
+        let dir = bench_dir(&["default/d1", "fast"]);
+        let vectors = dir.path();
+        fs::write(
+            vectors.join("default/v1.json"),
+            r#"{"rc": -11, "has_ub": 1}"#,
+        )
+        .unwrap();
+        fs::write(vectors.join("default/d1/cando_vector.json"), "{}").unwrap();
+        fs::write(vectors.join("fast/v2.json"), "{}").unwrap();
+        fs::write(vectors.join("fast/configuration.json"), "{}").unwrap();
+        let names: Vec<_> = parse_test_vectors(vectors)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.filename.clone(), t.config().to_owned()))
+            .collect();
+        let expected = [
+            ("default/d1/cando_vector.json", "default"),
+            ("default/v1.json", "default"),
+            ("fast/v2.json", "fast"),
+        ];
+        assert_eq!(names, expected.map(|(f, c)| (f.to_owned(), c.to_owned())));
+    }
+
+    #[test]
+    fn setup_prepares_the_working_directory() {
+        let dir = bench_dir(&["default/d1/resources"]);
+        let vectors = dir.path();
+        fs::write(vectors.join("default/d1/cando_vector.json"), "{}").unwrap();
+        fs::write(vectors.join("default/d1/resources/r.txt"), "res").unwrap();
+        fs::write(
+            vectors.join("default/d1/setup"),
+            "#!/bin/sh\nmkdir \"$DEFAULT_RUN_DIR/w\"\n\
+             cp \"$TEST_RESOURCES/r.txt\" \"$DEFAULT_RUN_DIR/w/\"\n\
+             echo \"$DEFAULT_RUN_DIR/w\" > \"$WORKING_DIR_FILE\"\n",
+        )
+        .unwrap();
+        let test_case = TestCase {
+            filename: "default/d1/cando_vector.json".to_owned(),
+            ..TestCase::default()
+        };
+        let (run_dir, cwd) = prepare_run_dir(vectors, &test_case).unwrap();
+        assert_eq!(cwd, run_dir.path().join("w"));
+        assert_eq!(fs::read_to_string(cwd.join("r.txt")).unwrap(), "res");
     }
 }

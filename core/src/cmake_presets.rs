@@ -11,41 +11,37 @@
 //! }
 //! ```
 //!
-//! The agent translates the C `#ifdef` switches into Cargo features whose names
-//! match the cache-variable values exactly (e.g. `blake`, `128f`, `simple`).
-//! Builtin CMake keys (those starting with `CMAKE_`) are filtered out — only
-//! project-specific knobs survive into the Cargo feature list.
+//! The preset configures the C side of the test case's default build
+//! configuration. The grader builds the Rust side with plain `cargo build
+//! --release`, so the crate's default features must select the same
+//! configuration. Builtin CMake keys (those starting with `CMAKE_`) are filtered out — only
+//! project-specific knobs survive into the flags.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-/// One configuration the agent must verify: a set of CMake `-D` flags and the
-/// matching Cargo feature list.
+/// One configuration the agent must verify: a set of CMake `-D` flags, matched
+/// on the Rust side by the default features.
 #[derive(Debug, Clone, Default)]
 pub struct TestConfig {
     /// CMake build flags ready to splice into a command line, e.g.
     /// `-DHASH_BACKEND=blake -DSECPAR=128f -DTHASH=simple`. Empty when no
     /// project-specific cache variables are set.
     pub cmake_flags: String,
-
-    /// Cargo feature names matching the cache-variable values, in sorted
-    /// order. Empty when no project-specific cache variables are set.
-    pub cargo_features: Vec<String>,
 }
 
 impl TestConfig {
     /// Whether this config carries any project-specific knobs.
     pub fn is_empty(&self) -> bool {
-        self.cmake_flags.is_empty() && self.cargo_features.is_empty()
+        self.cmake_flags.is_empty()
     }
 
     /// Markdown bullet describing this config, suitable to inject into a
     /// verify prompt under "Configurations to verify:".
     pub fn as_markdown_bullet(&self) -> String {
         format!(
-            "- cmake flags: `{}`\n  cargo features: `{}`",
-            self.cmake_flags,
-            self.cargo_features.join(",")
+            "- cmake flags: `{}`\n  Rust: `cargo build --release` (default features)",
+            self.cmake_flags
         )
     }
 }
@@ -122,12 +118,7 @@ pub fn read_test_config(presets_path: &Path) -> TestConfig {
         .map(|(k, v)| format!("-D{}={}", k, v))
         .collect::<Vec<_>>()
         .join(" ");
-    let cargo_features = project_vars.values().map(|v| v.to_string()).collect();
-
-    TestConfig {
-        cmake_flags,
-        cargo_features,
-    }
+    TestConfig { cmake_flags }
 }
 
 fn walk_inherits(
@@ -168,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_features_and_flags_from_test_preset() {
+    fn extracts_flags_from_test_preset() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write(
             tmp.path(),
@@ -190,7 +181,6 @@ mod tests {
             }"#,
         );
         let cfg = read_test_config(&path);
-        assert_eq!(cfg.cargo_features, vec!["blake", "128f", "simple"]);
         // BTreeMap orders alphabetically by key (HASH_BACKEND, SECPAR, THASH)
         assert_eq!(
             cfg.cmake_flags,
@@ -239,7 +229,7 @@ mod tests {
             }"#,
         );
         let cfg = find_test_config(&test_case);
-        assert_eq!(cfg.cargo_features, vec!["blake"]);
+        assert_eq!(cfg.cmake_flags, "-DHASH_BACKEND=blake");
     }
 
     #[test]
@@ -252,11 +242,10 @@ mod tests {
     fn markdown_bullet_format() {
         let cfg = TestConfig {
             cmake_flags: "-DHASH_BACKEND=blake".into(),
-            cargo_features: vec!["blake".into()],
         };
         assert_eq!(
             cfg.as_markdown_bullet(),
-            "- cmake flags: `-DHASH_BACKEND=blake`\n  cargo features: `blake`"
+            "- cmake flags: `-DHASH_BACKEND=blake`\n  Rust: `cargo build --release` (default features)"
         );
     }
 }

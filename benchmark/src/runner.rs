@@ -10,17 +10,24 @@ use crate::harness::TestCase;
 pub fn run_binary_with_timeout(
     binary_path: &Path,
     test_case: &TestCase,
+    cwd: &Path,
     timeout: Duration,
 ) -> HarvestResult<Output> {
-    let mut child = spawn_process_with_args(binary_path, test_case)?;
+    let mut child = spawn_process_with_args(binary_path, test_case, cwd)?;
     write_stdin_to_process(&mut child, test_case.stdin.as_deref(), binary_path)?;
     wait_for_process_with_timeout(child, timeout)
 }
 
-/// Spawns a process with the appropriate command line arguments and stdio configuration
-fn spawn_process_with_args(binary_path: &Path, test_case: &TestCase) -> HarvestResult<Child> {
+/// Spawns a process in `cwd` with the test case's arguments and environment
+fn spawn_process_with_args(
+    binary_path: &Path,
+    test_case: &TestCase,
+    cwd: &Path,
+) -> HarvestResult<Child> {
     let mut cmd = Command::new(binary_path);
-    cmd.args(&test_case.argv[..]);
+    cmd.args(&test_case.argv[..])
+        .envs(&test_case.env)
+        .current_dir(cwd);
 
     // Configure stdio pipes
     cmd.stdin(Stdio::piped())

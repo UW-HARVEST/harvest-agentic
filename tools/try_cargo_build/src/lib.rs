@@ -3,7 +3,6 @@
 pub use cargo_metadata::{Artifact, CompilerMessage};
 use full_source::CargoPackage;
 use harvest_core::cargo_utils::CargoToml;
-use harvest_core::cmake_presets::find_test_config;
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use std::path::{Path, PathBuf};
@@ -15,17 +14,13 @@ pub struct TryCargoBuild;
 // or a string containing error messages (on failure).
 pub type BuildResult = Result<Vec<PathBuf>, Vec<CompilerMessage>>;
 
-/// Validates that the generated Rust project builds by running `cargo build --release`.
-/// When `features` is non-empty, build with `--no-default-features --features <list>` so
-/// the produced binary matches the variant the test case expects.
+/// Validates that the generated Rust project builds by running `cargo build --release`,
+/// with the default features, as the grader builds the default configuration.
 /// Note: It has a bit of a confusing return type:
 /// - If the project builds successfully, it returns Ok(Ok(artifact_filenames)).
 /// - If the project fails to build, it returns Ok(Err(error_message)).
 /// - If there is an error running cargo, it returns Err.
-fn try_cargo_build(
-    project_path: &PathBuf,
-    features: &[String],
-) -> Result<CargoBuildResult, Box<dyn std::error::Error>> {
+fn try_cargo_build(project_path: &PathBuf) -> Result<CargoBuildResult, Box<dyn std::error::Error>> {
     info!("Validating that the generated Rust project builds...");
 
     let mut cargo = CargoToml::open(&project_path.join("Cargo.toml"))?;
@@ -33,23 +28,19 @@ fn try_cargo_build(
     cargo.normalize_name(project_path);
     cargo.save()?;
 
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
+    let output = Command::new("cargo")
+        .arg("build")
         .arg("--release")
-        .arg("--message-format=json");
-    if !features.is_empty() {
-        info!("Using test-derived features: {}", features.join(","));
-        cmd.arg("--no-default-features")
-            .arg("--features")
-            .arg(features.join(","));
-    }
-    let output = cmd.current_dir(project_path).output().map_err(|e| {
-        format!(
-            "Failed to run cargo build in {}: {}",
-            project_path.display(),
-            e
-        )
-    })?;
+        .arg("--message-format=json")
+        .current_dir(project_path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "Failed to run cargo build in {}: {}",
+                project_path.display(),
+                e
+            )
+        })?;
 
     let mut artifacts = vec![];
     let mut diagnostics = vec![];
@@ -102,10 +93,8 @@ impl Tool for TryCargoBuild {
         let output_path = context.config.output.clone();
         cargo_package.materialize(&output_path)?;
 
-        let features = find_test_config(&context.config.input).cargo_features;
-
         // Validate that the Rust project builds
-        Ok(Box::new(try_cargo_build(&output_path, &features)?))
+        Ok(Box::new(try_cargo_build(&output_path)?))
     }
 }
 

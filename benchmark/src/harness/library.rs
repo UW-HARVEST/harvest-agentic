@@ -17,7 +17,7 @@
 //! 3. Compare results against expected values from test vectors
 
 use crate::error::HarvestResult;
-use crate::harness::TestCase;
+use crate::harness::{build_config, prepare_run_dir, TestCase};
 use crate::stats::{TestResult, TestType};
 use harvest_core::cargo_utils::{self, CargoToml};
 use std::fs;
@@ -28,17 +28,24 @@ use wait_timeout::ChildExt;
 
 // === Constants ===
 
-/// Standard location where cando2 expects to find Rust-compiled libraries
-const RUST_ARTIFACTS_SUBDIR: &str = "translated_rust/target/release";
+/// Where cando2 expects the Rust-compiled libraries: `translated_rust/target/release` for the
+/// default build configuration, `translated_rust/target-<config>/release` for another.
+fn cando_artifacts_dir(output_dir: &Path, config: &str) -> PathBuf {
+    let target = match config {
+        build_config::DEFAULT => "target".to_owned(),
+        config => format!("target-{config}"),
+    };
+    output_dir
+        .join("translated_rust")
+        .join(target)
+        .join("release")
+}
 
 /// Location where cando2 framework is copied
 const CANDO2_TOOLS_PATH: &str = "translated_tools/cando2";
 
 /// Relative path from runner directory to cando2 tools
 const CANDO2_RELATIVE_PATH: &str = "../translated_tools/cando2";
-
-/// Environment variable that tells cando2 to load Rust-compiled libraries
-const RUST_ARTIFACTS_ENV: &str = "RUST_ARTIFACTS";
 
 /// Environment variable for shared library search paths
 #[cfg(target_os = "macos")]
@@ -59,8 +66,8 @@ const RUNNER_BUILD_SUBDIR: &str = "target/runner_build";
 /// This is the main entry point for library validation. It orchestrates the complete
 /// testing process by:
 /// 1. Preparing library-specific configuration (workspace guard, cdylib)
-/// 2. Rebuilding the project as a cdylib
-/// 3. Locating the compiled shared library
+/// 2. Building the cdylib in each build configuration the vectors use
+/// 3. Putting each library where cando2 loads it from
 /// 4. Setting up the test environment (cando2, runner)
 /// 5. Building and running the test runner
 /// 6. Collecting and returning test results
@@ -105,31 +112,20 @@ pub fn run_library_validation(
         .map_err(|e| format!("Failed to copy test_vectors directory: {}", e))?;
     }
 
-    // Rebuild to generate cdylib
-    log::info!("Rebuilding project as cdylib...");
-    let output = Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .current_dir(output_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run cargo build: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("cargo build --release failed: {}", stderr).into());
+    // Build the cdylib in every build configuration the vectors use, and put each library
+    // where cando2 loads it from.
+    let vectors_dir = output_dir.join("test_vectors");
+    for (config, release_dir) in build_config::build_all(output_dir, &vectors_dir, test_cases)? {
+        let lib_path = locate_compiled_library(output_dir, &release_dir, program_name)?;
+        log::info!("Located library at: {}", lib_path.display());
+        copy_library_to_standard_location(output_dir, &lib_path, program_name, config)?;
     }
-    log::info!("✅ Cdylib build completed successfully");
 
-    // === Validation logic ===
-
-    // Locate the compiled library
-    let lib_path = locate_compiled_library(output_dir, program_name)?;
-    log::info!("Located library at: {}", lib_path.display());
-
-    // Prepare the test environment
-    let ld_library_path = prepare_test_environment(input_dir, output_dir, &lib_path, program_name)?;
+    setup_cando2_framework(input_dir, output_dir)?;
+    let ld_library_path = configure_library_paths(
+        output_dir,
+        &cando_artifacts_dir(output_dir, build_config::DEFAULT),
+    );
     log::info!("Test environment prepared");
 
     // Build the runner
@@ -146,7 +142,7 @@ pub fn run_library_validation(
     )
 }
 
-/// Locates the compiled shared library artifact in the target directory.
+/// Locates the compiled shared library artifact in `release_dir`.
 ///
 /// # Search Strategy
 /// Simply uses the package name (with - replaced by _) to construct the library name.
@@ -154,25 +150,28 @@ pub fn run_library_validation(
 ///
 /// # Arguments
 /// * `output_dir` - The output directory containing the translated project
+/// * `release_dir` - The `release` directory of the build
 /// * `program_name` - Name of the program (used as fallback)
 ///
 /// # Returns
 /// Path to the shared library file (.so, .dylib, or .dll)
-pub fn locate_compiled_library(output_dir: &Path, program_name: &str) -> HarvestResult<PathBuf> {
+pub fn locate_compiled_library(
+    output_dir: &Path,
+    release_dir: &Path,
+    program_name: &str,
+) -> HarvestResult<PathBuf> {
     // Use the lib name (from [lib].name) because cargo names the .so after the lib crate name,
     // not the package name. Falls back to package_name if [lib].name is not set.
     let lib_name = CargoToml::open(&output_dir.join("Cargo.toml"))
         .ok()
         .and_then(|c| c.lib_name())
         .unwrap_or_else(|| program_name.to_string());
-    let target_release = output_dir.join("target").join("release");
-
     // Construct expected library name from lib crate name
     let lib_stem = format!("lib{}", lib_name.replace('-', "_"));
 
     // Try common extensions
     for ext in LIBRARY_EXTENSIONS {
-        let lib_path = target_release.join(format!("{}.{}", lib_stem, ext));
+        let lib_path = release_dir.join(format!("{}.{}", lib_stem, ext));
         if lib_path.exists() {
             return Ok(lib_path);
         }
@@ -182,63 +181,25 @@ pub fn locate_compiled_library(output_dir: &Path, program_name: &str) -> Harvest
     Err(format!(
         "Library not found: expected {} in {}",
         lib_stem,
-        target_release.display()
+        release_dir.display()
     )
     .into())
 }
 
-/// Prepares the test environment for library validation.
-///
-/// This includes:
-/// - Copying the library to the standard location (translated_rust/target/release/)
-/// - Setting up cando2 framework
-/// - Configuring library search paths
+/// Copies the compiled library to the location where cando2 loads it from for build
+/// configuration `config` (see [`cando_artifacts_dir`]), under the name the runner expects.
 ///
 /// # Why copy the library?
-/// The cando2 framework expects libraries in a specific directory structure
-/// when `RUST_ARTIFACTS=1` is set. This maintains compatibility with the
-/// Test-Corpus conventions without modifying cando2 or all existing runners.
-///
-/// # Arguments
-/// * `input_dir` - Directory containing the original test case (used to locate cando2)
-/// * `output_dir` - Directory containing the translated Rust project
-/// * `lib_path` - Path to the compiled shared library
-/// * `program_name` - Name of the program being tested
-///
-/// # Returns
-/// The LD_LIBRARY_PATH value (colon-separated directory list)
-pub fn prepare_test_environment(
-    input_dir: &Path,
-    output_dir: &Path,
-    lib_path: &Path,
-    program_name: &str,
-) -> HarvestResult<String> {
-    // Copy library to standard location
-    let rust_artifacts_dir = copy_library_to_standard_location(output_dir, lib_path, program_name)?;
-
-    // Setup cando2 framework
-    setup_cando2_framework(input_dir, output_dir)?;
-
-    // Configure library search paths
-    let ld_library_path = configure_library_paths(output_dir, &rust_artifacts_dir);
-
-    Ok(ld_library_path)
-}
-
-/// Copies the compiled library to the standard location expected by cando2.
-///
-/// Target location: `output_dir/translated_rust/target/release/lib<name>.<ext>`
-///
-/// # Arguments
-/// * `output_dir` - The output directory
-/// * `lib_path` - Path to the compiled shared library
-/// * `program_name` - Program name for determining the target filename
+/// cando2 loads `translated_rust/target[-<config>]/release/lib<name>.<ext>` of the test root,
+/// with the `<name>` of the runner's `harness!` macro. Copying keeps the Test-Corpus
+/// conventions without modifying cando2 or the runners.
 fn copy_library_to_standard_location(
     output_dir: &Path,
     lib_path: &Path,
     program_name: &str,
-) -> HarvestResult<PathBuf> {
-    let rust_artifacts_dir = output_dir.join(RUST_ARTIFACTS_SUBDIR);
+    config: &str,
+) -> HarvestResult<()> {
+    let rust_artifacts_dir = cando_artifacts_dir(output_dir, config);
     fs::create_dir_all(&rust_artifacts_dir)?;
 
     let pkg_name = CargoToml::open(&output_dir.join("Cargo.toml"))
@@ -268,7 +229,7 @@ fn copy_library_to_standard_location(
         )
     })?;
 
-    Ok(rust_artifacts_dir)
+    Ok(())
 }
 
 /// Sets up the cando2 test framework in the output directory.
@@ -459,8 +420,8 @@ fn locate_runner_binary(runner_dir: &Path, runner_target_dir: &Path) -> HarvestR
 ///
 /// # Process
 /// For each test case:
-/// 1. Spawn runner with cando2 0.2.x CLI: `runner -t <root> -v <vector> --rust lib`
-/// 2. Set environment: RUST_ARTIFACTS=1, LD_LIBRARY_PATH
+/// 1. Prepare a fresh working directory (run the vector's `setup` script, if any)
+/// 2. Spawn runner in it: `runner -t <root> -v <vector> --build-config <config> --rust lib`
 /// 3. Apply timeout
 /// 4. Validate exit code (success = test passed)
 ///
@@ -557,16 +518,11 @@ pub fn run_test_suite(
 
 /// Runs a single library test case.
 ///
-/// Spawns the runner process with appropriate environment variables and applies a timeout.
-/// The runner is invoked with cando2 0.2.x CLI:
-/// `runner -t <test_root> -v test_vectors/<case>.json --rust lib`.
-///
-/// Older benchmark code used `runner lib -c <case>`, but cando2 0.2.x treats
-/// vector selection as a global option before the `lib` subcommand.
-///
-/// # Environment Variables
-/// - `RUST_ARTIFACTS=1`: Tells cando2 to load Rust-compiled libraries
-/// - Library search path variable (`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`/`PATH` depending on platform)
+/// Spawns the runner in the vector's working directory (see [`prepare_run_dir`]) and applies a
+/// timeout. The vector is given by absolute path with its build configuration:
+/// `runner -t <test_root> -v <test_root>/test_vectors/<filename> --build-config <config> --rust lib`.
+/// The library search path variable (`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`/`PATH` depending on
+/// platform) is set to `ld_library_path`.
 fn run_single_library_test(
     runner_bin: &Path,
     test_root: &Path,
@@ -574,21 +530,22 @@ fn run_single_library_test(
     ld_library_path: &str,
     timeout: Duration,
 ) -> HarvestResult<Output> {
-    let runner_dir = test_root.join("runner");
     let test_root_abs = test_root
         .canonicalize()
         .unwrap_or_else(|_| test_root.to_path_buf());
-    let vector_path = &test_case.filename;
+    let vectors_dir = test_root_abs.join("test_vectors");
+    let (_run_dir, cwd) = prepare_run_dir(&vectors_dir, test_case)?;
 
     let mut cmd = Command::new(runner_bin);
     cmd.arg("-t")
         .arg(&test_root_abs)
         .arg("-v")
-        .arg(vector_path)
+        .arg(vectors_dir.join(&test_case.filename))
+        .arg("--build-config")
+        .arg(test_case.config())
         .arg("--rust")
         .arg("lib")
-        .current_dir(&runner_dir)
-        .env(RUST_ARTIFACTS_ENV, "1")
+        .current_dir(&cwd)
         .env(LD_LIBRARY_PATH_ENV, ld_library_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

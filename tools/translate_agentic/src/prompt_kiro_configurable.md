@@ -10,10 +10,15 @@ This project has **build-time configurability** via CMake cache variables.
 Look at inputs/c_src/CMakeLists.txt — it uses variables to select which source files
 to compile and which parameter headers to include at build time.
 
-You MUST preserve this configurability using **Cargo features**. Each CMake cache
-variable value becomes a Cargo feature, using the **exact same name in lowercase**.
+You MUST preserve this configurability using **Cargo features** named after the
+option, case kept: a boolean option `NAME` is the feature `NAME`; an option `NAME`
+with a string or integer value `v` is the feature `NAME_v`. When
+`inputs/c_src/configuration.json` exists, it lists the options and their values.
+The `default` features MUST select the C default configuration: the harness builds
+it with plain `cargo build --release`, and every other configuration with
+`cargo build --release --no-default-features --features <list>`.
 Use `#[cfg(feature = "...")]` to conditionally compile modules and set constants.
-All combinations of features must compile.
+The default build and every configuration build must compile.
 
 This project produces BOTH a shared library AND a binary executable.
 Your Cargo.toml must have both `[lib]` with `crate-type = ["cdylib"]` and

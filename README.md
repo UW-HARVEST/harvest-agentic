@@ -36,7 +36,7 @@ later stage can resume from an earlier run's output directory.
 1. **Translate** (`tools/translate_agentic`, stage `translate`/`t`). A coding
    agent is launched in a fresh working directory; the C source is a read-only
    input in its `inputs/`. It translates the project into a Cargo package and iterates
-   until `cargo build --release` passes for every feature combination.
+   until `cargo build --release` passes in every build configuration.
 2. **Verify & fix** (`tools/verify_fix_agentic`, stage `verify`/`v`). A second
    agent receives the Rust translation together with the C source. It builds a
    comparison environment using the C as the oracle (GoogleTest with FuzzTest

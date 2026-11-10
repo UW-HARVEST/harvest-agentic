@@ -39,7 +39,8 @@ Do NOT modify anything in inputs/c_src.
 
 If configurations are listed below, you MUST verify each one:
 - Clean and rebuild C with the listed cmake flags
-- Rebuild Rust with the matching Cargo features (`--no-default-features --features <list>`)
+- Rebuild Rust with the matching Cargo features: the default features for the default
+  configuration, `--no-default-features --features <list>` for any other
 - Re-run integration tests and fix any mismatches before moving to the next configuration
 
 {ALL_CONFIGURATIONS}

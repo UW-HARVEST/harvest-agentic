@@ -9,7 +9,8 @@ mod stats;
 use crate::cli::{Args, TestHarness, TestPart};
 use crate::error::HarvestResult;
 use crate::harness::{
-    cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, validate_binary_output,
+    build_config, cleanup_benchmarks, parse_benchmark_dir, parse_test_vectors, prepare_run_dir,
+    validate_binary_output, TestCase,
 };
 use crate::io::{
     collect_program_dirs, ensure_output_directory, log_failing_programs, log_found_programs,
@@ -34,7 +35,6 @@ use std::sync::Arc;
 pub struct TranspilationResult {
     translation_success: bool,
     build_success: bool,
-    rust_binary_path: Option<PathBuf>,
     build_error: Option<String>,
     /// The resolved settings of the run (see [`harvest_translate::effective_config`]), for the
     /// stage manifest.
@@ -45,38 +45,19 @@ impl TranspilationResult {
     /// Extract relevant info from HarvestIR
     pub fn from_ir(ir: &HarvestIR, run_config: serde_json::Value) -> Self {
         let translation_success = raw_cargo_package(ir).is_ok();
-        let (build_success, rust_binary_path, build_error) = match cargo_build_result(ir) {
-            Ok(artifacts) => {
-                if artifacts.is_empty() {
-                    // Empty artifacts list indicates build succeeded but produced no output
-                    (
-                        false,
-                        None,
-                        Some("Build succeeded but produced no artifacts".to_string()),
-                    )
-                } else {
-                    // The framework's contract (set_bin_driver in cargo_utils) is that
-                    // the entry-point binary is named "driver". Pick that artifact
-                    // explicitly — taking the first executable is unsafe because the
-                    // verify agent can leave debug binaries in src/bin/, which cargo
-                    // builds and which can be ordered before driver in the artifact list.
-                    let driver = artifacts.iter().find_map(|a| {
-                        if a.target.name == "driver" {
-                            a.executable.as_ref().map(|e| e.as_std_path().into())
-                        } else {
-                            None
-                        }
-                    });
-                    (true, driver, None)
-                }
-            }
-            Err(err) => (false, None, Some(err.clone())),
+        let (build_success, build_error) = match cargo_build_result(ir) {
+            // Empty artifacts list indicates build succeeded but produced no output
+            Ok(artifacts) if artifacts.is_empty() => (
+                false,
+                Some("Build succeeded but produced no artifacts".to_string()),
+            ),
+            Ok(_) => (true, None),
+            Err(err) => (false, Some(err.clone())),
         };
 
         Self {
             translation_success,
             build_success,
-            rust_binary_path,
             build_error,
             run_config,
         }
@@ -136,7 +117,6 @@ pub fn translate_c_directory_to_rust_project(
             TranspilationResult {
                 translation_success: false,
                 build_success: false,
-                rust_binary_path: None,
                 build_error: Some(format!("Failed to transpile: {}", e)),
                 run_config,
             }
@@ -411,13 +391,23 @@ fn runner_dir_exists(suite_root: &Path) -> bool {
         .is_dir()
 }
 
-/// Run list of tests and output result/errors
+/// Builds the `driver` binary of the crate in `crate_dir` in each build configuration the
+/// vectors use, runs it on each vector in the vector's working directory, and outputs the
+/// results/errors.
 fn run_test_validation(
-    binary_path: &Path,
-    test_cases: &[crate::harness::TestCase],
+    crate_dir: &Path,
+    vectors_dir: &Path,
+    test_cases: &[TestCase],
     timeout: u64,
-    output_dir: &Path,
-) -> (Vec<TestResult>, Vec<String>) {
+) -> HarvestResult<(Vec<TestResult>, Vec<String>)> {
+    let mut drivers = build_config::build_all(crate_dir, vectors_dir, test_cases)?;
+    for driver in drivers.values_mut() {
+        driver.push("driver");
+        *driver = driver
+            .canonicalize()
+            .map_err(|e| format!("driver binary not found at {}: {e}", driver.display()))?;
+    }
+
     let mut test_results = Vec::new();
     let mut error_messages = Vec::new();
 
@@ -452,8 +442,10 @@ fn run_test_validation(
             test_case.stdin,
         );
 
-        let timeout_opt = Some(timeout);
-        match validate_binary_output(binary_path, test_case, timeout_opt) {
+        let outcome = prepare_run_dir(vectors_dir, test_case).and_then(|(_run_dir, cwd)| {
+            validate_binary_output(&drivers[test_case.config()], test_case, &cwd, Some(timeout))
+        });
+        match outcome {
             Ok(()) => {
                 test_results.push(TestResult {
                     filename: test_case.filename.clone(),
@@ -474,13 +466,13 @@ fn run_test_validation(
                 error_messages.push(error);
                 log::info!("❌ Test case {} failed: {}", test_case.filename, e);
                 test_case
-                    .write_to_disk(output_dir)
+                    .write_to_disk(crate_dir)
                     .expect("failed to write test case to disk");
             }
         }
     }
 
-    (test_results, error_messages)
+    Ok((test_results, error_messages))
 }
 
 /// Run all benchmarks for a single program
@@ -731,17 +723,17 @@ fn benchmark_single_program(
                 }
             }
         }
-        ValidationHarness::Binary => match translation_result.rust_binary_path {
-            Some(binary_path) if binary_path.exists() => {
-                run_test_validation(&binary_path, &test_cases, timeout, &output_dir)
-            }
-            binary_path => {
-                let error = format!(
-                "Rust build reported success, but expected output artifact was not found at {:?}",
-                binary_path
-            );
-                log::error!("{}", error);
-                result.error_message = Some(error);
+        ValidationHarness::Binary => match run_test_validation(
+            &output_dir,
+            &graded_suite_root.join("test_vectors"),
+            &test_cases,
+            timeout,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let error_msg = format!("Executable validation failed: {}", e);
+                log::error!("{}", error_msg);
+                result.error_message = Some(error_msg);
                 return result;
             }
         },
@@ -973,35 +965,14 @@ fn test_existing_program(
             }
         }
     } else {
-        let output = std::process::Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .current_dir(program_dir)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {
+        match run_test_validation(program_dir, &test_vectors_dir, &test_cases, timeout) {
+            Ok(r) => {
                 result.rust_build_success = true;
-                let binary_path = program_dir.join("target/release/driver");
-                if !binary_path.exists() {
-                    result.error_message = Some(format!(
-                        "Built executable project but driver binary was not found at {}",
-                        binary_path.display()
-                    ));
-                    return result;
-                }
-                run_test_validation(&binary_path, &test_cases, timeout, program_dir)
-            }
-            Ok(output) => {
-                result.rust_build_success = false;
-                result.error_message = Some(format!(
-                    "cargo build --release failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-                return result;
+                r
             }
             Err(e) => {
                 result.rust_build_success = false;
-                result.error_message = Some(format!("Failed to run cargo build: {e}"));
+                result.error_message = Some(format!("Executable validation failed: {e}"));
                 return result;
             }
         }
