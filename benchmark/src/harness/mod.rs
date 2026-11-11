@@ -197,7 +197,8 @@ pub fn prepare_run_dir(
 ) -> HarvestResult<(tempfile::TempDir, PathBuf)> {
     let run_dir = tempfile::tempdir()?;
     let run_path = run_dir.path().to_path_buf();
-    let vector = vectors_dir.join(&test_case.filename);
+    // The script runs in the fresh directory: a relative path would not resolve there.
+    let vector = std::path::absolute(vectors_dir.join(&test_case.filename))?;
     let setup = vector.with_file_name("setup");
     if !test_case.filename.ends_with(CANDO_VECTOR_FILE) || !setup.is_file() {
         return Ok((run_dir, run_path));
@@ -430,8 +431,12 @@ mod tests {
 
     #[test]
     fn setup_prepares_the_working_directory() {
-        let dir = bench_dir(&["default/d1/resources"]);
-        let vectors = dir.path();
+        // A relative vectors path, as from a relative command-line path: the setup script runs
+        // in another directory.
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let vectors = dir.path().strip_prefix(&cwd).unwrap();
+        fs::create_dir_all(vectors.join("default/d1/resources")).unwrap();
         fs::write(vectors.join("default/d1/cando_vector.json"), "{}").unwrap();
         fs::write(vectors.join("default/d1/resources/r.txt"), "res").unwrap();
         fs::write(

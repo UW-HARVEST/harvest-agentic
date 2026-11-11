@@ -13,7 +13,7 @@ Arguments:
 
 Options:
   -c, --config <CONFIG>    Set a configuration value; format $NAME=$VALUE
-      --timeout <TIMEOUT>  Timeout in seconds for running test cases [default: 10]
+      --timeout <TIMEOUT>  Timeout in seconds for each test (default: 120 for Test-Corpus test vectors; 10 for GoogleTest tests without a manifest.json budget)
       --filter <FILTER>    Filter benchmarks by regex pattern on directory names (keeps matching directories)
       --exclude <EXCLUDE>  Exclude benchmarks by regex pattern on directory names (removes matching directories)
   -h, --help               Print help

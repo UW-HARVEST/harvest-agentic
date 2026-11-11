@@ -206,8 +206,8 @@ pub struct Args {
     pub test_harness: TestHarness,
 
     /// Timeout in seconds for running test cases
-    #[arg(long, default_value = "10")]
-    pub timeout: u64,
+    #[arg(long)]
+    pub timeout: Option<u64>,
 
     /// Filter benchmarks by regex pattern on directory names (keeps matching directories).
     /// Examples: ".*_lib$" (only libraries)

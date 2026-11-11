@@ -127,7 +127,7 @@ pub fn translate_c_directory_to_rust_project(
 /// Options shared by every program in a benchmark run.
 pub struct RunOptions {
     pub config_overrides: Vec<String>,
-    pub timeout: u64,
+    pub timeout: Option<u64>,
     pub modular: bool,
     /// Agentic stages of this run, in pipeline order. Empty = non-agentic.
     pub stages: Vec<Stage>,
@@ -351,6 +351,18 @@ enum ValidationHarness {
     Binary,
 }
 
+impl ValidationHarness {
+    /// The per-test timeout in seconds when `--timeout` is not given. Test-Corpus vectors get
+    /// the default of the TRACTOR test runner. A GoogleTest suite takes its budgets from its
+    /// `manifest.json`; this is only the fallback for the tests that it gives no budget.
+    fn default_timeout(&self) -> u64 {
+        match self {
+            Self::Gtest { .. } => 10,
+            Self::Library | Self::Binary => 120,
+        }
+    }
+}
+
 /// Resolves which validation harness grades `suite_root`.
 ///
 /// In auto mode a gtest suite wins; without one, a cando2 `runner/` means
@@ -488,7 +500,6 @@ fn benchmark_single_program(
     opts: &RunOptions,
 ) -> ProgramEvalStats {
     let stage_input = program_run.stage_input.as_deref();
-    let timeout = opts.timeout;
     let test_harness = opts.test_harness;
 
     let program_name = program_run.name.clone();
@@ -703,6 +714,7 @@ fn benchmark_single_program(
             return result;
         }
     };
+    let timeout = opts.timeout.unwrap_or(validation.default_timeout());
     let (test_results, error_messages) = match validation {
         ValidationHarness::Gtest { suite_dir } => {
             match harness::gtest::run_gtest_validation(&suite_dir, &output_dir, timeout) {
@@ -903,7 +915,7 @@ fn write_quality_csv(path: &Path, reports: &QualityReports) {
 
 fn test_existing_program(
     program_dir: &Path,
-    timeout: u64,
+    timeout: Option<u64>,
     test_harness: TestHarness,
 ) -> ProgramEvalStats {
     let program_name = program_dir
@@ -959,6 +971,7 @@ fn test_existing_program(
             return result;
         }
     };
+    let timeout = timeout.unwrap_or(validation.default_timeout());
     let (test_results, error_messages) = if let ValidationHarness::Gtest { suite_dir } = &validation
     {
         match harness::gtest::run_gtest_validation(suite_dir, program_dir, timeout) {
