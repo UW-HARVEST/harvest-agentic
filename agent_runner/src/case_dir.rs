@@ -59,8 +59,10 @@ pub struct CaseDir {
 }
 
 impl CaseDir {
-    /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `inputs/`, `shared/` and
-    /// `tmp/`. Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`] free.
+    /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `shared/` and `tmp/`, and
+    /// `inputs/` with the skill that every stage gives (`agent_skills/cargo_features/`, see
+    /// [`crate::cargo_features`]). Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`]
+    /// free.
     pub fn new() -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         let base = large_temp_dir();
@@ -80,10 +82,12 @@ impl CaseDir {
             fs::create_dir(root.join(area))?;
         }
         fs::DirBuilder::new().mode(0o700).create(root.join(TMP))?;
-        Ok(Self {
+        let case = Self {
             temp: Some(temp),
             root,
-        })
+        };
+        case.write_skill("cargo_features")?;
+        Ok(case)
     }
 
     pub fn root(&self) -> &Path {
@@ -114,6 +118,11 @@ impl CaseDir {
 
     pub fn c_src(&self) -> PathBuf {
         self.inputs().join(C_SOURCE_DIR)
+    }
+
+    /// Writes the skill `name` (a directory of `agent_skills/`) into `inputs/agent_skills/<name>/`.
+    pub fn write_skill(&self, name: &str) -> io::Result<()> {
+        crate::skills::materialize(name, &self.inputs().join("agent_skills").join(name))
     }
 
     /// Call it after the framework has written its inputs and before the agent starts: creates
@@ -314,6 +323,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(ws.join("inputs/c_src/src/a.c")).unwrap(),
             "int a;"
+        );
+        assert!(
+            ws.join("inputs/agent_skills/cargo_features/SKILL.md")
+                .is_file()
         );
         fs::write(ws.join("shared/build.o"), "").unwrap();
         assert!(case.shared().join("build.o").exists());

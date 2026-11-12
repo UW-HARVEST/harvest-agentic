@@ -85,16 +85,20 @@ pub fn configurable_variables(
 }
 
 /// The Cargo features of a configuration, by the Test-Corpus naming: a boolean parameter
-/// `NAME` set to true is the feature `NAME` (false adds none); a string or integer parameter
-/// `NAME` with value `v` is the feature `NAME_v`.
+/// `NAME` is the feature `NAME`; a string or integer parameter `NAME` with value `v` is the
+/// feature `NAME_v`. The `cargo_features` agent skill names the features by the same rule (the
+/// tests of both read `agent_skills/cargo_features/tests/naming_cases.json`).
 pub fn features(parameters: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
     parameters
         .iter()
-        .filter_map(|(name, value)| match value {
-            serde_json::Value::Bool(true) => Some(name.clone()),
-            serde_json::Value::Bool(false) => None,
-            serde_json::Value::String(v) => Some(format!("{name}_{v}")),
-            v => Some(format!("{name}_{v}")),
+        .map(|(name, value)| match value {
+            // A boolean gives `NAME` also when it is false. This mirrors the official runner
+            // (`_fmt_cargo_features` in Test-Corpus/tools/test_runner/runtests/orchestrator/
+            // build.py). There it looks like a bug: a configuration that sets an option to false
+            // enables its feature, while the C side gets `-DNAME=OFF`. Revisit when it changes.
+            serde_json::Value::Bool(_) => name.clone(),
+            serde_json::Value::String(v) => format!("{name}_{v}"),
+            v => format!("{name}_{v}"),
         })
         .collect()
 }
@@ -104,16 +108,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn features_follow_the_test_corpus_naming() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(CONFIGURATION_FILE);
-        fs::write(
-            &path,
-            r#"{"configurable_variables": {"MODE": "fast", "SIZE": 64, "EXTRA": true, "DEBUG": false}}"#,
-        )
+    fn features_follow_the_shared_naming_cases() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../agent_skills/cargo_features/tests/naming_cases.json"
+        ))
         .unwrap();
-        let mut features = features(&configurable_variables(&path).unwrap());
-        features.sort();
-        assert_eq!(features, ["EXTRA", "MODE_fast", "SIZE_64"]);
+        for case in cases["cases"].as_array().unwrap() {
+            let mut parameters = serde_json::Map::new();
+            parameters.insert(
+                case["option"].as_str().unwrap().to_owned(),
+                case["value"].clone(),
+            );
+            assert_eq!(
+                features(&parameters),
+                [case["feature"].as_str().unwrap()],
+                "{case}"
+            );
+        }
     }
 }

@@ -3,12 +3,10 @@ The external tests use the **cando2 library runner** (`{SUITE}/runner/` +
 vectors of one build configuration: `<name>.json`, or `<name>/cando_vector.json`
 with an optional `setup` script that prepares the working directory. A
 configuration other than `default` lists its build options in
-`configuration.json`; the grader builds it with
-`cargo build --release --no-default-features --features <list>`, where a boolean
-option `NAME` is the feature `NAME` and an option `NAME` with value `v` is the
-feature `NAME_v`. When `{SUITE}/CMakePresets.json` exists, its `test` preset is
-the `default` configuration, and the harness puts its features in your `default`
-features before grading. Build it with them, as below.
+`configuration.json`; the grader builds it with their Cargo features (see the
+Cargo features invariant). When `{SUITE}/CMakePresets.json` exists, its `test`
+preset is the `default` configuration, and the harness puts its features in
+your `default` features before grading. Build it with them, as below.
 The grader builds your crate as a `cdylib` in each
 configuration and, for each vector, runs the compiled runner, which loads YOUR
 `.so`. Reproduce it for the `default` configuration:

@@ -23,7 +23,7 @@ pub(crate) struct RegistryLimits {
 impl AgentInvocation<'_> {
     /// The prompt with the placeholders that all main prompts share filled in:
     /// `{AGENT_BUG_WORKAROUNDS}`, `{GIT_DISCIPLINE}`, `{RUST_TOOLCHAIN_CONTEXT}`,
-    /// `{CASE_LAYOUT}` and `{MODEL_LIMITS}`.
+    /// `{CASE_LAYOUT}`, `{MODEL_LIMITS}` and `{CARGO_FEATURES}`.
     pub(crate) fn render_prompt(&self, limits: &RegistryLimits) -> String {
         let model_limits = render_model_limits(self.subagent_model, limits);
         self.prompt
@@ -35,6 +35,7 @@ impl AgentInvocation<'_> {
             )
             .replace("{CASE_LAYOUT}", self.case.layout())
             .replace("{MODEL_LIMITS}", &model_limits)
+            .replace("{CARGO_FEATURES}", cargo_features())
     }
 }
 
@@ -100,6 +101,15 @@ fn git_discipline() -> &'static str {
     GIT_DISCIPLINE_BODY.trim_end()
 }
 
+const CARGO_FEATURES_BODY: &str = include_str!("cargo_features.md");
+
+/// The rule for the Cargo features of the C build options, and how to use the `cargo_features`
+/// skill that [`CaseDir::new`](crate::CaseDir::new) gives every stage. The `{CARGO_FEATURES}`
+/// placeholder of the main prompts and of task files that a stage writes.
+pub fn cargo_features() -> &'static str {
+    CARGO_FEATURES_BODY.trim_end()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,7 +131,7 @@ mod tests {
             agent: AgentKind::Claude,
             case: &case,
             prompt: "{AGENT_BUG_WORKAROUNDS}\n{GIT_DISCIPLINE}\n{RUST_TOOLCHAIN_CONTEXT}\n\
-                     {CASE_LAYOUT}\n{MODEL_LIMITS}",
+                     {CASE_LAYOUT}\n{MODEL_LIMITS}\n{CARGO_FEATURES}",
             timeout_secs: 1,
             model: None,
             subagent_model: None,
@@ -134,6 +144,7 @@ mod tests {
         let prompt = invocation.render_prompt(&RegistryLimits::default());
         assert!(prompt.contains("TOOLCHAIN"));
         assert!(prompt.contains("### Directories of this run"));
+        assert!(prompt.contains("### Cargo features"));
         assert!(!prompt.contains('{'), "{prompt}");
         case.finish();
     }

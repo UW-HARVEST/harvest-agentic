@@ -76,6 +76,8 @@ test, your hypothesis for the cause, the fix, and the outcome.
   exported by the Rust crate (verified with `nm -D`); a missing symbol makes
   the suite fail to link. Add any that are missing.
 
+{CARGO_FEATURES}
+
 ### Rust toolchain
 - Build and run everything with the pinned toolchain (see the toolchain
   context above). If a different version is active, stop and report an

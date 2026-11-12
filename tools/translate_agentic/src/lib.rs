@@ -20,8 +20,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-mod skills;
-
 const PROMPT_KIRO_EXECUTABLE: &str = include_str!("prompt_kiro_executable.md");
 const PROMPT_KIRO_LIBRARY: &str = include_str!("prompt_kiro_library.md");
 const PROMPT_KIRO_CONFIGURABLE: &str = include_str!("prompt_kiro_configurable.md");
@@ -224,12 +222,14 @@ pub fn check_scout_option(option: &str, no_plan: bool, agent: AgentKind) -> Resu
     ))
 }
 
-/// The scout task, with the tab2rust part when tab2rust is on.
+/// The scout task, with the Cargo feature rule, and the tab2rust part when tab2rust is on.
 fn render_scout(tab2rust: bool) -> String {
-    let scout = SCOUT.replace(
-        "{TAB2RUST_SCOUT}",
-        if tab2rust { SCOUT_TAB2RUST } else { "" },
-    );
+    let scout = SCOUT
+        .replace(
+            "{TAB2RUST_SCOUT}",
+            if tab2rust { SCOUT_TAB2RUST } else { "" },
+        )
+        .replace("{CARGO_FEATURES}", agent_runner::cargo_features());
     fill_tab2rust(&scout, tab2rust)
 }
 
@@ -262,7 +262,7 @@ fn write_scout_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::
     fs::create_dir_all(&prompts)?;
     fs::write(prompts.join("SCOUT.md"), render_scout(tab2rust))?;
     if tab2rust {
-        skills::materialize("tab2rust", &case.inputs().join("agent_skills/tab2rust"))?;
+        case.write_skill("tab2rust")?;
         fs::write(prompts.join("TRANSLATOR.md"), TAB2RUST_TRANSLATOR)?;
     }
     if safe_wrapper {
@@ -436,6 +436,13 @@ mod tests {
         walk(dir, dir, &mut files);
         files.sort();
         (fs::read_to_string(dir.join("Cargo.toml")).unwrap(), files)
+    }
+
+    #[test]
+    fn scout_task_has_no_placeholder_left() {
+        for tab2rust in [false, true] {
+            assert!(!render_scout(tab2rust).contains("{CARGO_FEATURES}"));
+        }
     }
 
     #[test]

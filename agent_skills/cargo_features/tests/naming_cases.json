@@ -1,0 +1,10 @@
+{
+  "about": "The Cargo feature of a build option set to a value. The tests of scripts/cargo_features.py and of the benchmark's configuration builds (benchmark/src/harness/build_config.rs) both read this file.",
+  "cases": [
+    {"option": "WORD_SIZE", "value": "32", "feature": "WORD_SIZE_32"},
+    {"option": "REPEAT", "value": 4, "feature": "REPEAT_4"},
+    {"option": "foo", "value": "Bar", "feature": "foo_Bar"},
+    {"option": "DEBUG", "value": true, "feature": "DEBUG"},
+    {"option": "DEBUG", "value": false, "feature": "DEBUG"}
+  ]
+}

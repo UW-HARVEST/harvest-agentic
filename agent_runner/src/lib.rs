@@ -12,12 +12,14 @@ mod claude;
 mod kiro;
 mod opencode;
 mod prompt;
+mod skills;
 mod toolchain;
 
 pub use case_dir::CaseDir;
 use claude::claude_uses_ccr;
 pub use claude::claude_uses_teamclaude;
 use prompt::RegistryLimits;
+pub use prompt::cargo_features;
 pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_test_corpus};
 
 #[derive(Debug, Clone, Copy)]

@@ -1,18 +1,18 @@
-//! Embeds the skills of `agent_skills/` into the binary. The translate stage gives a skill to an
-//! agent by writing it into the agent's working directory with [`materialize`].
+//! Embeds the skills of `agent_skills/` into the binary. A stage gives a skill to its agents with
+//! [`CaseDir::write_skill`](crate::CaseDir::write_skill).
 
 use include_dir::{Dir, include_dir};
 use std::fs;
 use std::io;
 use std::path::Path;
 
-static SKILLS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../agent_skills");
+static SKILLS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../agent_skills");
 
 /// Directories of a skill that agents do not need: the skill's own tests and Python caches.
 const SKIPPED_DIRS: &[&str] = &["tests", "__pycache__"];
 
 /// Writes the skill `name` (a directory of `agent_skills/`) into `dest`.
-pub fn materialize(name: &str, dest: &Path) -> io::Result<()> {
+pub(crate) fn materialize(name: &str, dest: &Path) -> io::Result<()> {
     let skill = SKILLS.get_dir(name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

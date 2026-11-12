@@ -96,21 +96,7 @@ When in doubt, re-read this section.
 
 ### AFTER ANY COMPACTION: `cat PLAN.md` is your FIRST action before anything.
 
-### Cargo features
-- A build-time option of the C project (a CMake option or cache variable)
-  becomes Cargo features named after the option, case kept: a boolean option
-  `NAME` is the feature `NAME`; an option `NAME` with a string or integer
-  value `v` is the feature `NAME_v`. When `inputs/c_src/configuration.json`
-  exists, it lists the options and their values under `configurable_variables`.
-  Example: `{"WORD_SIZE": ["32", "64"], "ENABLE_EXTRA": [true, false]}` gives
-  the features `WORD_SIZE_32`, `WORD_SIZE_64` and `ENABLE_EXTRA`.
-- The translation MUST be correct in every configuration: every value of
-  every option.
-- The `default` features select the CMake defaults; the harness can replace
-  their option features. Every other configuration is built with
-  `cargo build --release --no-default-features --features <list>`, one
-  feature for each option it sets.
-- The default build and every configuration build must compile.
+{CARGO_FEATURES}
 
 ### Cargo manifest target names
 - `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
@@ -176,7 +162,7 @@ When in doubt, re-read this section.
 ## Codebase summary
 - Files: <one line per .c/.h with line count + 1-line role>
 - Project type: bin / lib / both
-- Build configurability: <Cargo features needed, if any>
+- Build configurability: <the options and their values; the features that `cargo_features.py names` prints>
 - Public API surface: <list of public functions/types>
 
 ## Translation subtasks
@@ -336,10 +322,9 @@ different source files or parameters), you MUST preserve this using Cargo
 features. Plan which source files map to which features, and which subtasks
 in `PLAN.md` will own each feature gate, before writing code.
 
-The exact naming contract for those features lives in the `## Invariants`
-section of your `PLAN.md` template above (and, after Step 0.3, in `PLAN.md`
-itself). Do not restate the rule from memory — re-read it from PLAN.md
-whenever you touch `[features]` in Cargo.toml.
+The naming contract for those features is the Cargo features invariant of
+`PLAN.md`. Write the `[features]` of Cargo.toml yourself, from the output of
+`cargo_features.py names`, before you send the sub-agents that use them.
 
 Break the work into phases: shared/core code first, then
 each backend or variant, then wire up feature gates. These phases should
@@ -377,7 +362,7 @@ like a summary rather than concrete work. In that case:
 
 Run `cargo build --release` and fix any errors until it compiles.
 If the project has Cargo features, also run the configuration builds of the
-Cargo features contract (see Invariants) and fix them until they compile.
+Cargo features invariant, and fix them until they compile.
 
 Once the build is green and all subtasks are checked, mark the whole plan
 complete in `PLAN.md` with a final note.

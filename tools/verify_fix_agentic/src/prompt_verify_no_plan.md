@@ -37,12 +37,11 @@ Your task:
 Add `libloading = "0.8"` to [dev-dependencies] in Cargo.toml.
 Do NOT modify anything in inputs/c_src.
 
-If the C project has build options (`inputs/c_src/configuration.json` lists them and
-their values when it exists), the Rust must be correct for every value of every option.
+{CARGO_FEATURES}
+
 Verify each configuration you can:
 - Clean and rebuild C with the option values as cmake `-D` flags
-- Rebuild Rust with `--no-default-features --features <list>`, the features matching
-  the option values. Do not rely on the `default` features: the harness can change them
+- Rebuild Rust with its Cargo features
 - Re-run integration tests and fix any mismatches before moving to the next configuration
 
 IMPORTANT: Use timeouts for all commands. No single build or test command should

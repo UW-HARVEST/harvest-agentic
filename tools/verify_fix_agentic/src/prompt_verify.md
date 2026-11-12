@@ -74,16 +74,9 @@ These rules govern verification. They must survive every compaction unchanged.
   every executable run result (stdout, stderr, exit status, written files).
 - If C and Rust diverge, fix Rust. NEVER modify C.
 
-### Cargo features (FRAMEWORK CONTRACT — enforced by the grader)
-- A build-time option `NAME` of the C project is the feature `NAME` when it is
-  boolean, and the feature `NAME_v` for each string or integer value `v`, case
-  kept (`inputs/c_src/configuration.json`, when present, lists the options).
-- The `default` features select the CMake defaults, but the harness can
-  replace their option features. Build each configuration you test with
-  `cargo build --release --no-default-features --features <list>`, as the
-  grader does.
-- If `Cargo.toml` names its features differently, the grader fails. That is a
-  Cargo.toml bug, not a test-command bug — fix the Cargo.toml.
+{CARGO_FEATURES}
+
+### Cargo manifest target names
 - `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
   Hyphens cause manifest parse failure. Fix Cargo.toml if you see them.
 
@@ -91,15 +84,12 @@ These rules govern verification. They must survive every compaction unchanged.
 - Do NOT modify anything in `inputs/c_src`.
 
 ### Configuration coverage
-- The build options and their legal values are in `inputs/c_src/configuration.json`
-  (`configurable_variables`) when it exists, and otherwise in the CMake files
-  and documentation of `inputs/c_src`. Test every configuration: the grader
+- Test every configuration (see the Cargo features invariant): the grader
   can test any of them. When there are too many combinations, test every
   value of each option at least once and record the choice in `CONFIGS.md`.
   For each configuration you test:
     1. Clean and rebuild C with the option values as cmake `-D` flags.
-    2. Rebuild Rust with the matching Cargo features (see the Cargo features
-       contract above).
+    2. Rebuild Rust with its Cargo features.
     3. Re-run integration tests and fix any mismatches before moving on.
 
 ### Surface coverage and completion

@@ -45,20 +45,13 @@ Before writing a single line of Rust, you MUST:
 ## Step 2: Plan the translation
 
 If the project has build-time configurability (CMake cache variables selecting different
-source files or parameters):
-- You MUST preserve this using **Cargo features** named after the option, case kept:
-  a boolean option `NAME` is the feature `NAME`; an option `NAME` with a string or
-  integer value `v` is the feature `NAME_v`. When `inputs/c_src/configuration.json`
-  exists, it lists the options and their values under `configurable_variables`.
-- The translation MUST be correct in every configuration: every value of every option.
-- The `default` features select the CMake defaults; the harness can replace their option
-  features. Every other configuration is built with
-  `cargo build --release --no-default-features --features <list>`, one feature for each
-  option it sets.
+source files or parameters), you MUST preserve this with Cargo features (see "Cargo features"
+below):
 - Use `#[cfg(feature = "...")]` to conditionally compile modules and set constants.
-- The default build and every configuration build must compile.
 - Plan which source files map to which features before writing code.
 - Do NOT hardcode a single configuration — every variant must be implemented.
+
+{CARGO_FEATURES}
 
 For large projects, break the work into phases: shared/core code first, then each
 backend or variant, then wire up feature gates.
@@ -85,9 +78,8 @@ backend or variant, then wire up feature gates.
 ## Step 4: Verify
 
 Run `cargo build --release` and fix any errors until it compiles.
-If the project has Cargo features, also run the configuration builds
-(`cargo build --release --no-default-features --features <list>`) and fix them
-until they compile.
+If the project has Cargo features, also run the configuration builds (see "Cargo features"
+above) and fix them until they compile.
 
 Do NOT modify anything in inputs/c_src.
 

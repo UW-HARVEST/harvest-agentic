@@ -25,11 +25,13 @@ Find these facts for the files of your group:
 1. Inventory: each `.c` and `.h` file, its line count, and its role in one line.
 2. Project type: library (exported functions), program (`main()`), or both.
 3. Public API: the exported functions and types.
-4. Build configurability: the options and cache variables in `inputs/c_src/CMakeLists.txt`
-   and `inputs/c_src/configuration.json`, the source files that they select, and the `#if` switches that they
-   control. These become Cargo features.
+4. Build configurability: the build options and their values as the C project writes them, with
+   `file:line`, the source files that they select, and the `#if` switches that they control. These
+   become Cargo features (see "Cargo features" below).
 5. Symbol renames: macros that change linker symbols, for example `#define foo NAMESPACE(foo)`.
 6. Call groups: functions that call each other, also across files. Find the call sites with `grep`.
+
+{CARGO_FEATURES}
 
 ## Propose subtasks
 
@@ -56,7 +58,7 @@ Reply with only these sections, in at most 80 lines.
 
 - Files: <one line per .c/.h with line count + 1-line role>
 - Project type: bin / lib / both
-- Build configurability: <Cargo features needed, if any>
+- Build configurability: <the options and their values; the features that `cargo_features.py names` prints>
 - Public API surface: <list of public functions/types>
 
 ### Proposed subtasks

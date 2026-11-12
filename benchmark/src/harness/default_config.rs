@@ -117,7 +117,8 @@ fn apply_preset(
 }
 
 /// The preset's values, with a CMake truth value for each option whose legal values in
-/// `options` (the C source's `configurable_variables`) are booleans.
+/// `options` (the C source's `configurable_variables`) are booleans. A false option is left out:
+/// in `default`, a boolean option that is off has no feature.
 fn typed_values(preset: &Map<String, Value>, options: &Map<String, Value>) -> Map<String, Value> {
     let is_boolean = |name: &str| {
         options
@@ -137,6 +138,7 @@ fn typed_values(preset: &Map<String, Value>, options: &Map<String, Value>) -> Ma
             ),
             _ => (name.clone(), value.clone()),
         })
+        .filter(|(_, value)| *value != Value::Bool(false))
         .collect()
 }
 
