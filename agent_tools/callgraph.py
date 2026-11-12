@@ -383,6 +383,15 @@ def cmd_dot(graph: dict[str, set[str]], indirect: set[str]) -> int:
         print(f'  // indirect-call-site: {f}')
         print(f'  "{f}" [style=filled, fillcolor="#ffd6d6", '
               f'tooltip="{INDIRECT_MARKER}"];')
+    # Emit a bare node line for EVERY function, so a function with no callees
+    # and no callers (e.g. a public API leaf like LZ4_versionNumber that the
+    # library never calls itself) still appears in the DOT. Without this, a
+    # downstream consumer that reads only edge lines silently loses every
+    # edgeless function.
+    for func in sorted(graph):
+        if func in indirect:
+            continue  # already emitted above with its style
+        print(f'  "{_dot_safe(func)}";')
     for func, callees in sorted(graph.items()):
         for callee in sorted(callees):
             print(f'  "{_dot_safe(func)}" -> "{_dot_safe(callee)}";')

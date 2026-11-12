@@ -56,7 +56,10 @@ def run_callgraph_dot(callgraph_py: Path, compile_commands: Path) -> str:
 
 _EDGE_RE = re.compile(r'^\s*"(?P<src>(?:[^"\\]|\\.)*)"\s*->\s*"(?P<dst>(?:[^"\\]|\\.)*)"')
 _INDIRECT_RE = re.compile(r'^\s*//\s*indirect-call-site:\s*(?P<name>.+?)\s*$')
-_NODE_RE = re.compile(r'^\s*"(?P<name>(?:[^"\\]|\\.)*)"\s*\[')
+# Matches a node line that is NOT an edge: a quoted name followed by an
+# attribute list (`"n" [...]`) or a bare statement (`"n";`). The negative
+# lookahead rejects `"a" -> "b"` so edges are handled only by _EDGE_RE.
+_NODE_RE = re.compile(r'^\s*"(?P<name>(?:[^"\\]|\\.)*)"\s*(?!->)(\[|;|$)')
 
 
 def parse_dot(dot: str):
@@ -91,6 +94,46 @@ def parse_dot(dot: str):
 
 def _unescape(s: str) -> str:
     return s.replace('\\"', '"')
+
+
+# Well-known C library / system functions the project links against but does
+# not define. They appear as leaf callees in the graph; they are NOT migration
+# units and must not become capsule members or create inter-capsule
+# dependencies (e.g. "both capsules call malloc" is not a real dependency).
+_LIBC_NAMES = frozenset({
+    "malloc", "calloc", "realloc", "free", "aligned_alloc", "posix_memalign",
+    "memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp", "strncmp",
+    "strcpy", "strncpy", "strcat", "strchr", "strrchr", "strstr", "strdup",
+    "printf", "fprintf", "snprintf", "vsnprintf", "puts", "fputs",
+    "fread", "fwrite", "fopen", "fclose", "fflush", "fseek", "ftell",
+    "abort", "exit", "qsort", "bsearch", "getenv", "atoi", "strtol",
+})
+# Common decorations around those names: macOS underscore ABI (_fwrite),
+# fortified wrappers (__memcpy_chk), the callgraph DOT's numeric prefixes
+# (001_fwrite), and assertion helpers.
+_LIBC_RE = re.compile(
+    r'^(?:\d+_)?_{0,2}(' + "|".join(sorted(_LIBC_NAMES, key=len, reverse=True))
+    + r')(?:_chk)?$'
+)
+_ASSERT_RE = re.compile(r'(?:^|_)_*assert(?:_\w+)?$')
+
+
+def classify_external(nodes: set[str], edges: list[tuple[str, str]]) -> set[str]:
+    """
+    Decide which nodes are external (libc/system), so they can be excluded
+    from capsules and from dependency computation.
+
+    A node is external if its name matches a known libc/system function after
+    stripping platform decorations (leading digits, underscores, a `_chk`
+    suffix). We rely on name-matching alone and deliberately do NOT treat
+    every edgeless/sink node as external: a legitimate project leaf such as
+    `LZ4_versionNumber` is exactly the function that must be KEPT (see Bug #1).
+    """
+    external: set[str] = set()
+    for n in nodes:
+        if _LIBC_RE.match(n) or _ASSERT_RE.search(n):
+            external.add(n)
+    return external
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +175,9 @@ def connected_components(nodes: set[str], edges: list[tuple[str, str]]) -> list[
     groups: dict[str, set[str]] = defaultdict(set)
     for n in nodes:
         groups[find(n)].add(n)
-    return list(groups.values())
+    # Deterministic order: sort capsules by their sorted member list so repeated
+    # runs on the same graph produce identical output.
+    return sorted(groups.values(), key=lambda c: sorted(c))
 
 
 def _edge_weights(edges: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
@@ -254,7 +299,9 @@ def agglomerative(
             continue
         break
 
-    return list(caps.values())
+    # Deterministic order: sort capsules by their sorted member list so
+    # repeated runs on the same graph produce identical output.
+    return sorted(caps.values(), key=lambda c: sorted(c))
 
 
 # ---------------------------------------------------------------------------
@@ -541,21 +588,33 @@ def main() -> None:
     if not nodes:
         sys.exit("callgraph.py produced no functions — check its warnings above.")
 
+    # Drop external (libc/system) nodes from the partition: they are not
+    # migration units, and keeping them would invent false dependencies
+    # ("both capsules call malloc") and non-deterministic capsule membership.
+    # Edges TO them are dropped too; edges between library functions are kept.
+    external = classify_external(nodes, edges)
+    if external:
+        print(f"[capsules] excluding {len(external)} external/system node(s): "
+              + ", ".join(sorted(external)[:12])
+              + (" …" if len(external) > 12 else ""), file=sys.stderr)
+    lib_nodes = {n for n in nodes if n not in external}
+    lib_edges = [(a, b) for a, b in edges if a not in external and b not in external]
+
     if args.group == "components":
-        capsules = connected_components(nodes, edges)
+        capsules = connected_components(lib_nodes, lib_edges)
         grouping_desc = "connected components (loose; one capsule per island)"
     else:
-        capsules = agglomerative(nodes, edges, args.max_cross)
+        capsules = agglomerative(lib_nodes, lib_edges, args.max_cross)
         grouping_desc = f"agglomerative (max-cross={args.max_cross:.2f})"
 
-    ordering, deps = order_capsules(capsules, edges)
-    metric = score_partition(capsules, edges)
-    plan = write_plan(capsules, ordering, deps, edges, indirect,
+    ordering, deps = order_capsules(capsules, lib_edges)
+    metric = score_partition(capsules, lib_edges)
+    plan = write_plan(capsules, ordering, deps, lib_edges, indirect,
                       args.compile_commands, metric, grouping_desc)
 
     if args.output:
         args.output.write_text(plan)
-        print(f"wrote {args.output} ({len(capsules)} capsules, {len(nodes)} "
+        print(f"wrote {args.output} ({len(capsules)} capsules, {len(lib_nodes)} "
               f"functions, cohesion {metric['cohesion']:.1%}, "
               f"modularity {metric['modularity']:.3f})", file=sys.stderr)
     else:
