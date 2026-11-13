@@ -1,6 +1,7 @@
+use crate::extra_info::ExtraInfo;
 use clap::{Parser, ValueEnum};
 use harvest_core::config::{AgentKind, Stage};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which validation harness to run translated projects against.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +189,21 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub safe_wrapper: bool,
 
+    /// Give the translate stage results of an analysis of the C programs
+    /// that you already have. The only SOURCE is `sll`: reports of a list
+    /// analysis, from which a list scout decides the Rust representation of
+    /// each singly linked list type. PATH is one report file, or a directory
+    /// with one `<program directory name>.json` for each program. Requires
+    /// the translate stage. An error with --no-plan, Kiro or --safe-wrapper.
+    /// See the README, "Extra information: list analysis reports".
+    #[arg(
+        long,
+        requires = "agentic",
+        value_name = "SOURCE=PATH",
+        value_parser = |s: &str| s.parse::<ExtraInfo>()
+    )]
+    pub extra_info: Option<ExtraInfo>,
+
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
     /// harness also describes FuzzTest to the agent and ships its
     /// scaffolding; with this flag the agent gets plain GoogleTest only.
@@ -239,6 +255,13 @@ impl Args {
         stages
     }
 
+    /// The PATH of `--extra-info sll=PATH`.
+    pub fn sll_info(&self) -> Option<&Path> {
+        self.extra_info
+            .as_ref()
+            .map(|ExtraInfo::Sll(path)| path.as_path())
+    }
+
     /// Validates flag/stage combinations that clap cannot express (they
     /// depend on the *value* of --agentic, not its presence).
     pub fn validate_stages(&self, stages: &[Stage]) -> Result<(), String> {
@@ -256,6 +279,7 @@ impl Args {
         let translate_only_flags = [
             (self.no_tab2rust, "--no-tab2rust"),
             (self.safe_wrapper, "--safe-wrapper"),
+            (self.extra_info.is_some(), "--extra-info"),
         ];
         for (set, flag) in translate_only_flags {
             if set && !has(Stage::Translate) {
@@ -290,6 +314,10 @@ impl Args {
                     self.agent.unwrap_or_default(),
                 )?;
             }
+        }
+        // As above: the translate stage checks a safe_wrapper of a config file.
+        if self.sll_info().is_some() {
+            translate_agentic::check_sll_option("--extra-info sll", self.safe_wrapper)?;
         }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
@@ -393,15 +421,51 @@ mod tests {
         assert!(err.contains("--no-fuzz"), "{err}");
     }
 
+    /// The options of the scout wave: the argument, and the flag that an error names.
+    const SCOUT_FLAGS: [(&str, &str); 3] = [
+        ("--no-tab2rust", "--no-tab2rust"),
+        ("--safe-wrapper", "--safe-wrapper"),
+        ("--extra-info=sll=.", "--extra-info"),
+    ];
+
     #[test]
     fn scout_flags_require_translate_stage() {
-        for flag in ["--no-tab2rust", "--safe-wrapper"] {
-            let args = parse(&["bench", "--agentic=v", flag, "in", "out"]).unwrap();
+        for (arg, flag) in SCOUT_FLAGS {
+            let args = parse(&["bench", "--agentic=v", arg, "in", "out"]).unwrap();
             let err = args.validate_stages(&args.stages()).unwrap_err();
             assert!(err.contains(flag), "{err}");
-            let args = parse(&["bench", "--agentic=t,v", flag, "in", "out"]).unwrap();
+            let args = parse(&["bench", "--agentic=t,v", arg, "in", "out"]).unwrap();
             args.validate_stages(&args.stages()).unwrap();
         }
+    }
+
+    #[test]
+    fn extra_info_gives_the_list_reports_once() {
+        // The values themselves are tested in extra_info.
+        let once = ["bench", "--agentic=t", "--extra-info", "sll=.", "in", "out"];
+        assert_eq!(parse(&once).unwrap().sll_info(), Some(Path::new(".")));
+        assert!(parse(&["bench", "--agentic=t", "--extra-info", "sll", "in", "out"]).is_err());
+        let mut twice = once.to_vec();
+        twice.splice(2..2, ["--extra-info", "sll=.."]);
+        assert!(parse(&twice).is_err());
+    }
+
+    #[test]
+    fn extra_info_is_not_combined_with_safe_wrapper() {
+        let argv = [
+            "bench",
+            "--agentic=t",
+            "--extra-info=sll=.",
+            "--safe-wrapper",
+            "in",
+            "out",
+        ];
+        let args = parse(&argv).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(
+            err.starts_with("--extra-info sll cannot be used with"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -445,9 +509,9 @@ mod tests {
 
     #[test]
     fn scout_flags_need_a_prompt_that_sends_scouts() {
-        for flag in ["--no-tab2rust", "--safe-wrapper"] {
+        for (arg, flag) in SCOUT_FLAGS {
             for extra in [&["--no-plan"][..], &["--agent", "kiro"]] {
-                let mut argv = vec!["bench", "--agentic=t", flag];
+                let mut argv = vec!["bench", "--agentic=t", arg];
                 argv.extend_from_slice(extra);
                 argv.extend(["in", "out"]);
                 let args = parse(&argv).unwrap();

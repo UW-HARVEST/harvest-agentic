@@ -164,6 +164,7 @@ harness build would otherwise report every test as a failure.
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
 | `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |
 | `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` or with the Kiro agent |
+| `--extra-info <SOURCE=PATH>` | Give the translate stage results of an analysis of the C programs that you already have. The only source is `sll`. See "Extra information: list analysis reports" below. Requires the translate stage. An error with `--no-plan`, with the Kiro agent, or together with `--safe-wrapper` |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
@@ -174,6 +175,35 @@ harness build would otherwise report every test as a failure.
 `--timeout`, `--test-harness`, `--filter`, and `--exclude` work as in
 non-agentic benchmark runs. Flags scoped to a stage (e.g. `--no-fuzz` to verify)
 are rejected when that stage is not part of the run.
+
+### Extra information: list analysis reports
+
+`--extra-info sll=<PATH>` gives the translate stage the JSON report of a list
+analysis of each C program. A report lists the struct types that are singly
+linked lists, and tells whether the functions of the program keep the list
+shape. PATH is one of these:
+
+- A directory with one report for each program. The file name is the name of
+  the program directory. A program without a file runs as without the option,
+  and the log has the line `No sll info for <program>`.
+
+  ```
+  reports/
+    lz4.json    # for the program directory harvest-bench/tests/lz4/
+    mujs.json
+  ```
+
+- One report file, when the run has one program.
+
+With a report, the translate stage sends a list scout with the scouts. The
+list scout uses the `sll` skill (`agent_skills/sll/`): it writes one card for
+each list type in `scout/sll/` of the crate, with the Rust representation that
+it chose (`Vec`/`VecDeque`, a chain of `Option<Box<Node>>`, borrowed nodes, or
+the C layout). The translation sub-agents follow the cards. The framework only
+copies the report into the inputs of the run. It does not read it.
+
+The `translate` binary takes the report of its program as
+`-c tools.translate_agentic.sll_report=<file>`.
 
 ## Code quality metrics
 

@@ -3,7 +3,8 @@
 //! ```text
 //! /var/tmp/.tmpXXXX/      case_dir (in `large_temp_dir()`): removed after a successful run,
 //!                         kept after a failed one
-//!   inputs/               inputs from the framework (C source, task files, skills, suites), read-only
+//!   inputs/               inputs from the framework (C source, task files, skills, suites, extra
+//!                         information), read-only
 //!   shared/               large files that agents share and that git must not record (tab2rust builds)
 //!   workspace/            the agent's working directory: the crate and the reports. Frozen.
 //!     inputs, shared      symbolic links to the two directories above (absolute targets). Git

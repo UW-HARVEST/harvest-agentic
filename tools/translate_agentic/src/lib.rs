@@ -34,6 +34,10 @@ const SAFE_WRAPPER_DESIGNER: &str = include_str!("safe_wrapper_designer.md");
 const SAFE_WRAPPER_TRANSLATOR: &str = include_str!("safe_wrapper_translator.md");
 const SAFE_WRAPPER_DISPATCH: &str = include_str!("safe_wrapper_dispatch.md");
 const SAFE_WRAPPER_INVARIANT: &str = include_str!("safe_wrapper_invariant.md");
+const SLL_SCOUT: &str = include_str!("sll_scout.md");
+const SLL_TRANSLATOR: &str = include_str!("sll_translator.md");
+const SLL_DISPATCH: &str = include_str!("sll_dispatch.md");
+const SLL_INVARIANT: &str = include_str!("sll_invariant.md");
 static SAFE_WRAPPER_RT: Dir = include_dir!("$CARGO_MANIFEST_DIR/safe_wrapper_rt/src");
 
 pub struct TranslateAgentic;
@@ -67,11 +71,19 @@ impl Tool for TranslateAgentic {
         if config.safe_wrapper {
             check_scout_option("safe_wrapper = true", config.no_plan, agent)?;
         }
+        if let Some(report) = &config.sll_report {
+            check_scout_option("sll_report", config.no_plan, agent)?;
+            check_sll_option("sll_report", config.safe_wrapper)?;
+            // Checked before case_dir exists: a failed run keeps its case_dir.
+            if !report.is_file() {
+                return Err(format!("sll_report {} is not a file", report.display()).into());
+            }
+        }
         let translate_prompt = load_prompt(&config, &project_spec.kind, agent);
         let no_plan = config.no_plan;
 
-        // The agent works in case_dir/workspace/. The C source and, with scouts, the task files and
-        // the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
+        // The agent works in case_dir/workspace/. The C source and, with scouts, the task files,
+        // the skills and the list report are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
         let case = CaseDir::new()?;
         let workspace = case.workspace();
         raw_source.dir.materialize(case.c_src())?;
@@ -80,8 +92,9 @@ impl Tool for TranslateAgentic {
         let scouts = sends_scouts(config.no_plan, agent);
         let tab2rust = scouts && config.tab2rust;
         let safe_wrapper = scouts && config.safe_wrapper;
+        let sll_report = config.sll_report.as_deref().filter(|_| scouts);
         if scouts {
-            write_scout_files(&case, tab2rust, safe_wrapper)?;
+            write_scout_files(&case, tab2rust, safe_wrapper, sll_report)?;
         }
         let reference_guard = case.lock_inputs()?;
 
@@ -95,8 +108,9 @@ impl Tool for TranslateAgentic {
             ""
         };
         let translate_prompt =
-            fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper)
-                .replace("{WORKFLOW_HINT}", workflow_hint);
+            fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper);
+        let translate_prompt = fill_sll(&translate_prompt, sll_report.is_some())
+            .replace("{WORKFLOW_HINT}", workflow_hint);
 
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Translate,
@@ -207,10 +221,10 @@ fn sends_scouts(no_plan: bool, agent: AgentKind) -> bool {
     agent != AgentKind::Kiro && !no_plan
 }
 
-/// Refuses an option of the scout wave (`tab2rust = false`, `safe_wrapper = true`) where it has
-/// no effect: only the prompt that sends scouts (the plan prompt of Claude and OpenCode) uses
-/// tab2rust and the Safe API Wrapper Designer. The translate stage checks the resolved config; the
-/// benchmark checks its command line before the run starts.
+/// Refuses an option of the scout wave (`tab2rust = false`, `safe_wrapper = true`, `sll_report`)
+/// where it has no effect: only the prompt that sends scouts (the plan prompt of Claude and
+/// OpenCode) uses tab2rust, the Safe API Wrapper Designer and the list scout. The translate stage
+/// checks the resolved config; the benchmark checks its command line before the run starts.
 pub fn check_scout_option(option: &str, no_plan: bool, agent: AgentKind) -> Result<(), String> {
     if sends_scouts(no_plan, agent) {
         return Ok(());
@@ -219,6 +233,19 @@ pub fn check_scout_option(option: &str, no_plan: bool, agent: AgentKind) -> Resu
         "{option} has no effect with agent {agent}{}: only the plan prompt of Claude and \
          OpenCode sends scouts",
         if no_plan { " and no_plan" } else { "" }
+    ))
+}
+
+/// Refuses a list report (`option`) together with the Safe API Wrapper Designer. The list rules and
+/// the boundary design give the translation sub-agents different rules for the same code, so this
+/// version does not combine them. Called from the same two places as [`check_scout_option`].
+pub fn check_sll_option(option: &str, safe_wrapper: bool) -> Result<(), String> {
+    if !safe_wrapper {
+        return Ok(());
+    }
+    Err(format!(
+        "{option} cannot be used with the Safe API Wrapper Designer (safe_wrapper): this version \
+         does not combine the two"
     ))
 }
 
@@ -252,12 +279,34 @@ fn fill_safe_wrapper(prompt: &str, safe_wrapper: bool) -> String {
         .replace("{SAFE_WRAPPER_INVARIANT}", invariant)
 }
 
+/// Fills the list placeholders of a prompt: the list scout in the scout wave and the list rule, or
+/// nothing. Each placeholder is on the line of its safe-wrapper placeholder, so that a prompt
+/// without a list report has no trace of the option, not even an empty line. The two options are
+/// never on together ([`check_sll_option`]), so the list scout has the item number of the designer.
+fn fill_sll(prompt: &str, sll: bool) -> String {
+    let (dispatch, invariant) = if sll {
+        (SLL_DISPATCH, SLL_INVARIANT)
+    } else {
+        ("", "")
+    };
+    prompt
+        .replace("{SLL_DISPATCH}", dispatch)
+        .replace("{SLL_INVARIANT}", invariant)
+}
+
 /// Writes the scout inputs into `inputs/`: `prompts/SCOUT.md`; with tab2rust, the skill
 /// (`agent_skills/tab2rust/`) and `prompts/TRANSLATOR.md`; with safe_wrapper,
 /// `prompts/SAFE_WRAPPER_DESIGNER.md`, `prompts/SAFE_WRAPPER_TRANSLATOR.md` and the framework items
-/// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses. The scouts
-/// and the designer write their reports in `workspace/scout/`, which is created here.
-fn write_scout_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::Result<()> {
+/// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses; with a
+/// list report, its unchanged copy `extra_info/sll/report.json`, the skill (`agent_skills/sll/`),
+/// `prompts/SLL_SCOUT.md` and `prompts/SLL_TRANSLATOR.md`. The scouts, the designer and the list
+/// scout write their reports in `workspace/scout/`, which is created here.
+fn write_scout_files(
+    case: &CaseDir,
+    tab2rust: bool,
+    safe_wrapper: bool,
+    sll_report: Option<&Path>,
+) -> io::Result<()> {
     let prompts = case.inputs().join("prompts");
     fs::create_dir_all(&prompts)?;
     fs::write(prompts.join("SCOUT.md"), render_scout(tab2rust))?;
@@ -277,6 +326,14 @@ fn write_scout_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::
             prompts.join("SAFE_WRAPPER_TRANSLATOR.md"),
             SAFE_WRAPPER_TRANSLATOR,
         )?;
+    }
+    if let Some(report) = sll_report {
+        let dir = case.inputs().join("extra_info/sll");
+        fs::create_dir_all(&dir)?;
+        fs::copy(report, dir.join("report.json"))?;
+        case.write_skill("sll")?;
+        fs::write(prompts.join("SLL_SCOUT.md"), SLL_SCOUT)?;
+        fs::write(prompts.join("SLL_TRANSLATOR.md"), SLL_TRANSLATOR)?;
     }
     fs::create_dir_all(case.workspace().join("scout"))
 }
@@ -325,6 +382,15 @@ pub struct Config {
     /// `--safe-wrapper` turns it on. Only the prompts that send scouts use it.
     #[serde(default)]
     pub safe_wrapper: bool,
+
+    /// The report of a list analysis of the C program: its singly linked list types, and whether
+    /// its functions keep the chain shape. With it, the stage gives the agents the report and the
+    /// sll skill (`agent_skills/sll/`), and sends a list scout with the scouts: it decides the Rust
+    /// representation of each list type, and the translation sub-agents follow it. The stage only
+    /// checks that the file exists. The benchmark option `--extra-info sll=<PATH>` sets it for
+    /// each program. Only the prompts that send scouts use it, and not together with
+    /// `safe_wrapper`.
+    pub sll_report: Option<PathBuf>,
 
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
@@ -442,6 +508,73 @@ mod tests {
     fn scout_task_has_no_placeholder_left() {
         for tab2rust in [false, true] {
             assert!(!render_scout(tab2rust).contains("{CARGO_FEATURES}"));
+        }
+    }
+
+    /// Step 0.2 of a plan prompt: the scout wave.
+    fn scout_step(prompt: &str) -> &str {
+        let start = prompt.find("### 0.2").unwrap();
+        &prompt[start..prompt.find("### 0.3").unwrap()]
+    }
+
+    #[test]
+    fn prompt_without_list_report_is_the_prompt_without_the_placeholders() {
+        // Each placeholder is on the line of another one, so its removal leaves no empty line.
+        assert!(PROMPT_TRANSLATE.contains("{SAFE_WRAPPER_DISPATCH}{SLL_DISPATCH}\n"));
+        assert!(PROMPT_TRANSLATE.contains("{SLL_INVARIANT}{SAFE_WRAPPER_INVARIANT}\n"));
+        let before = PROMPT_TRANSLATE
+            .replace("{SLL_DISPATCH}", "")
+            .replace("{SLL_INVARIANT}", "");
+        for safe_wrapper in [false, true] {
+            let prompt = fill_sll(&fill_safe_wrapper(PROMPT_TRANSLATE, safe_wrapper), false);
+            assert_eq!(prompt, fill_safe_wrapper(&before, safe_wrapper));
+        }
+    }
+
+    #[test]
+    fn list_scout_is_item_5_of_the_scout_step() {
+        let prompt = fill_sll(&fill_safe_wrapper(PROMPT_TRANSLATE, false), true);
+        let step = scout_step(&prompt);
+        assert!(step.contains("\n4. "));
+        assert!(step.contains("\n5. In the same message as the scouts, also send one list scout"));
+        assert_eq!(step.matches("\n5. ").count(), 1);
+        assert!(prompt.contains("\n### Linked list types\n"));
+        assert!(!prompt.contains("{SLL_"));
+    }
+
+    #[test]
+    fn list_report_and_safe_wrapper_are_not_combined() {
+        check_sll_option("sll_report", false).unwrap();
+        let err = check_sll_option("sll_report", true).unwrap_err();
+        assert!(err.starts_with("sll_report cannot be used with"), "{err}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // CaseDir::new has no statvfs shim
+    fn list_report_adds_its_inputs_to_the_scout_files() {
+        let report = tempfile::NamedTempFile::new().unwrap();
+        fs::write(report.path(), "never parsed").unwrap();
+        let copy = "extra_info/sll/report.json";
+        let sll_files = [
+            copy,
+            "agent_skills/sll/SKILL.md",
+            "agent_skills/sll/references/rewriting.md",
+            "agent_skills/sll/scripts/sll_cards.py",
+            "prompts/SLL_SCOUT.md",
+            "prompts/SLL_TRANSLATOR.md",
+        ];
+        for sll_report in [None, Some(report.path())] {
+            let case = CaseDir::new().unwrap();
+            write_scout_files(&case, false, false, sll_report).unwrap();
+            let inputs = case.inputs();
+            for file in sll_files {
+                assert_eq!(inputs.join(file).is_file(), sll_report.is_some(), "{file}");
+            }
+            if sll_report.is_some() {
+                let copied = fs::read_to_string(inputs.join(copy)).unwrap();
+                assert_eq!(copied, "never parsed");
+            }
+            case.finish();
         }
     }
 

@@ -1,5 +1,6 @@
 mod cli;
 mod error;
+mod extra_info;
 mod harness;
 mod io;
 mod ir_utils;
@@ -176,6 +177,9 @@ pub struct ProgramRun {
     /// Test-Corpus checkout for the toolchain contract, from the input
     /// snapshot's manifest or detected now.
     pub test_corpus_root: Option<PathBuf>,
+    /// The list report of this program (`--extra-info sll=...`), for the
+    /// translate stage. `None` when the program has none.
+    pub sll_report: Option<PathBuf>,
 }
 
 /// Returns whether the directory is occupied, so a caller allowed through
@@ -624,6 +628,12 @@ fn benchmark_single_program(
         if opts.safe_wrapper {
             effective_overrides.push("tools.translate_agentic.safe_wrapper=true".to_owned());
         }
+        if let Some(report) = &program_run.sll_report {
+            effective_overrides.push(format!(
+                "tools.translate_agentic.sll_report={}",
+                report.display()
+            ));
+        }
     }
     if opts.has(Stage::Verify) {
         stage_overrides(
@@ -1058,7 +1068,11 @@ fn test_program_dirs(
 /// Resolves a program's inputs for a run that starts from a bench test case:
 /// the C source is the bench `test_case/`, and the external suite (if any)
 /// sits beside it in the bench program directory.
-fn start_from_bench(bench_program_dir: &Path, name: String) -> HarvestResult<ProgramRun> {
+fn start_from_bench(
+    bench_program_dir: &Path,
+    name: String,
+    sll_report: Option<PathBuf>,
+) -> HarvestResult<ProgramRun> {
     let (c_source_dir, _) = parse_benchmark_dir(bench_program_dir)?;
     let suite_root =
         load_test_suite::has_suite(bench_program_dir).then(|| bench_program_dir.to_path_buf());
@@ -1080,6 +1094,7 @@ fn start_from_bench(bench_program_dir: &Path, name: String) -> HarvestResult<Pro
         bench_revision: harvest_core::utils::git_revision(bench_program_dir),
         bench_program: name.clone(),
         name,
+        sll_report,
     })
 }
 
@@ -1153,6 +1168,8 @@ fn resume_from(
         bench_program: manifest.bench_program,
         bench_revision,
         test_corpus_root: manifest.test_corpus_root,
+        // Only the translate stage takes a list report, and a resumed run has no translate stage.
+        sll_report: None,
     })
 }
 
@@ -1268,7 +1285,11 @@ fn run(args: Args) -> HarvestResult<()> {
         program_runs.push(if resume_from_snapshot {
             resume_from(dir, name, args.test_case.as_deref())?
         } else {
-            start_from_bench(dir, name)?
+            let sll_report = match args.sll_info() {
+                Some(path) => extra_info::sll_report(path, &name, program_dirs.len())?,
+                None => None,
+            };
+            start_from_bench(dir, name, sll_report)?
         });
     }
 
