@@ -89,7 +89,8 @@ fn limits_section(heading: &str, model: Option<&str>, limits: Option<&ModelLimit
 fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Kiro => "",
-        // Async sub-agents are killed when a headless `claude -p` session ends.
+        // Async sub-agent kill, report-file guard, and the Agent tool's advice
+        // against sub-agents.
         AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),
         AgentKind::OpenCode => include_str!("agent_bug_workarounds/opencode.md").trim_end(),
     }
