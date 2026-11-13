@@ -35,6 +35,7 @@ const SAFE_WRAPPER_TRANSLATOR: &str = include_str!("safe_wrapper_translator.md")
 const SAFE_WRAPPER_DISPATCH: &str = include_str!("safe_wrapper_dispatch.md");
 const SAFE_WRAPPER_INVARIANT: &str = include_str!("safe_wrapper_invariant.md");
 const SLL_SCOUT: &str = include_str!("sll_scout.md");
+const SLL_SCOUT_RULE: &str = include_str!("sll_scout_rule.md");
 const SLL_TRANSLATOR: &str = include_str!("sll_translator.md");
 const SLL_DISPATCH: &str = include_str!("sll_dispatch.md");
 const SLL_INVARIANT: &str = include_str!("sll_invariant.md");
@@ -130,6 +131,10 @@ impl Tool for TranslateAgentic {
         // The plan prompt always asks for PLAN.md; the no-plan and Kiro prompts never do.
         if scouts && !workspace.join("PLAN.md").exists() {
             warn!("Agent did not produce a PLAN.md, although the prompt asks for one");
+        }
+        // The list scout always writes it, also for a report without list types.
+        if sll_report.is_some() && !workspace.join("scout/sll/INDEX.md").exists() {
+            warn!("Agent did not produce scout/sll/INDEX.md: the list scout did not do its task");
         }
         if !workspace.join("Cargo.toml").exists() {
             return Err("Agent did not produce a Cargo.toml".into());
@@ -249,9 +254,11 @@ pub fn check_sll_option(option: &str, safe_wrapper: bool) -> Result<(), String> 
     ))
 }
 
-/// The scout task, with the Cargo feature rule, and the tab2rust part when tab2rust is on.
-fn render_scout(tab2rust: bool) -> String {
+/// The scout task, with the Cargo feature rule, the tab2rust part when tab2rust is on, and, with
+/// a list report (`sll`), the rule that leaves the task of the list scout to the list scout.
+fn render_scout(tab2rust: bool, sll: bool) -> String {
     let scout = SCOUT
+        .replace("{SLL_SCOUT_RULE}", if sll { SLL_SCOUT_RULE } else { "" })
         .replace(
             "{TAB2RUST_SCOUT}",
             if tab2rust { SCOUT_TAB2RUST } else { "" },
@@ -299,8 +306,9 @@ fn fill_sll(prompt: &str, sll: bool) -> String {
 /// `prompts/SAFE_WRAPPER_DESIGNER.md`, `prompts/SAFE_WRAPPER_TRANSLATOR.md` and the framework items
 /// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses; with a
 /// list report, its unchanged copy `extra_info/sll/report.json`, the skill (`agent_skills/sll/`),
-/// `prompts/SLL_SCOUT.md` and `prompts/SLL_TRANSLATOR.md`. The scouts, the designer and the list
-/// scout write their reports in `workspace/scout/`, which is created here.
+/// `prompts/SLL_SCOUT.md`, `prompts/SLL_TRANSLATOR.md`, and one more rule in `prompts/SCOUT.md`.
+/// The scouts, the designer and the list scout write their reports in `workspace/scout/`, which is
+/// created here.
 fn write_scout_files(
     case: &CaseDir,
     tab2rust: bool,
@@ -309,7 +317,10 @@ fn write_scout_files(
 ) -> io::Result<()> {
     let prompts = case.inputs().join("prompts");
     fs::create_dir_all(&prompts)?;
-    fs::write(prompts.join("SCOUT.md"), render_scout(tab2rust))?;
+    fs::write(
+        prompts.join("SCOUT.md"),
+        render_scout(tab2rust, sll_report.is_some()),
+    )?;
     if tab2rust {
         case.write_skill("tab2rust")?;
         fs::write(prompts.join("TRANSLATOR.md"), TAB2RUST_TRANSLATOR)?;
@@ -507,7 +518,19 @@ mod tests {
     #[test]
     fn scout_task_has_no_placeholder_left() {
         for tab2rust in [false, true] {
-            assert!(!render_scout(tab2rust).contains("{CARGO_FEATURES}"));
+            assert!(!render_scout(tab2rust, false).contains("{CARGO_FEATURES}"));
+        }
+    }
+
+    #[test]
+    fn scout_task_without_list_report_is_the_task_without_the_placeholder() {
+        // The placeholder is on the line of another one, so its removal leaves no empty line.
+        assert!(SCOUT.contains("\n{SLL_SCOUT_RULE}{TAB2RUST_SCOUT}\n"));
+        for tab2rust in [false, true] {
+            let with_rule = render_scout(tab2rust, true);
+            assert!(with_rule.contains(SLL_SCOUT_RULE));
+            let without = render_scout(tab2rust, false);
+            assert_eq!(with_rule.replacen(SLL_SCOUT_RULE, "", 1), without);
         }
     }
 
@@ -570,6 +593,8 @@ mod tests {
             for file in sll_files {
                 assert_eq!(inputs.join(file).is_file(), sll_report.is_some(), "{file}");
             }
+            let scout = fs::read_to_string(inputs.join("prompts/SCOUT.md")).unwrap();
+            assert_eq!(scout.contains(SLL_SCOUT_RULE), sll_report.is_some());
             if sll_report.is_some() {
                 let copied = fs::read_to_string(inputs.join(copy)).unwrap();
                 assert_eq!(copied, "never parsed");

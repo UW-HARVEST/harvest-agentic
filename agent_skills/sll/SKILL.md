@@ -22,9 +22,9 @@ ends with NULL.
 
 ## What the analysis gives
 
-`scripts/sll_cards.py` reads the report and writes one card for each list type. A card gives the
-type, the place of its definition, the link field, the holders that the analysis found (struct
-fields that point to a node), and one class:
+`inputs/agent_skills/sll/scripts/sll_cards.py` reads the report and writes one card for each list
+type. A card gives the type, the place of its definition, the link field, the holders that the
+analysis found (struct fields that point to a node), and one class:
 
 | Class | Meaning | What you do |
 |---|---|---|
@@ -49,12 +49,19 @@ card:
 
 1. The functions that use the type or the link field, the functions that write the link field,
    the read-only functions, and the single-node functions.
-   - A function is **read-only** when it and the functions that it calls write no field of a
-     node, allocate no node, free no node, and call no function pointer, and when it returns no
-     pointer to a node (as its value or through an output parameter).
-   - A function is **single-node** when it has exactly one parameter that points to a node, it
-     writes fields of that node but not the link field, and it returns no pointer to a node. In
-     all other points it obeys the read-only definition.
+   - A function is **read-only** when all of these are true:
+     - It has a parameter that points to a node or to the struct that holds the list head. A
+       function that reaches the chain only through another struct, for example through the
+       cursor of an iterator, is not read-only.
+     - It and the functions that it calls write no field of a node, allocate no node, free no
+       node, and call no function pointer.
+     - It returns no pointer to a node (as its value or through an output parameter).
+   - A function is **single-node** when all of these are true:
+     - It has exactly one parameter that points to a node.
+     - It writes fields of that node, but not the link field.
+     - It and the functions that it calls write no field of another node, allocate no node, free
+       no node, and call no function pointer.
+     - It returns no pointer to a node (as its value or through an output parameter).
 2. Where nodes are allocated and where they are freed. An allocator is **plain** when it is
    `malloc`, `calloc` or `free` called directly. It is **replaceable** when the call goes through a
    function pointer, a callback that the application sets, or a wrapper that does one of these.
@@ -89,13 +96,17 @@ Use the first row that applies. Write the representation and the reason in the c
 
 Do rows 1 to 5 first. They need only `grep`, and they decide most types.
 
+Row 2 comes before row 5. A BORROWED type can be in exported signatures: in an `extern "C"`
+function, a parameter `Option<&Node>` has the same ABI as the C pointer `const Node *`.
+
 ### Views
 
 This skill does not change a C-LAYOUT type: the translators write the type as without this skill,
 with the C struct, the C allocator calls and the raw pointer links. With `Views: NO`, this skill
 adds no rule for the type or its functions. With `Views: YES`, the read-only functions walk the
 chain in safe Rust through a view, and the single-node functions take the node as a reference (see
-`references/rewriting.md`). The other functions get no rule.
+`inputs/agent_skills/sll/references/rewriting.md`). These reference parameters have the same ABI
+as the C pointers. The other functions get no rule.
 
 For a C-LAYOUT type of rows 3, 4, 5 and 9, write `Views: YES` in the card when all of these are
 true, and `Views: NO` when one is false:
@@ -110,16 +121,27 @@ With `Views: YES`, list the read-only functions and the single-node functions in
 
 Do this check only when it can change a decision: at row 6, and for item 3 of "Views". Do not do
 it when more than 20 functions use the type: there the check does not pass. Read each function
-that writes the link field. The check passes when all of these are true for each write:
+that writes the link field. The check passes when all of these are true for each of these
+functions:
 
-1. The value is NULL, a node that the function allocated, or a node that the function removed from
-   its place in the same chain before the write.
-2. After the write, no node has two predecessors, and no node is reachable from itself.
+1. For each write of the link field: the value is NULL, or the node that the value points to has
+   exactly one predecessor when the function returns. The predecessor of a node is the list head
+   or the link field that points to the node. Do not examine the value alone. Examine the result
+   of the function. These are the usual cases that pass:
+   - The function allocated the node, and it stores the pointer to the node in one head or link
+     field only.
+   - The function overwrites or frees the old predecessor of the node. Head insertion,
+     `n->next = *head; *head = n;`: the old first node gets the predecessor `n->next`, and the
+     function overwrites its old predecessor `*head`. Removal,
+     `prev->next = e->next; free(e);`: the node after `e` gets the predecessor `prev->next`, and
+     the function frees its old predecessor `e->next` together with `e`.
+2. When the function returns, no node is reachable from itself.
 3. The function stores no pointer to a node or to a link field in memory that stays after it
    returns, apart from the pointers of fact 4.
 
-Also make sure that each allocation site sets the link field before another function can reach
-the node. When you are not sure about one write, the check does not pass.
+Also make sure that each allocation site sets the link field of the new node before another
+function can reach the node. When you are not sure about one of these points, the check does not
+pass.
 
 ## Command
 
@@ -136,4 +158,4 @@ status 1. Do not read the report yourself then.
 
 ## Rewriting
 
-`references/rewriting.md` tells how to write each representation in Rust.
+`inputs/agent_skills/sll/references/rewriting.md` tells how to write each representation in Rust.

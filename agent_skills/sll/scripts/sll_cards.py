@@ -12,7 +12,7 @@ type comes only from the report:
   proved      verdict "proved", one function or more analysed, and a complete source scan
   not-proved  all other cases ("refuted" without a found violation, "unknown", incomplete scan)
 
-See ../SKILL.md.
+See inputs/agent_skills/sll/SKILL.md.
 """
 import argparse
 import json

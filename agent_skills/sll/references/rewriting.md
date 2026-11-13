@@ -205,6 +205,10 @@ pub extern "C" fn list_length<'a>(list: Option<&'a EntryView<'a>>) -> c_uint {
 
 - `Option<&EntryView>` has the same ABI as `Entry *`. The exported symbol and its C signature do
   not change.
+- Walk the chain only through views, in the function or in a helper function that also takes a
+  view. Do not cast a view back to a node pointer, and do not call a function that takes a node
+  pointer. When the C function calls such a function, for example to find the node at a
+  position, write that walk again with views.
 - A function can return data that it reads through a view, for example `e.data`. It never returns
   a pointer to a node: a function that does this is not read-only, and it does not use a view.
 - When C uses the pointer without a NULL check, take the value with `.unwrap()`. A NULL pointer
@@ -241,5 +245,15 @@ A read-only function that uses one node takes `Option<&EntryView>`.
 For each list type of your subtask that "Scope" names, add one line to your report:
 
 ```
-list type <C type>: <representation> — Rust type: <path::Type> — functions with views: <names, or none> — deviations: <none, or the C lines>
+list type <C type>: <representation> — Rust type: <path::Type> — functions with views: <names, or none> — deviations: <the list below, or none>
 ```
+
+The `deviations` field lists each of these, with the reason:
+
+- Each function that the card lists as read-only or single-node and that you did not write as
+  this file shows. A function with a view in its signature and a raw pointer walk in its body is
+  one of these.
+- Each C branch that has no Rust code, with its C lines (see OWNED-CHAIN).
+- Each function that you did not write because of rule 5 of "Rules".
+
+Write `none` only when there is no such function and no such branch.

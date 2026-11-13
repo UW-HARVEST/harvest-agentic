@@ -17,7 +17,7 @@ Rules:
 - Read a whole file only when it is short. Use `grep`, `head`, `sed -n 'A,Bp'`, and `wc -l`.
 - Do not read the body of a data initializer of more than about 50 lines. Write its file and lines
   in your report.
-{TAB2RUST_SCOUT}
+{SLL_SCOUT_RULE}{TAB2RUST_SCOUT}
 ## Explore
 
 Find these facts for the files of your group:

@@ -1,5 +1,7 @@
 5. In the same message as the scouts, also send one list scout. It decides the Rust representation
-   of the linked list types. Give it this prompt:
+   of the linked list types. Send it also when the C code is small, and also when you read the C
+   code yourself. Never decide the representation of a list type without a card: only a card of
+   the list scout decides it. Give the list scout this prompt:
 
    ```
    Read inputs/prompts/SLL_SCOUT.md and do the task in it.
