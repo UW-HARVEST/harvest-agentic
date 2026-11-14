@@ -14,6 +14,7 @@ use harvest_core::{Id, Representation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -28,6 +29,10 @@ const METHOD_GTEST: &str = include_str!("method_gtest.md");
 /// FuzzTest instructions inserted into the gtest method only when
 /// fuzzing is enabled.
 const FUZZTEST_SECTION: &str = include_str!("fuzztest_section.md");
+/// The prompt parts for function contracts (see `fill_spec`).
+const SPEC_INVARIANT: &str = include_str!("spec_invariant.md");
+const SPEC_FUZZ: &str = include_str!("spec_fuzz.md");
+const SPEC_GATE: &str = include_str!("spec_gate.md");
 
 /// Directory (inside the workspace) holding the gtest/fuzztest verification
 /// environment. Materialized for the gtest harness and stripped before freeze.
@@ -100,6 +105,25 @@ impl Tool for VerifyFixAgentic {
         config.validate();
 
         let agent = context.config.agentic_agent;
+        // Checked before case_dir exists: a failed run keeps its case_dir.
+        let spec_files = match &config.spec_dir {
+            Some(dir) => {
+                check_spec_option(
+                    "spec_dir",
+                    agent,
+                    config.no_plan,
+                    config.verify_harness == VerifyHarness::Libloading,
+                    config.fuzz,
+                )?;
+                let files = spec_c_files(dir)
+                    .map_err(|e| format!("cannot read spec_dir {}: {e}", dir.display()))?;
+                if files.is_empty() {
+                    return Err(format!("spec_dir {} has no C file", dir.display()).into());
+                }
+                Some(files)
+            }
+            None => None,
+        };
         let cargo_package = context
             .ir_snapshot
             .get::<CargoPackage>(inputs[0])
@@ -110,7 +134,8 @@ impl Tool for VerifyFixAgentic {
             .ok_or("No RawSource representation found in IR")?;
 
         // The agent works in case_dir/workspace/, the materialized CargoPackage. The C source is
-        // this stage's oracle, a read-only input in case_dir/inputs/ (see agent_runner::CaseDir).
+        // this stage's oracle, a read-only input in case_dir/inputs/ (see agent_runner::CaseDir),
+        // as are the C files with contracts and their skill.
         let case = CaseDir::new()?;
         let workspace = case.workspace();
         cargo_package.dir.materialize(&workspace)?;
@@ -143,6 +168,9 @@ impl Tool for VerifyFixAgentic {
             );
         }
 
+        if let Some(files) = &spec_files {
+            write_spec_files(&case, files)?;
+        }
         let reference_guard = case.lock_inputs()?;
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Verify,
@@ -164,6 +192,10 @@ impl Tool for VerifyFixAgentic {
                 "Agent did not produce a HYPOTHESES.md (no bugs investigated, or skipped step 1)"
             );
         }
+        // With function contracts, the prompt always asks for it.
+        if spec_files.is_some() && !workspace.join("DOMAINS.md").exists() {
+            warn!("Agent did not produce a DOMAINS.md, although the prompt asks for one");
+        }
 
         // Keep the gtest/fuzztest verification environment in the frozen output (like the
         // libloading tests/ dir) so it is available for inspection, but strip its build directories
@@ -184,6 +216,33 @@ impl Tool for VerifyFixAgentic {
         let dir = case.freeze(&reference_guard, config.reference_audit_dir.as_deref())?;
         Ok(Box::new(CargoPackage { dir }))
     }
+}
+
+/// Refuses function contracts (`option`) with a prompt that has no parts for them (see
+/// `fill_spec`). The verify stage checks the resolved config; the benchmark checks its command
+/// line before the run starts.
+pub fn check_spec_option(
+    option: &str,
+    agent: AgentKind,
+    no_plan: bool,
+    libloading: bool,
+    fuzz: bool,
+) -> Result<(), String> {
+    let conflict = if agent == AgentKind::Kiro {
+        "the Kiro agent"
+    } else if no_plan {
+        "no_plan"
+    } else if libloading {
+        "the libloading verify harness"
+    } else if !fuzz {
+        "FuzzTest turned off"
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "{option} cannot be used with {conflict}: only the plan prompt of Claude and OpenCode \
+         with the gtest verify harness and FuzzTest uses function contracts"
+    ))
 }
 
 /// Builds the verification method, including FuzzTest guidance when enabled.
@@ -311,6 +370,35 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// The annotated C files of a spec directory: the regular files `*.c` directly in it, in the order
+/// of their names. Other files and subdirectories (proof stubs, copies of headers) are not part of
+/// the input.
+pub fn spec_c_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "c") && path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// Writes the inputs for function contracts into `inputs/`: the unchanged copies of the annotated
+/// C files in `extra_info/spec/`, and the skill that reads them (`agent_skills/spec_contracts/`).
+fn write_spec_files(case: &CaseDir, files: &[PathBuf]) -> io::Result<()> {
+    let dir = case.inputs().join("extra_info/spec");
+    fs::create_dir_all(&dir)?;
+    for file in files {
+        let name = file
+            .file_name()
+            .expect("a path from spec_c_files has a file name");
+        fs::copy(file, dir.join(name))?;
+    }
+    case.write_skill("spec_contracts")
+}
+
 /// Removes build output directories (`build-*`, e.g. build-test/build-fuzz) from
 /// a verify_env directory so only the agent's source survives the freeze. These
 /// hold fetched GoogleTest/FuzzTest/Abseil sources and symlinks. Returns the
@@ -351,11 +439,33 @@ fn load_verify_prompt(config: &Config, agent: AgentKind) -> String {
         AgentKind::Claude | AgentKind::OpenCode if config.no_plan => {
             PROMPT_VERIFY_NO_PLAN.to_owned()
         }
-        AgentKind::Claude | AgentKind::OpenCode => {
-            PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config))
-        }
+        AgentKind::Claude | AgentKind::OpenCode => fill_spec(
+            &PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config)),
+            config.spec_dir.is_some(),
+        ),
         AgentKind::Kiro => PROMPT_KIRO_VERIFY.to_owned(),
     }
+}
+
+/// Fills the placeholders for function contracts of a prompt: the rule in the Invariants section,
+/// the domain rule in the FuzzTest section and one more item of the completion gate, or nothing.
+/// Each placeholder is at the start or at the end of a line of other text, and the separators come
+/// from here, so that a prompt without function contracts has no trace of the option, not even an
+/// empty line.
+fn fill_spec(prompt: &str, spec: bool) -> String {
+    let (invariant, fuzz, gate) = if spec {
+        (
+            format!("{SPEC_INVARIANT}\n"),
+            format!("{SPEC_FUZZ}\n"),
+            format!("\n{}", SPEC_GATE.trim_end()),
+        )
+    } else {
+        Default::default()
+    };
+    prompt
+        .replace("{SPEC_INVARIANT}", &invariant)
+        .replace("{SPEC_FUZZ}", &fuzz)
+        .replace("{SPEC_GATE}", &gate)
 }
 
 /// Comparison mechanism the verification prompt describes.
@@ -409,6 +519,16 @@ pub struct Config {
     /// No effect under the libloading harness.
     #[serde(default = "default_fuzz")]
     pub fuzz: bool,
+
+    /// A directory with C files of the library that have function contracts (CBMC clauses
+    /// between the parameter list and the body of a function). With it, the stage gives the
+    /// agents the `*.c` files of the directory ([`spec_c_files`]) and the spec_contracts skill
+    /// (`agent_skills/spec_contracts/`). The agents find classes of argument values from the
+    /// contracts, and the prompt asks for `DOMAINS.md`, which tells how the tests cover each
+    /// class. The stage copies the files and does not read them. It checks that the prompt uses
+    /// function contracts ([`check_spec_option`]). The benchmark option
+    /// `--extra-info spec=<DIR>` sets it for each program.
+    pub spec_dir: Option<PathBuf>,
 
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
@@ -927,5 +1047,102 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
                 }
             }
         }
+    }
+
+    fn config(json: serde_json::Value) -> Config {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn prompt_without_spec_dir_is_the_prompt_without_the_placeholders() {
+        // Each placeholder is at the start or at the end of a line of other text, so its removal
+        // leaves no empty line.
+        assert!(PROMPT_VERIFY.contains("\n{SPEC_INVARIANT}### Git discipline\n"));
+        assert!(PROMPT_VERIFY.contains(" before finishing.{SPEC_GATE}\n"));
+        assert!(FUZZTEST_SECTION.contains("\n{SPEC_FUZZ}A property is "));
+        for fuzz in [true, false] {
+            let config = config(serde_json::json!({ "fuzz": fuzz }));
+            let method = build_method_section(&config).replace("{SPEC_FUZZ}", "");
+            let before = PROMPT_VERIFY
+                .replace("{SPEC_INVARIANT}", "")
+                .replace("{SPEC_GATE}", "")
+                .replace("{VERIFICATION_METHOD}", &method);
+            assert_eq!(load_verify_prompt(&config, AgentKind::Claude), before);
+        }
+        // The other prompts have no placeholder.
+        for prompt in [PROMPT_VERIFY_NO_PLAN, PROMPT_KIRO_VERIFY, METHOD_LIBLOADING] {
+            assert!(!prompt.contains("{SPEC_"));
+        }
+    }
+
+    #[test]
+    fn spec_dir_adds_three_parts_to_the_prompt() {
+        let config = config(serde_json::json!({ "spec_dir": "spec/lists" }));
+        let prompt = load_verify_prompt(&config, AgentKind::OpenCode);
+        // Each part is a paragraph or a list item of its own.
+        assert!(prompt.contains(&format!("\n\n{SPEC_INVARIANT}\n### Git discipline\n")));
+        assert!(prompt.contains(&format!("\n\n{SPEC_FUZZ}\nA property is ")));
+        let gate = SPEC_GATE.trim_end();
+        assert!(prompt.contains(&format!(" before finishing.\n{gate}\n\n## ")));
+        assert!(!prompt.contains("{SPEC_"));
+    }
+
+    #[test]
+    fn spec_dir_needs_the_plan_prompt_with_gtest_and_fuzztest() {
+        for agent in [AgentKind::Claude, AgentKind::OpenCode] {
+            check_spec_option("spec_dir", agent, false, false, true).unwrap();
+        }
+        for (agent, no_plan, libloading, fuzz, conflict) in [
+            (AgentKind::Kiro, false, false, true, "the Kiro agent"),
+            (AgentKind::Claude, true, false, true, "no_plan"),
+            (AgentKind::Claude, false, true, true, "the libloading"),
+            (
+                AgentKind::Claude,
+                false,
+                false,
+                false,
+                "FuzzTest turned off",
+            ),
+        ] {
+            let err = check_spec_option("spec_dir", agent, no_plan, libloading, fuzz).unwrap_err();
+            let start = format!("spec_dir cannot be used with {conflict}");
+            assert!(err.starts_with(&start), "{err}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // CaseDir::new has no statvfs shim
+    fn spec_dir_adds_its_c_files_and_the_skill_to_the_inputs() {
+        // Only the C files directly in the directory are part of the input.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("stubs")).unwrap();
+        for file in ["lists.c", "lists.h", "stubs/stub.c"] {
+            fs::write(dir.path().join(file), format!("never parsed: {file}")).unwrap();
+        }
+        fs::create_dir(dir.path().join("directory.c")).unwrap();
+        let files = spec_c_files(dir.path()).unwrap();
+        assert_eq!(files, [dir.path().join("lists.c")]);
+
+        let copy = "extra_info/spec/lists.c";
+        let spec_files = [
+            copy,
+            "agent_skills/spec_contracts/SKILL.md",
+            "agent_skills/spec_contracts/references/domains-table.md",
+            "agent_skills/spec_contracts/scripts/spec_contracts.py",
+        ];
+        let case = CaseDir::new().unwrap();
+        let inputs = case.inputs();
+        // The stage calls write_spec_files only with spec_dir: without it, inputs/ is this.
+        assert!(!inputs.join("extra_info").exists());
+        assert!(!inputs.join("agent_skills/spec_contracts").exists());
+        write_spec_files(&case, &files).unwrap();
+        for file in spec_files {
+            assert!(inputs.join(file).is_file(), "{file}");
+        }
+        let copied = fs::read_to_string(inputs.join(copy)).unwrap();
+        assert_eq!(copied, "never parsed: lists.c");
+        let copies = fs::read_dir(inputs.join("extra_info/spec")).unwrap();
+        assert_eq!(copies.count(), 1);
+        case.finish();
     }
 }

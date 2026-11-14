@@ -9,6 +9,7 @@ mod runner;
 mod stats;
 use crate::cli::{Args, TestHarness, TestPart};
 use crate::error::HarvestResult;
+use crate::extra_info::ExtraInfo;
 use crate::harness::{
     build_config, cleanup_benchmarks, default_config, parse_benchmark_dir, parse_test_vectors,
     prepare_run_dir, validate_binary_output, TestCase,
@@ -177,9 +178,11 @@ pub struct ProgramRun {
     /// Test-Corpus checkout for the toolchain contract, from the input
     /// snapshot's manifest or detected now.
     pub test_corpus_root: Option<PathBuf>,
-    /// The list report of this program (`--extra-info sll=...`), for the
-    /// translate stage. `None` when the program has none.
-    pub sll_report: Option<PathBuf>,
+    /// The `--extra-info` source with the information of this program as its
+    /// PATH: the list report for the translate stage, or the directory of the
+    /// C files with contracts for the verify stage. `None` when the program
+    /// has none.
+    pub extra_info: Option<ExtraInfo>,
 }
 
 /// Returns whether the directory is occupied, so a caller allowed through
@@ -628,7 +631,7 @@ fn benchmark_single_program(
         if opts.safe_wrapper {
             effective_overrides.push("tools.translate_agentic.safe_wrapper=true".to_owned());
         }
-        if let Some(report) = &program_run.sll_report {
+        if let Some(ExtraInfo::Sll(report)) = &program_run.extra_info {
             effective_overrides.push(format!(
                 "tools.translate_agentic.sll_report={}",
                 report.display()
@@ -647,6 +650,12 @@ fn benchmark_single_program(
         }
         if opts.no_fuzz {
             effective_overrides.push("tools.verify_fix_agentic.fuzz=false".to_owned());
+        }
+        if let Some(ExtraInfo::Spec(dir)) = &program_run.extra_info {
+            effective_overrides.push(format!(
+                "tools.verify_fix_agentic.spec_dir={}",
+                dir.display()
+            ));
         }
     }
     if opts.has(Stage::Quality) {
@@ -1071,7 +1080,7 @@ fn test_program_dirs(
 fn start_from_bench(
     bench_program_dir: &Path,
     name: String,
-    sll_report: Option<PathBuf>,
+    extra_info: Option<ExtraInfo>,
 ) -> HarvestResult<ProgramRun> {
     let (c_source_dir, _) = parse_benchmark_dir(bench_program_dir)?;
     let suite_root =
@@ -1094,7 +1103,7 @@ fn start_from_bench(
         bench_revision: harvest_core::utils::git_revision(bench_program_dir),
         bench_program: name.clone(),
         name,
-        sll_report,
+        extra_info,
     })
 }
 
@@ -1107,6 +1116,7 @@ fn resume_from(
     snapshot_dir: &Path,
     name: String,
     suite_override: Option<&Path>,
+    extra_info: Option<ExtraInfo>,
 ) -> HarvestResult<ProgramRun> {
     let manifest = StageManifest::read_from_dir(snapshot_dir).map_err(|e| {
         format!(
@@ -1168,8 +1178,7 @@ fn resume_from(
         bench_program: manifest.bench_program,
         bench_revision,
         test_corpus_root: manifest.test_corpus_root,
-        // Only the translate stage takes a list report, and a resumed run has no translate stage.
-        sll_report: None,
+        extra_info,
     })
 }
 
@@ -1282,14 +1291,15 @@ fn run(args: Args) -> HarvestResult<()> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        // The program name is the name of the program directory, of the bench or of the snapshot.
+        let extra_info = match &args.extra_info {
+            Some(info) => info.for_program(&name, program_dirs.len())?,
+            None => None,
+        };
         program_runs.push(if resume_from_snapshot {
-            resume_from(dir, name, args.test_case.as_deref())?
+            resume_from(dir, name, args.test_case.as_deref(), extra_info)?
         } else {
-            let sll_report = match args.sll_info() {
-                Some(path) => extra_info::sll_report(path, &name, program_dirs.len())?,
-                None => None,
-            };
-            start_from_bench(dir, name, sll_report)?
+            start_from_bench(dir, name, extra_info)?
         });
     }
 

@@ -48,7 +48,7 @@ with less harness code.
 Choose a domain that covers the legal range (see the domain
 guide below and, for anything not covered here, `verify_env/docs/`). Refer to the C documentation and implementation to determine the legal range of each parameter.
 
-A property is an ordinary C++ function that asserts an invariant; you register it
+{SPEC_FUZZ}A property is an ordinary C++ function that asserts an invariant; you register it
 with `FUZZ_TEST` and describe the legal inputs with domains. The same file can
 hold both plain `TEST`s and `FUZZ_TEST`s:
 

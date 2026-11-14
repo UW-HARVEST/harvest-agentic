@@ -1419,6 +1419,7 @@ dependencies = [
  "toml_edit 0.23.10+spec-1.0.0",
  "translate_agentic",
  "try_cargo_build",
+ "verify_fix_agentic",
  "wait-timeout",
  "walkdir",
 ]

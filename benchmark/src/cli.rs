@@ -1,7 +1,7 @@
 use crate::extra_info::ExtraInfo;
 use clap::{Parser, ValueEnum};
 use harvest_core::config::{AgentKind, Stage};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Which validation harness to run translated projects against.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,13 +189,19 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub safe_wrapper: bool,
 
-    /// Give the translate stage results of an analysis of the C programs
-    /// that you already have. The only SOURCE is `sll`: reports of a list
-    /// analysis, from which a list scout decides the Rust representation of
-    /// each singly linked list type. PATH is one report file, or a directory
-    /// with one `<program directory name>.json` for each program. Requires
-    /// the translate stage. An error with --no-plan, Kiro or --safe-wrapper.
-    /// See the README, "Extra information: list analysis reports".
+    /// Give a stage information about the C programs that you already have.
+    /// SOURCE `sll`: reports of a list analysis, from which a list scout of
+    /// the translate stage decides the Rust representation of each singly
+    /// linked list type. PATH is one report file, or a directory with one
+    /// `<program directory name>.json` for each program. Requires the
+    /// translate stage. An error with --no-plan, Kiro or --safe-wrapper.
+    /// SOURCE `spec`: C files with function contracts, from which the verify
+    /// stage finds the argument values for its tests and FuzzTest domains.
+    /// PATH is a directory with one directory `<program directory name>/`
+    /// for each program, which holds the annotated `*.c` files. Requires the
+    /// verify stage. See the README, "Extra information: list analysis
+    /// reports" and "Extra information: function contracts" (with the
+    /// options that `spec` cannot be used with).
     #[arg(
         long,
         requires = "agentic",
@@ -255,13 +261,6 @@ impl Args {
         stages
     }
 
-    /// The PATH of `--extra-info sll=PATH`.
-    pub fn sll_info(&self) -> Option<&Path> {
-        self.extra_info
-            .as_ref()
-            .map(|ExtraInfo::Sll(path)| path.as_path())
-    }
-
     /// Validates flag/stage combinations that clap cannot express (they
     /// depend on the *value* of --agentic, not its presence).
     pub fn validate_stages(&self, stages: &[Stage]) -> Result<(), String> {
@@ -276,10 +275,12 @@ impl Args {
         if self.agentic.is_some() && stages.is_empty() {
             return Err("--agentic requires at least one stage".to_owned());
         }
+        let sll = matches!(self.extra_info, Some(ExtraInfo::Sll(_)));
+        let spec = matches!(self.extra_info, Some(ExtraInfo::Spec(_)));
         let translate_only_flags = [
             (self.no_tab2rust, "--no-tab2rust"),
             (self.safe_wrapper, "--safe-wrapper"),
-            (self.extra_info.is_some(), "--extra-info"),
+            (sll, "--extra-info"),
         ];
         for (set, flag) in translate_only_flags {
             if set && !has(Stage::Translate) {
@@ -316,12 +317,13 @@ impl Args {
             }
         }
         // As above: the translate stage checks a safe_wrapper of a config file.
-        if self.sll_info().is_some() {
+        if sll {
             translate_agentic::check_sll_option("--extra-info sll", self.safe_wrapper)?;
         }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
             (self.verify_harness.is_some(), "--verify-harness"),
+            (spec, "--extra-info spec"),
         ];
         for (set, flag) in verify_only_flags {
             if set && !has(Stage::Verify) {
@@ -330,6 +332,16 @@ impl Args {
                     stages_str()
                 ));
             }
+        }
+        // The verify stage checks the resolved config too (a value set in a config file).
+        if spec {
+            verify_fix_agentic::check_spec_option(
+                "--extra-info spec",
+                self.agent.unwrap_or_default(),
+                self.no_plan,
+                self.verify_harness == Some(VerifyHarness::Libloading),
+                !self.no_fuzz,
+            )?;
         }
         let translate_or_verify_flags =
             [(self.no_plan, "--no-plan"), (self.workflow, "--workflow")];
@@ -443,7 +455,8 @@ mod tests {
     fn extra_info_gives_the_list_reports_once() {
         // The values themselves are tested in extra_info.
         let once = ["bench", "--agentic=t", "--extra-info", "sll=.", "in", "out"];
-        assert_eq!(parse(&once).unwrap().sll_info(), Some(Path::new(".")));
+        let reports = ExtraInfo::Sll(PathBuf::from("."));
+        assert_eq!(parse(&once).unwrap().extra_info, Some(reports));
         assert!(parse(&["bench", "--agentic=t", "--extra-info", "sll", "in", "out"]).is_err());
         let mut twice = once.to_vec();
         twice.splice(2..2, ["--extra-info", "sll=.."]);
@@ -466,6 +479,52 @@ mod tests {
             err.starts_with("--extra-info sll cannot be used with"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn spec_requires_the_verify_stage() {
+        let args = parse(&["bench", "--agentic=t", "--extra-info=spec=.", "in", "out"]).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(
+            err.starts_with("--extra-info spec requires the verify stage"),
+            "{err}"
+        );
+        // Not an option of the scout wave: the translate stage is not necessary, and
+        // --safe-wrapper is permitted.
+        for argv in [
+            &["bench", "--agentic=v", "--extra-info=spec=.", "in", "out"][..],
+            &[
+                "bench",
+                "--agentic=t,v",
+                "--extra-info=spec=.",
+                "--safe-wrapper",
+                "in",
+                "out",
+            ],
+        ] {
+            let args = parse(argv).unwrap();
+            args.validate_stages(&args.stages()).unwrap();
+        }
+    }
+
+    #[test]
+    fn spec_is_checked_before_the_run() {
+        // Each flag reaches its own argument of the check. The check itself is tested in
+        // verify_fix_agentic.
+        for (extra, conflict) in [
+            (&["--no-fuzz"][..], "FuzzTest turned off"),
+            (&["--verify-harness", "libloading"], "the libloading"),
+            (&["--no-plan"], "no_plan"),
+            (&["--agent", "kiro"], "the Kiro agent"),
+        ] {
+            let mut argv = vec!["bench", "--agentic=v", "--extra-info=spec=."];
+            argv.extend_from_slice(extra);
+            argv.extend(["in", "out"]);
+            let args = parse(&argv).unwrap();
+            let err = args.validate_stages(&args.stages()).unwrap_err();
+            let start = format!("--extra-info spec cannot be used with {conflict}");
+            assert!(err.starts_with(&start), "{extra:?}: {err}");
+        }
     }
 
     #[test]

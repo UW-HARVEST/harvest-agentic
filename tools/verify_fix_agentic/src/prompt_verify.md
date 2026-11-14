@@ -108,7 +108,7 @@ These rules govern verification. They must survive every compaction unchanged.
   `CONDITIONALS.md` region is settled, and the final cross-review finds no
   gap. Green tests on inputs you picked yourself are not completion.
 
-### Git discipline
+{SPEC_INVARIANT}### Git discipline
 {GIT_DISCIPLINE}
 
 ### Operational
@@ -314,7 +314,7 @@ list after your last fix.
       test maps back to a row or a logged hypothesis, that every
       `confirmed` or `fixed` hypothesis has a passing test, and that every
       unchecked-row note carries evidence. You resolved what it reported
-      before finishing.
+      before finishing.{SPEC_GATE}
 
 ## Static Analysis Tool Wishlist
 

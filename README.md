@@ -164,7 +164,7 @@ harness build would otherwise report every test as a failure.
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
 | `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |
 | `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` or with the Kiro agent |
-| `--extra-info <SOURCE=PATH>` | Give the translate stage results of an analysis of the C programs that you already have. The only source is `sll`. See "Extra information: list analysis reports" below. Requires the translate stage. An error with `--no-plan`, with the Kiro agent, or together with `--safe-wrapper` |
+| `--extra-info <SOURCE=PATH>` | Give a stage information about the C programs that you already have. A run takes one source. `sll`: list analysis reports for the translate stage, see "Extra information: list analysis reports" below. Requires the translate stage. An error with `--no-plan`, with the Kiro agent, or together with `--safe-wrapper`. `spec`: C files with function contracts for the verify stage, see "Extra information: function contracts" below for its stage rules |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
@@ -204,6 +204,78 @@ copies the report into the inputs of the run. It does not read it.
 
 The `translate` binary takes the report of its program as
 `-c tools.translate_agentic.sll_report=<file>`.
+
+### Extra information: function contracts
+
+`--extra-info spec=<DIR>` gives the verify stage C files of each program that
+have function contracts. A contract is a list of CBMC clauses
+(`__CPROVER_requires`, `__CPROVER_ensures`, `__CPROVER_assigns`) between the
+parameter list of a function and its body. DIR holds one directory for each
+program, with the annotated C files of the program:
+
+```
+spec/
+  lz4/lz4.c     # for harvest-bench/tests/lz4/, or for <output>/lz4/
+  mujs/jsrun.c
+```
+
+`<program>` is the name of the program directory: of the bench, or of the
+output that the run resumes from. The run takes the `*.c` files directly in
+`<DIR>/<program>/`. It does not take other files or subdirectories, for
+example proof stubs or copies of headers. A program without the directory, or
+without a `*.c` file in it, runs as without the option, and the log has the
+warning `No spec for <program>`. `spec` does not accept one file as its PATH.
+
+The framework copies the files unchanged into `inputs/extra_info/spec/` of the
+run. It does not read them, and it does not read `DOMAINS.md`. The verify
+agent uses the `spec_contracts` skill (`agent_skills/spec_contracts/`):
+
+- The script of the skill does the syntax work when the agent calls it. It
+  finds the contract of a function, gives each clause an id, marks the clauses
+  that only set up the proof, prints the build value of each macro in the
+  clauses, and gives the lines of the C definition, of the header declaration
+  and of the header comments.
+- The agent decides what each clause means for the tests, from the C source
+  and the headers. It finds classes of argument values: values that tests must
+  cover, values that C rejects with an error result, values that no test
+  passes, and values that it cannot decide.
+- The agent writes `DOMAINS.md` in the crate, with one row for each class and
+  the tests that pass values of the class. The FuzzTest domains produce the
+  classes that tests must cover, and they do not generate a value that no test
+  passes.
+
+The completion gate of the prompt has one more item: the `check` command of
+the skill finds no problem in `DOMAINS.md`. The log has a warning when the
+agent wrote no `DOMAINS.md`.
+
+Stage rules: `spec` requires the verify stage. Only the plan prompt of Claude
+and OpenCode with the gtest harness and FuzzTest uses function contracts, so
+`spec` is an error with `--no-plan`, with the Kiro agent, with `--no-fuzz`, or
+with `--verify-harness libloading`. `--safe-wrapper` is permitted.
+
+To see what the agent gets, run the script on the files of a program (it needs
+`gcc` for the build values):
+
+```bash
+python3 agent_skills/spec_contracts/scripts/spec_contracts.py list \
+  --spec spec/lz4 --c-src harvest-bench/tests/lz4/test_case
+python3 agent_skills/spec_contracts/scripts/spec_contracts.py show LZ4_compress_fast \
+  --spec spec/lz4 --c-src harvest-bench/tests/lz4/test_case
+```
+
+To compare runs, list the FuzzTest properties of an output with their domains
+and the functions with a contract that each property names (directly or
+through functions of the test files). The command reads names only: it does
+not find a call through a macro or through a table of function pointers.
+
+```bash
+python3 agent_skills/spec_contracts/scripts/spec_contracts.py properties \
+  --spec spec/lz4 --c-src harvest-bench/tests/lz4/test_case \
+  --tests <output>/lz4/verify_env
+```
+
+The `translate` binary takes the directory of its program as
+`-c tools.verify_fix_agentic.spec_dir=<directory>`.
 
 ## Code quality metrics
 
