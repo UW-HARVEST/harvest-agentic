@@ -30,7 +30,7 @@ analysis found (struct fields that point to a node), and one class:
 |---|---|---|
 | PROVED | The analysis proved that every function that it examined keeps the chain shape. | Accept the shape. Find the facts below. |
 | NOT PROVED | The analysis has no proof for the type. The card gives the cause: no result for some functions, no function examined, or an incomplete scan of the source. This does not show that the type is not a list. | Find the facts below. The shape check below can be necessary. |
-| BROKEN | The analysis found a function that breaks the chain shape. | Keep the C layout, without views. |
+| BROKEN | The analysis found a function that breaks the chain shape. | Write C-LAYOUT with `Views: NO` (row 1 below). |
 
 A card can add `with optimistic assumptions` to PROVED. The class and the decisions below do not
 change.
@@ -38,7 +38,8 @@ change.
 The tool writes no card for a type that is not defined in `inputs/c_src`, for example a type of a
 system header.
 
-A type without a card is not in the scope of this skill. Translate it as your other instructions
+A type without a card is not in the scope of this skill. This skill adds no rule for it: the
+translators choose its Rust form as freely as without this skill, as their other instructions
 tell. Do not apply the decisions below to it.
 
 ## What the analysis does not give
@@ -75,8 +76,8 @@ card:
 
 ## Decision
 
-There are two decisions for each type: the representation of the type, and, for a type that keeps
-the C layout, whether its read-only functions use views.
+There are two decisions for each type: the representation of the type, and, for a C-LAYOUT type,
+whether its read-only functions use views.
 
 ### Representation
 
@@ -92,7 +93,7 @@ Use the first row that applies. Write the representation and the reason in the c
 | 6 | The class is NOT PROVED, and more than 20 functions use the type (fact 1) or the shape check below does not pass. | C-LAYOUT, views NO |
 | 7 | The only pointers that stay after a call are the head and, if there is one, the tail. The code adds and removes nodes only at the ends, walks the chain, and frees it. | OWNED-SEQUENCE |
 | 8 | No pointer other than the head stays after a call. The code also inserts, removes or moves nodes in the middle. | OWNED-CHAIN |
-| 9 | All other cases. | C-LAYOUT |
+| 9 | All other cases. | C-LAYOUT, views NO |
 
 Do rows 1 to 5 first. They need only `grep`, and they decide most types.
 
@@ -101,19 +102,22 @@ function, a parameter `Option<&Node>` has the same ABI as the C pointer `const N
 
 ### Views
 
-This skill does not change a C-LAYOUT type: the translators write the type as without this skill,
-with the C struct, the C allocator calls and the raw pointer links. With `Views: NO`, this skill
-adds no rule for the type or its functions. With `Views: YES`, the read-only functions walk the
-chain in safe Rust through a view, and the single-node functions take the node as a reference (see
-`inputs/agent_skills/sll/references/rewriting.md`). These reference parameters have the same ABI
-as the C pointers. The other functions get no rule.
+With `Views: NO`, this skill adds no rule for a C-LAYOUT type or its functions: the translators
+choose its Rust form as they do without this skill, and C-LAYOUT does not require raw pointers.
+With `Views: YES`, the node struct keeps the C layout with `#[repr(C)]` and the raw pointer link,
+the read-only functions walk the chain in safe Rust through a view, and the single-node functions
+take the node as a reference (see `inputs/agent_skills/sll/references/rewriting.md`). These
+reference parameters have the same ABI as the C pointers. The other functions get no rule.
 
-For a C-LAYOUT type of rows 3, 4, 5 and 9, write `Views: YES` in the card when all of these are
+For a C-LAYOUT type of rows 3, 4 and 5, write `Views: YES` in the card when all of these are
 true, and `Views: NO` when one is false:
 
 1. The node layout is fixed size.
 2. The type has one read-only function or more (fact 1).
 3. The class is PROVED, or the class is NOT PROVED and the shape check below passes.
+
+A C-LAYOUT type of row 9 gets `Views: NO`. A view needs the C layout of the node, and for a row 9
+type nothing outside the translation needs that layout.
 
 With `Views: YES`, list the read-only functions and the single-node functions in the card.
 

@@ -1,7 +1,7 @@
 # Writing a list type in Rust
 
-The card of a list type (in `scout/sll/types/`) gives its representation. Use that representation
-for the type in all functions. Do not choose a different one.
+The card of a list type (in `scout/sll/types/`) gives its representation. For a type that "Scope"
+names, use that representation in all functions. Do not choose a different one.
 
 ## Scope
 
@@ -12,9 +12,14 @@ This file gives rules for these types and functions only:
 
 All other code gets no rule from this file: a type without a card, a C-LAYOUT type with
 `Views: NO`, and the other functions of a C-LAYOUT type with `Views: YES`. Translate that code as
-your other instructions tell.
+your other instructions tell. For a type without a card and a C-LAYOUT type with `Views: NO`,
+choose the Rust form as freely as without this file, for example raw pointers or indices into a
+vector, as your other instructions permit. C-LAYOUT is a decision of a card only. Do not use it as
+a rule for other types.
 
 ## Rules
+
+These rules apply only to the types and functions that "Scope" names.
 
 1. Keep the order of the items. A walk in Rust visits the items in the same order as the walk in C.
 2. Keep each count and each size field that C keeps. Do not replace a stored count by `len()` when

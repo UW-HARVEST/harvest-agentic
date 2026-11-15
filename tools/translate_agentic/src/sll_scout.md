@@ -27,7 +27,7 @@ Steps:
       and BORROWED, write the Rust declarations of the node type and of each struct that holds
       the list, as `inputs/agent_skills/sll/references/rewriting.md` shows them. For C-LAYOUT
       with `Views: YES`, write the declaration of the view struct. For C-LAYOUT with `Views: NO`,
-      write `as in C`.
+      write `no rule from this skill`.
 4. Write `scout/sll/INDEX.md`: a table with one row for each type and the columns
    `Type | C files that use it | Class | Representation | Views | Card | Result`. Leave "Result"
    empty.

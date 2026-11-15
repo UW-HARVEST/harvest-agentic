@@ -2,15 +2,18 @@
 - `scout/sll/INDEX.md` lists the linked list types of the C code, with one card for each type in
   `scout/sll/types/`. A card gives the Rust representation of its type. All subtasks use that
   representation.
-- Only the list scout makes `scout/sll/INDEX.md` and the cards, and only a card decides the
-  representation of a list type. Never decide it without a card, also when the C code is small.
+- Only the list scout makes `scout/sll/INDEX.md` and the cards. For a type that has a card, only
+  its card decides the representation. Never decide it without the card, also when the C code is
+  small.
   If `scout/sll/INDEX.md` does not exist when you write or read this plan, send the list scout
   first: a sub-agent with the prompt `Read inputs/prompts/SLL_SCOUT.md and do the task in it.`
 - This section applies to the types with the representation OWNED-SEQUENCE, OWNED-CHAIN or
   BORROWED, and to the C-LAYOUT types with `Views: YES`. It does not apply to a C-LAYOUT type with
-  `Views: NO` or to a type without a card: translate them as the other sections tell. It also
-  does not apply when `scout/sll/INDEX.md` has the line `No list types.` or a line that starts
-  with `Error:`.
+  `Views: NO` or to a type without a card. It also does not apply when `scout/sll/INDEX.md` has
+  the line `No list types.` or a line that starts with `Error:`. In these cases this section adds
+  no rule: choose the Rust form of the types as freely as without this section, for example raw
+  pointers or indices into a vector, as the other sections permit. C-LAYOUT is a decision of a
+  card only. Do not use it as a rule for other types.
 - In an `extern "C"` function, a parameter `Option<&T>` or `Option<&mut T>` has the same ABI as
   the C pointer to `T`, and NULL is `None`. Thus a reference parameter does not change the C ABI
   of an export.

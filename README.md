@@ -199,8 +199,11 @@ With a report, the translate stage sends a list scout with the scouts. The
 list scout uses the `sll` skill (`agent_skills/sll/`): it writes one card for
 each list type in `scout/sll/` of the crate, with the Rust representation that
 it chose (`Vec`/`VecDeque`, a chain of `Option<Box<Node>>`, borrowed nodes, or
-the C layout). The translation sub-agents follow the cards. The framework only
-copies the report into the inputs of the run. It does not read it.
+C-LAYOUT, which sets no Rust form of its own). The translation sub-agents
+follow the cards. A C-LAYOUT card without views and a type without a card get
+no rule from the skill: the translators choose the Rust form as without the
+report. The framework only copies the report into the inputs of the run. It
+does not read it.
 
 The `translate` binary takes the report of its program as
 `-c tools.translate_agentic.sll_report=<file>`.
