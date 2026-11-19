@@ -3,19 +3,11 @@
 // Makes silent sub-agent failures visible to the main agent.
 //
 // OpenCode reports a `task` (sub-agent) call as `state="completed"` no matter
-// how the child session ended. When the child burns its whole output budget on
-// thinking, or its provider stream dies mid-response, OpenCode treats the turn
-// as finished, the child returns an EMPTY `<task_result>`, and the parent sees
-// a successful tool call with no content. Observed in trace_lz4_52, where six
-// of nine translation sub-agents returned nothing and wrote no files while the
-// main agent kept checking them off as done. Upstream: anomalyco/opencode#27210
-// (closed as not planned) and #29363 (the 32k output cap).
+// how the child session ended. When the child ends without final text, the
+// parent sees a successful tool call with an EMPTY `<task_result>`. This
+// plugin rewrites such a result into an explicit failure report, so the main
+// agent re-plans instead of trusting a phantom success.
 //
-// This plugin rewrites such a result into an explicit failure report, so the
-// main agent re-plans instead of trusting a phantom success. It cannot make
-// the sub-agent succeed - only stop the silence.
-//
-// Hook names verified against opencode v1.17.19 (local) and the dev branch.
 // Appends to `resilience.log` in the work dir so a run can confirm the hook
 // actually fired.
 import fs from "node:fs"
@@ -39,10 +31,9 @@ function taskResultIsEmpty(text) {
 const FAILURE_REPORT =
   "Sub-agent failed.\n" +
   "\n" +
-  "The sub-agent session ended without producing a report. A usual cause is " +
-  "the OpenCode output-token cap: thinking tokens count against the same budget " +
-  "as written output, so a sub-agent that plans at length inside its own reasoning " +
-  "process hits the cap and the turn ends before it writes anything.\n" +
+  "The sub-agent session ended without producing a report. Possible causes: " +
+  "the provider stream stopped mid-response, or one response used up the " +
+  "output token limit (thinking counts against it) before the sub-agent wrote anything.\n" +
   "\n" +
   "Do not trust any file it claimed to create. Instead:\n" +
   "1. See what actually exists.\n" +

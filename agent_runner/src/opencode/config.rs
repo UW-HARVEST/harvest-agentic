@@ -17,18 +17,16 @@ struct OpenCodeAgentConfig<'a> {
 }
 
 /// Project-local OpenCode plugin (auto-loaded from `.opencode/plugin/`) that
-/// makes post-compaction plan-file recovery reliable. A per-turn system-prompt
-/// hint ("after any compaction, read PLAN.md first") is both wasteful and
-/// weakly followed (observed in trace_zstd_44: the instruction was present in
-/// the system prompt AND in the summary text, and was still skipped). See the
-/// plugin source for the mechanism. `{RECOVERY_CMD}` is substituted with the
-/// phase's recovery command before writing.
+/// tells the model to restore its plan files after a compaction; a
+/// system-prompt hint alone is often skipped. `{RECOVERY_CMD}` is replaced
+/// with the phase's recovery command in the whole file, comments included.
+/// The agent can read the plugin, so keep its comments free of history.
 const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("compaction_recovery.js");
 
-/// Project-local OpenCode plugin that rewrites an empty sub-agent `task`
-/// result into an explicit failure report. Written for every OpenCode run
-/// (unlike the compaction plugin, this needs no per-phase substitution). See
-/// the plugin source for the mechanism and the upstream issues.
+/// Project-local OpenCode plugin that turns an empty sub-agent `task` result,
+/// which OpenCode reports as completed (opencode#27210), into an explicit
+/// failure report. Written for every OpenCode run. The agent can read the
+/// plugin, so keep its comments free of history.
 const OPENCODE_RESILIENCE_PLUGIN: &str = include_str!("resilience.js");
 
 const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[

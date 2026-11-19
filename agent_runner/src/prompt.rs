@@ -47,7 +47,7 @@ fn render_model_limits(subagent_model: Option<&str>, limits: &RegistryLimits) ->
     let mut sections = Vec::new();
     if let Some(main) = &limits.main {
         sections.push(limits_section(
-            "### Registry context limits",
+            "### Model limits",
             None,
             Some(main),
         ));
@@ -165,7 +165,7 @@ mod tests {
         };
         assert_eq!(
             render_model_limits(Some("opencode-go/mimo-v2.6-flash"), &both),
-            "### Registry context limits\ncontext_limit: 1048576\noutput_limit: 128000\n\n\
+            "### Model limits\ncontext_limit: 1048576\noutput_limit: 128000\n\n\
              ### Sub-agent model\nmodel: opencode-go/mimo-v2.6-flash\n\
              context_limit: 262144\noutput_limit: 65536"
         );
