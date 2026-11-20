@@ -66,7 +66,8 @@ Each run creates a unique `verify_env/fuzz-artifacts/Suite.Property.*/` director
 - `reproducers/`: file reproducers via `FUZZTEST_REPRODUCERS_OUT_DIR`;
 - `corpus/`: coverage inputs via `FUZZTEST_TESTSUITE_OUT_DIR`.
 
-These artifacts survive removal of `build-*` during snapshot creation. Keep file
+These artifacts survive removal of `build-*` during snapshot creation. Git
+records only `reproducers/`: `.gitignore` excludes the other files. Keep file
 reproducers: printed regression drafts can truncate large values. A hard kill
 can prevent writing a reproducer, and a cumulative-memory OOM may need more than
 the last input to reproduce. OOM, timeout, signal termination, and launcher

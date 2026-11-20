@@ -378,14 +378,21 @@ fn run_teed(
     child.wait()
 }
 
-/// The framework's `.gitignore` entries: build outputs, scratch and worktrees stay untracked.
-const GITIGNORE_ENTRIES: [&str; 6] = [
+/// The framework's `.gitignore` entries: build outputs, fuzz campaign data, scratch and worktrees
+/// stay untracked. A FuzzTest build installs its ANTLR runtime into `verify_env/dist`, outside
+/// its build directory. Of a fuzz campaign, git records only the `reproducers/`.
+const GITIGNORE_ENTRIES: [&str; 11] = [
     "target/",
     "build*/",
     "cbuild/",
     "scratch/",
     "wt/",
     ".opencode/",
+    "verify_env/dist/",
+    "verify_env/clang-rt/",
+    "verify_env/fuzz-artifacts/*/corpus/",
+    "verify_env/fuzz-artifacts/*/run.log",
+    "verify_env/fuzz-artifacts/*/exit_status",
 ];
 
 /// Adds the framework's `.gitignore` entries that an existing repository lacks: snapshots made
@@ -466,7 +473,7 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         "config user.email",
     );
     let gitignore = format!(
-        "# Framework-written: build outputs, scratch and worktrees stay untracked.\n{}\n",
+        "# Framework-written: build outputs, fuzz campaign data, scratch and worktrees stay untracked.\n{}\n",
         GITIGNORE_ENTRIES.join("\n")
     );
     if let Err(e) = fs::write(work_dir.join(".gitignore"), gitignore) {
@@ -587,13 +594,66 @@ mod tests {
         let text = fs::read_to_string(dir.path().join(".gitignore")).expect("read");
         assert_eq!(
             text,
-            "# old\ntarget/\nwt/\nbuild*/\ncbuild/\nscratch/\n.opencode/\n"
+            "# old\ntarget/\nwt/\nbuild*/\ncbuild/\nscratch/\n.opencode/\nverify_env/dist/\n\
+             verify_env/clang-rt/\nverify_env/fuzz-artifacts/*/corpus/\n\
+             verify_env/fuzz-artifacts/*/run.log\nverify_env/fuzz-artifacts/*/exit_status\n"
         );
         ensure_workdir_git(dir.path());
         assert_eq!(
             fs::read_to_string(dir.path().join(".gitignore")).expect("read"),
             text
         );
+    }
+
+    /// A fresh repository and a resumed one with an old `.gitignore`: `git add -A` records the
+    /// sources and the fuzz reproducers of verify_env, never its build output or campaign data.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn verify_env_records_only_sources_and_reproducers() {
+        let campaign = "verify_env/fuzz-artifacts/Suite.Prop.ab12";
+        // In the order of `git ls-files`.
+        let recorded = [
+            format!("{campaign}/reproducers/input"),
+            "verify_env/verification_tests.cc".to_owned(),
+        ];
+        let products = [
+            "verify_env/dist/libantlr4-runtime.a".to_owned(),
+            "verify_env/clang-rt/libclang_rt.asan.a".to_owned(),
+            "verify_env/cbuild/a.o".to_owned(),
+            "verify_env/build-fuzz/verification_tests".to_owned(),
+            format!("{campaign}/corpus/input"),
+            format!("{campaign}/run.log"),
+            format!("{campaign}/exit_status"),
+        ];
+        for old_gitignore in [None, Some("target/\nwt/\n")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            ensure_workdir_git(dir.path());
+            if let Some(text) = old_gitignore {
+                fs::write(dir.path().join(".gitignore"), text).expect("write gitignore");
+                ensure_workdir_git(dir.path());
+            }
+            for rel in recorded.iter().chain(&products) {
+                let path = dir.path().join(rel);
+                fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                fs::write(path, "x").expect("write file");
+            }
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .output()
+                    .expect("git");
+                assert!(out.status.success(), "git {args:?}");
+                String::from_utf8(out.stdout).expect("utf8")
+            };
+            git(&["add", "-A"]);
+            let tracked = git(&["ls-files", "verify_env"]);
+            assert_eq!(
+                tracked.lines().collect::<Vec<_>>(),
+                recorded,
+                "{old_gitignore:?}"
+            );
+        }
     }
 
     fn file_sink(path: &Path) -> (String, Box<dyn Write>) {
