@@ -31,10 +31,14 @@ use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 const PROMPT_CONFORM: &str = include_str!("prompt_conform.md");
+/// The log of the agent, which the framework writes into the workspace as `CONFORM.md` before
+/// the agent starts: the invariants, and the format of a log entry.
+const CONFORM_MD: &str = include_str!("conform_md.md");
 /// How to build and run each kind of external suite (`{CONFORM_TEST_INSTRUCTIONS}`).
 const TEST_GTEST: &str = include_str!("test_gtest.md");
 const TEST_LIB: &str = include_str!("test_lib.md");
@@ -43,6 +47,8 @@ const TEST_BIN: &str = include_str!("test_bin.md");
 /// The agent's final gap-analysis report. It stays in the crate, like its notes
 /// file `CONFORM.md`.
 const CONFORM_REPORT: &str = "CONFORM_REPORT.md";
+/// The log file of the agent, which the framework writes (see [`CONFORM_MD`]).
+const CONFORM_LOG: &str = "CONFORM.md";
 
 /// Tool-specific configuration, read from `[tools.conform_agentic]`.
 #[derive(Debug, Deserialize, Serialize)]
@@ -129,9 +135,6 @@ impl Tool for ConformAgentic {
         cargo_package.dir.materialize(&workspace)?;
         raw_source.dir.materialize(case.c_src())?;
         suite.dir.materialize(case.inputs().join(SUITE_DIR))?;
-        // Guarding the suite is what keeps this stage honest: an agent that "passes" by editing
-        // the tests is reported. The grade runs a pristine copy of the suite in any case.
-        let reference_guard = case.lock_inputs()?;
         info!(
             "Conform working directory: {} ({} suite revealed)",
             workspace.display(),
@@ -158,7 +161,7 @@ impl Tool for ConformAgentic {
                 &suite_dir_list(suite.kind, &suite_path),
             );
 
-        agent_runner::invoke_agent(AgentInvocation {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Conform,
             agent,
             case: &case,
@@ -172,6 +175,17 @@ impl Tool for ConformAgentic {
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
         })?;
+        fs::write(
+            workspace.join(CONFORM_LOG),
+            prepared.render(&CONFORM_MD.replace(
+                "{EXTERNAL_TEST_DIRS}",
+                &suite_dir_list(suite.kind, &suite_path),
+            )),
+        )?;
+        // Guarding the suite is what keeps this stage honest: an agent that "passes" by editing
+        // the tests is reported. The grade runs a pristine copy of the suite in any case.
+        let reference_guard = case.lock_inputs()?;
+        prepared.run()?;
         info!("Conformance refinement complete");
 
         if !workspace.join(CONFORM_REPORT).is_file() {
@@ -207,4 +221,31 @@ fn test_instructions(kind: TestSuiteKind, suite: &str, toolchain: &str) -> Strin
     text.trim_end()
         .replace("{SUITE}", suite)
         .replace("{TOOLCHAIN}", toolchain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conform_file_holds_the_invariants_and_the_prompt_has_no_template() {
+        assert!(CONFORM_MD.contains("## Invariants") && CONFORM_MD.contains("## Log"));
+        // After the placeholder of this tool, only shared ones are left.
+        for placeholder in
+            agent_runner::placeholders(&CONFORM_MD.replace("{EXTERNAL_TEST_DIRS}", ""))
+        {
+            assert!(
+                [
+                    "{RUST_TOOLCHAIN_CONTEXT}",
+                    "{CASE_LAYOUT}",
+                    "{CARGO_FEATURES}",
+                    "{GIT_DISCIPLINE}",
+                ]
+                .contains(&placeholder),
+                "{placeholder}"
+            );
+        }
+        assert!(!PROMPT_CONFORM.contains("## Invariants ("));
+        assert!(PROMPT_CONFORM.contains("Read `CONFORM.md` now"));
+    }
 }

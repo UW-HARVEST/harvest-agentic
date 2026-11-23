@@ -53,3 +53,5 @@ Left for other sub-tasks or not done: <list>
 Last regress.py check: <its last line>
 Commits: <number>; git status clean: yes/no
 ```
+
+{SUBAGENT_RULES}

@@ -12,7 +12,7 @@
   - Wave 2, after wave 1 ends: the subtask of a C file `X.c` writes `src/internal/X.rs` and
     `src/api/X.rs`.
   - Each subtask lists its sections of `DESIGN.md`: `— safe wrapper: <names>`. Its sub-agent prompt
-    contains: `Read inputs/prompts/SAFE_WRAPPER_TRANSLATOR.md and the sections <names> of scout/safe_wrapper/DESIGN.md.`
+    also contains: `Read inputs/prompts/SAFE_WRAPPER_TRANSLATOR.md and the sections <names> of scout/safe_wrapper/DESIGN.md.`
 - After each wave, record the design changes that the sub-agents report in `DESIGN.md`, before
   the next step starts. For functions that the designer did not design, send the designer again
   with the line `Add to the design: <list>.` Only one designer runs at a time.

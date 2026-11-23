@@ -52,10 +52,11 @@ thinking block goes over its output limit stops without a result.
 ## Sub-agent prompts
 
 Every sub-agent prompt contains: the line "Read inputs/prompts/<task file> and do the task in it.",
-its checkout, its inputs (unit, proposal, branches, scans), the line "Keep each response and each
-thinking block short: plan one function or one step at a time, and call a tool at least every
-2000 tokens.", the "Git discipline" section below (copied in full), and the agent bug workarounds
-below (copied in full, if any).
+its checkout, its inputs (unit, proposal, branches, scans), and the line "Keep each response and
+each thinking block short: plan one function or one step at a time, and call a tool at least every
+2000 tokens." The task files contain the rules that a sub-agent needs (the directories, the
+toolchain, the git rules of a sub-agent). Do not copy rules into the prompts. The two sections
+below are for you.
 
 ### Git discipline
 {GIT_DISCIPLINE}

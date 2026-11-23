@@ -69,3 +69,5 @@ Reply with only these sections, in at most 80 lines.
 
 At most 5 lines: renames, feature combinations, very large functions, and other problems for the
 translation.
+
+{SUBAGENT_RULES}

@@ -1,0 +1,8 @@
+{CASE_LAYOUT}
+
+{RUST_TOOLCHAIN_CONTEXT}
+
+{GIT_SUBAGENT}
+
+### Known problems of the agent runtime
+{AGENT_BUG_WORKAROUNDS}

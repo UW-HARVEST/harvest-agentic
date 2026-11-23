@@ -18,7 +18,7 @@ pub use case_dir::CaseDir;
 use claude::claude_uses_ccr;
 pub use claude::claude_uses_teamclaude;
 use prompt::RegistryLimits;
-pub use prompt::{cargo_features, fill_tool_wishlist};
+pub use prompt::{SUBAGENT_RULES_FILE, fill_tool_wishlist, placeholders};
 pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_test_corpus};
 
 #[derive(Debug, Clone, Copy)]
@@ -70,8 +70,8 @@ pub struct AgentInvocation<'a> {
     pub agent: AgentKind,
     /// The run directory. The agent works in its workspace.
     pub case: &'a CaseDir,
-    /// The prompt template, with the placeholders of the tool filled in. [`invoke_agent`] fills
-    /// the shared ones (`AgentInvocation::render_prompt`).
+    /// The prompt template, with the placeholders of the tool filled in. [`PreparedAgent::run`]
+    /// fills the shared ones ([`PreparedAgent::render`]).
     pub prompt: &'a str,
     pub timeout_secs: u64,
     pub model: Option<&'a str>,
@@ -117,7 +117,21 @@ pub fn effective_subagent_model<'a>(
     Ok(Some(sub))
 }
 
-pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
+/// An agent that is ready to run: its models are resolved and the rules file of the sub-agents
+/// is written. Between [`prepare_agent`] and [`PreparedAgent::run`], the tool writes its own
+/// files for the agents ([`PreparedAgent::render`] fills their shared placeholders) and locks the
+/// inputs ([`CaseDir::lock_inputs`]).
+pub struct PreparedAgent<'a> {
+    invocation: AgentInvocation<'a>,
+    limits: RegistryLimits,
+}
+
+/// Resolves the models of the stage and their registry limits, and writes
+/// `inputs/prompts/SUBAGENT_RULES.md` ([`SUBAGENT_RULES_FILE`]). Call it before
+/// [`CaseDir::lock_inputs`].
+pub fn prepare_agent(
+    invocation: AgentInvocation<'_>,
+) -> Result<PreparedAgent<'_>, Box<dyn std::error::Error>> {
     let mut invocation = invocation;
     invocation.subagent_model = effective_subagent_model(
         invocation.agent,
@@ -128,12 +142,39 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
         AgentKind::Claude => RegistryLimits::default(),
     };
-    let prompt = invocation.render_prompt(&limits);
-    invocation.prompt = &prompt;
+    let prompts = invocation.case.inputs().join("prompts");
+    fs::create_dir_all(&prompts)?;
+    fs::write(
+        prompts.join(SUBAGENT_RULES_FILE),
+        invocation.subagent_rules_file(&limits),
+    )?;
+    Ok(PreparedAgent { invocation, limits })
+}
+
+impl PreparedAgent<'_> {
+    /// `text` with the shared placeholders filled in (see `AgentInvocation::render`): for the
+    /// task files and the plan files that the tool writes for the agents of this stage.
+    pub fn render(&self, text: &str) -> String {
+        self.invocation.render(text, &self.limits)
+    }
+
+    /// Runs the agent on its prompt, to the end of the stage.
+    pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        let prompt = self.render(self.invocation.prompt);
+        let mut invocation = self.invocation;
+        invocation.prompt = &prompt;
+        run_prepared(&invocation, &self.limits)
+    }
+}
+
+fn run_prepared(
+    invocation: &AgentInvocation<'_>,
+    limits: &RegistryLimits,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_workdir_git(&invocation.case.workspace());
     invocation.case.commit_links();
 
-    prepare_agent_env(&invocation)?;
+    prepare_agent_env(invocation)?;
 
     let logs_dir = invocation.case.root().join("logs");
     fs::create_dir_all(&logs_dir)?;
@@ -160,8 +201,8 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     );
 
     let status = match invocation.agent {
-        AgentKind::Claude => claude::invoke_claude(&invocation, &log_path)?,
-        AgentKind::OpenCode => opencode::invoke_opencode(&invocation, &log_path, &limits)?,
+        AgentKind::Claude => claude::invoke_claude(invocation, &log_path)?,
+        AgentKind::OpenCode => opencode::invoke_opencode(invocation, &log_path, limits)?,
     };
 
     if !status.success() {

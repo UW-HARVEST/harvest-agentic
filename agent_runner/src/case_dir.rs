@@ -60,8 +60,8 @@ pub struct CaseDir {
 
 impl CaseDir {
     /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `shared/` and `tmp/`, and
-    /// `inputs/` with the skill that every stage gives (`agent_skills/cargo_features/`, see
-    /// [`crate::cargo_features`]). Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`]
+    /// `inputs/` with the skill that every stage gives (`agent_skills/cargo_features/`, which the
+    /// `{CARGO_FEATURES}` placeholder describes). Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`]
     /// free.
     pub fn new() -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
@@ -174,7 +174,7 @@ impl CaseDir {
     }
 
     /// The prompt section that tells the agent the areas and their rules. Every main prompt has
-    /// it as `{CASE_LAYOUT}`, and the agent copies it into each sub-agent prompt.
+    /// it as `{CASE_LAYOUT}`, and every sub-agent reads it in the sub-agent rules.
     pub fn layout(&self) -> &'static str {
         LAYOUT.trim_end()
     }

@@ -35,3 +35,5 @@ You do not edit code for any other reason. Do not merge, do not remove worktrees
 
 At most 15 lines: the exit code, the summary that the script printed at its end (copy it), and any
 build fix that you made.
+
+{SUBAGENT_RULES}

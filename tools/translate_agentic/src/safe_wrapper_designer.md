@@ -27,6 +27,8 @@ Rules:
   them. Use them, and do not design them again. Copy into the skeleton, as `wrap/rt/`, only the
   files that your design uses. In the copies, only delete items that the design does not use.
 
+{SUBAGENT_RULES}
+
 ## 0. Role and deliverables
 
 You are the **Safe API Wrapper Designer** of a C-to-Rust translation pipeline. Before the

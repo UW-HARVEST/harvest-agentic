@@ -26,8 +26,8 @@ A `build.rs` is allowed for legitimate build-time needs (code generation,
 feature detection, etc.), but it must NOT reference, compile, or link any
 file under `inputs/c_src`.
 
-If the codebase is large, you must still translate all of it. No stubs, no
-placeholders, no shortcuts. Never refuse or abort a translation because the codebase seems too big.
+If the codebase is large, you must still translate all of it, with no stubs (see "Completion
+gate" below). Never refuse or abort a translation because the codebase seems too big.
 
 ## Step 1: Analyze BEFORE writing any code
 
@@ -66,8 +66,10 @@ backend or variant, then wire up feature gates.
   source-level name.
 - Export the ENTIRE public symbol surface: every non-static function the C
   shared library exports needs a matching Rust export — including functions
-  nothing in the repo appears to call (verified later with `nm -D` against
-  the C build)
+  nothing in the repo appears to call. The completion gate compares the
+  exports with `nm -D` against the C build. Each export must be a real
+  translation of its C function. An export whose body does not do what the C
+  function does counts as missing, also when `nm -D` shows its name.
 - Do NOT fix bugs in the original C code — reproduce behavior exactly
 - Preserve the exact order of error checks and validation
 - Match C's stdin reading behavior exactly (scanf reads across newlines, fgets does not)
@@ -75,11 +77,23 @@ backend or variant, then wire up feature gates.
 - Do NOT use the `openssl` crate or any OpenSSL bindings — use pure-Rust crates instead
 - Use safe Rust internally where possible
 
-## Step 4: Verify
+## Step 4: Check the completion gate
 
 Run `cargo build --release` and fix any errors until it compiles.
 If the project has Cargo features, also run the configuration builds (see "Cargo features"
 above) and fix them until they compile.
+
+{COMPLETION_GATE}
+
+{NO_STUBS}
+
+Before you end, check each point of the completion gate yourself. Search all of `src/` with `grep`
+for each stub form of "No stubs". For each exported function, check that its body is a real translation of the C
+function. Fix what you find, and check again.
+
+Your job ends when the translation passes the completion gate. A separate verification stage runs
+after you and does the thorough execution testing. Beyond the one smoke test, do not write test
+suites or differential tests here.
 
 Do NOT modify anything in inputs/c_src.
 

@@ -19,6 +19,9 @@ use tracing::{info, warn};
 
 const PROMPT_VERIFY: &str = include_str!("prompt_verify.md");
 const PROMPT_VERIFY_NO_PLAN: &str = include_str!("prompt_verify_no_plan.md");
+/// The hypothesis log of the main agent, which the framework writes into the workspace as
+/// `HYPOTHESES.md` before the agent starts: the invariants, and the format of a log entry.
+const HYPOTHESES_MD: &str = include_str!("hypotheses_md.md");
 
 /// Verification-method sections spliced into the standard prompt's
 /// `{VERIFICATION_METHOD}` slot (see `load_verify_prompt`).
@@ -142,8 +145,7 @@ impl Tool for VerifyFixAgentic {
             );
         }
 
-        let reference_guard = case.lock_inputs()?;
-        agent_runner::invoke_agent(AgentInvocation {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Verify,
             agent,
             case: &case,
@@ -157,11 +159,20 @@ impl Tool for VerifyFixAgentic {
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
         })?;
+        // The plan prompt keeps its log in HYPOTHESES.md. A log that an earlier verification
+        // left in the crate stays: the agent continues it.
+        let hypotheses = workspace.join("HYPOTHESES.md");
+        if !config.no_plan && !hypotheses.exists() {
+            fs::write(
+                &hypotheses,
+                prepared.render(&hypotheses_md(gtest_harness_active)),
+            )?;
+        }
+        let reference_guard = case.lock_inputs()?;
+        prepared.run()?;
         info!("Verification complete");
-        if !workspace.join("HYPOTHESES.md").exists() {
-            info!(
-                "Agent did not produce a HYPOTHESES.md (no bugs investigated, or skipped step 1)"
-            );
+        if !config.no_plan && !hypotheses.exists() {
+            warn!("The agent removed HYPOTHESES.md, which the framework wrote");
         }
 
         // Keep the gtest/fuzztest verification environment in the frozen output (like the
@@ -340,6 +351,16 @@ fn write_script(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
         fs::set_permissions(path, perms)?;
     }
     Ok(())
+}
+
+/// The rule of the gtest harness in the invariants of `HYPOTHESES.md` (see `method_gtest.md`).
+const GTEST_INVARIANT: &str = "- Run the GoogleTest binary only through `verify_env/run_tests.sh`, never\n  \
+     `build-test/verification_tests` directly.\n";
+
+/// The text of `HYPOTHESES.md`, with the placeholder of this tool filled in.
+fn hypotheses_md(gtest_harness: bool) -> String {
+    let harness = if gtest_harness { GTEST_INVARIANT } else { "" };
+    HYPOTHESES_MD.replace("{HARNESS_INVARIANT}", harness)
 }
 
 fn load_verify_prompt(config: &Config) -> String {
@@ -897,6 +918,32 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
             assert!(prompt.contains("{AGENT_BUG_WORKAROUNDS}"));
         }
+    }
+
+    #[test]
+    fn hypotheses_file_holds_the_invariants_and_the_prompt_has_no_template() {
+        for gtest in [false, true] {
+            let text = hypotheses_md(gtest);
+            assert!(text.contains("## Invariants") && text.contains("## Hypothesis log"));
+            assert_eq!(text.contains("verify_env/run_tests.sh"), gtest);
+            // Only shared placeholders are left: PreparedAgent::render fills them.
+            for placeholder in agent_runner::placeholders(&text) {
+                assert!(
+                    [
+                        "{MODEL_LIMITS}",
+                        "{RUST_TOOLCHAIN_CONTEXT}",
+                        "{CASE_LAYOUT}",
+                        "{CARGO_FEATURES}",
+                        "{GIT_DISCIPLINE}",
+                    ]
+                    .contains(&placeholder),
+                    "{placeholder}"
+                );
+            }
+        }
+        assert!(METHOD_GTEST.contains(GTEST_INVARIANT.trim_end()));
+        assert!(!PROMPT_VERIFY.contains("## Invariants ("));
+        assert!(PROMPT_VERIFY.contains("Read `HYPOTHESES.md` now"));
     }
 
     #[test]

@@ -37,8 +37,8 @@ because of these limits, examine the test first. A loop that makes no progress
 can use all memory. If the test really needs more, read `verify_env/README.md`
 and `run_tests.sh` to understand the limits, and change a setting for that run.
 
-Add this rule to the `### Operational` invariants in `HYPOTHESES.md`, and copy
-it into every sub-agent prompt that runs tests:
+The `### Operational` invariants in `HYPOTHESES.md` have this rule. Put it in
+the prompt of every sub-agent that runs tests:
 
 ```
 - Run the GoogleTest binary only through `verify_env/run_tests.sh`, never

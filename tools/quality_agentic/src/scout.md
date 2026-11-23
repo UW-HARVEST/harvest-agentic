@@ -92,3 +92,5 @@ Then these sections:
 
 At most 25 lines: the header table values, the one sentence that says why the proposal is worth
 the risk, and the last line of the gate check.
+
+{SUBAGENT_RULES}

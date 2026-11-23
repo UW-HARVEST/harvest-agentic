@@ -1,2 +1,2 @@
 **OpenCode output-token limit** Each model response has an output token limit: the output token limit that your instructions give, or 32000 if they give none. Thinking tokens count against the same limit. If one response uses the full limit before its first tool call, the turn ends as if it were complete and the session stops silently. A sub-agent that stops this way returns an empty result and writes no files.
-Therefore, keep thinking short. Do not draft a whole file in thinking. Write long files in parts, each well below that limit. Copy this whole warning into every sub-agent prompt.
+Therefore, keep thinking short. Do not draft a whole file in thinking. Write long files in parts, each well below that limit.

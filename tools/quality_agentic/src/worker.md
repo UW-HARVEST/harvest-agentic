@@ -80,3 +80,5 @@ Changes needed outside this unit (not done): <function and what>, or none
 Last regress.py check: <its last line>
 Commits: <number>; git status clean: yes/no
 ```
+
+{SUBAGENT_RULES}

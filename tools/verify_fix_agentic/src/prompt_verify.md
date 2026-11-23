@@ -45,98 +45,20 @@ will be **compacted** when it fills up; after a compaction your memory of which
 hypotheses you already investigated is **lost**, leading to "rediscover the
 same bug three times" loops that waste an entire run.
 
-To prevent this, you MUST maintain a file `HYPOTHESES.md` in the current
-directory as an append-only log of bug hypotheses. Create it at the very
-start of your work (right after reading `PLAN.md`) with this template:
-
-```markdown
-# Verification Hypotheses Log
-
-This is an append-only log of bug hypotheses I form while verifying the
-Rust translation. After every compaction I will read `HYPOTHESES.md` first
-thing to recover state.
-
-## Invariants (do not drift across compactions)
-
-These rules govern verification. They must survive every compaction unchanged.
-
-{MODEL_LIMITS}
-
-{RUST_TOOLCHAIN_CONTEXT}
-
-{CASE_LAYOUT}
-
-### AFTER ANY COMPACTION: read `PLAN.md` and `HYPOTHESES.md` is your first action before anything.
-
-### Ground truth
-- The C code is the authoritative reference. Rust outputs must match C
-  byte-for-byte on the whole public surface: every library call result, and
-  every executable run result (stdout, stderr, exit status, written files).
-- If C and Rust diverge, fix Rust. NEVER modify C.
-
-{CARGO_FEATURES}
-
-### Cargo manifest target names
-- `[lib] name` and `[[bin]] name` MUST use underscores only — NO hyphens.
-  Hyphens cause manifest parse failure. Fix Cargo.toml if you see them.
-
-### Boundaries
-- Do NOT modify anything in `inputs/c_src`.
-
-### Configuration coverage
-- Test every configuration (see the Cargo features invariant): the grader
-  can test any of them. When there are too many combinations, test every
-  value of each option at least once and record the choice in `CONFIGS.md`.
-  For each configuration you test:
-    1. Clean and rebuild C with the option values as cmake `-D` flags.
-    2. Rebuild Rust with its Cargo features.
-    3. Re-run integration tests and fix any mismatches before moving on.
-
-### Surface coverage and completion
-- `SYMBOLS.md`, `CONDITIONALS.md`, `ERRORS.md`, and `CONFIGS.md` are the test
-  plan. Every `CONFIGS.md` row gets a differential test. Every `ERRORS.md`
-  row gets a rejection test that asserts both sides return the same error
-  code, sentinel value, or exit status and message.
-- Every region in `CONDITIONALS.md` is settled: conditional compilation in
-  Rust, or a resolution to one branch with recorded evidence.
-- An untested row or an inactive-branch judgment carries evidence: an
-  experiment, a definition-site grep, or a premise in `CONDITIONALS.md`.
-  Reading alone is not evidence.
-- Verification is complete only when `SYMBOLS.md` has no open missing entry
-  (for the library, the `nm -D` symbol diff is empty), every row has a
-  passing test under every configuration you test, every
-  `CONDITIONALS.md` region is settled, and the final cross-review finds no
-  gap. Green tests on inputs you picked yourself are not completion.
-
-### Git discipline
-{GIT_DISCIPLINE}
-
-### Operational
-- Wrap every `cargo build`, `cargo test`, `cmake`, or other long-running
-  command in `timeout 600` (or shorter). No single command should run > 600s.
-- If a single test takes too long, skip it and move on. Do not get stuck on
-  one step.
-
-## Hypothesis log
-
-Format per entry:
-### H<N>: <one-line hypothesis>
-- Status: open | confirmed | refuted | fixed
-- Evidence: <how I think I know>
-- Coverage: <ERRORS.md #N / CONFIGS.md #M / CONDITIONALS.md #K / test name; omit when not tied to a row or a test>
-- Files/lines suspected: <file path:line>
-- Action taken: <Edit/test/none yet>
-- Outcome: <what happened after the action>
-```
+To prevent this, you MUST maintain the file `HYPOTHESES.md` in the current
+directory as an append-only log of bug hypotheses. The framework wrote it. Its
+`## Invariants` section holds the rules of the verification: the model limits,
+the directories, the ground truth, the Cargo features, the coverage and
+completion rules, and the git discipline. Its `## Hypothesis log` section gives
+the format of an entry. **Read `HYPOTHESES.md` now** (right after `PLAN.md`).
+When an earlier verification left entries in the log, continue that log.
 
 **Rules of engagement with `HYPOTHESES.md`:**
 
-1. **The `## Invariants` section is verbatim.** When you create
-   `HYPOTHESES.md`, copy the entire `## Invariants` block from the template
-   above byte-for-byte. Do not paraphrase, do not omit, do not reorder. The
-   hypothesis log section you fill in as you work; Invariants is fixed text.
+1. **Do not change the `## Invariants` section.** The framework wrote it. The
+   hypothesis log section you fill in as you work.
    Reason: anything outside HYPOTHESES.md drifts after compaction; only this
-   file reliably comes back. Invariants must be byte-stable.
+   file reliably comes back.
 2. **Every time you form a new hypothesis** (e.g. "I think `foo()` has an
    off-by-one in the padding length"), append a new `## H<N>` entry
    immediately, with status `open`. Do NOT wait until you have proof.
@@ -201,8 +123,9 @@ library `.so` and the executable, for each kind the program has. Run the two
 executables on the same few inputs: such a smoke test finds gross divergences
 before any test exists. Generate
 each file with a separate sub-agent. Each sub-agent reads `inputs/c_src` and the
-built artifacts, writes exactly one file, and gets the working-directory
-boundary rules from the Invariants section.
+built artifacts, and writes exactly one file. Its prompt starts with the line
+`Read inputs/prompts/SUBAGENT_RULES.md first.` (see "Directories of this run"
+in the Invariants).
 
 Dispatch in two waves. Dispatch `SYMBOLS.md` and `CONDITIONALS.md` in
 parallel. When `CONDITIONALS.md` is complete, dispatch `ERRORS.md`,
@@ -297,8 +220,8 @@ from reading alone is not evidence.
 {VERIFICATION_METHOD}
 
 All operational rules (the read-only inputs, per-configuration re-verification,
-the 600-second timeout cap) live in the `## Invariants` section of your
-`HYPOTHESES.md` template above. Re-read them from `HYPOTHESES.md` whenever you
+the 600-second timeout cap) live in the `## Invariants` section of
+`HYPOTHESES.md`. Re-read them from `HYPOTHESES.md` whenever you
 are unsure — do not work from memory of this prompt.
 
 ## Completion gate

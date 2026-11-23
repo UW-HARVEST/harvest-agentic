@@ -16,5 +16,8 @@ directory of the main agent, or the git worktree of a sub-agent.
 - `inputs` and `shared` are symbolic links that git tracks, so each git
   worktree has them. Do not delete, change or commit changes to them.
 - Build the C source out of tree: `cmake -S inputs/c_src -B scratch/<build name>`.
-- When you dispatch sub-agents, copy this whole "Directories of this run"
-  section into every sub-agent prompt.
+- `inputs/prompts/SUBAGENT_RULES.md` holds the rules that every sub-agent
+  needs, with this section. Start the prompt of each sub-agent that you send
+  with the line `Read inputs/prompts/SUBAGENT_RULES.md first.`, unless your
+  instructions give that sub-agent a task file in `inputs/prompts/`. Do not
+  copy rules into sub-agent prompts.

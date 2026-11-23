@@ -11,7 +11,7 @@
 //! The tests are the oracle of this stage, so the agent must not change them. The framework keeps
 //! a copy of them, and restores and reports any change before the freeze.
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir, PreparedAgent};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
@@ -79,17 +79,13 @@ impl Tool for QualityAgentic {
 
         let oracle = Oracle::capture(&workspace, &case.root().join("quality_oracle"))
             .map_err(|e| format!("saving the regression tests: {e}"))?;
-        write_inputs(&case).map_err(|e| format!("writing the inputs: {e}"))?;
-        fs::write(workspace.join("QUALITY.md"), with_rules(QUALITY_MD))
-            .map_err(|e| format!("writing QUALITY.md: {e}"))?;
         let prompt = PROMPT_QUALITY.replace("{ORACLE}", &oracle.describe());
 
         let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-        let reference_guard = case.lock_inputs()?;
-        agent_runner::invoke_agent(AgentInvocation {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Quality,
             agent,
             case: &case,
@@ -103,6 +99,11 @@ impl Tool for QualityAgentic {
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
         })?;
+        write_inputs(&case, &prepared).map_err(|e| format!("writing the inputs: {e}"))?;
+        fs::write(workspace.join("QUALITY.md"), with_rules(QUALITY_MD))
+            .map_err(|e| format!("writing QUALITY.md: {e}"))?;
+        let reference_guard = case.lock_inputs()?;
+        prepared.run()?;
         info!("Quality stage complete");
         for report in ["QUALITY.md", "QUALITY_REPORT.md"] {
             if !workspace.join(report).exists() {
@@ -125,8 +126,9 @@ impl Tool for QualityAgentic {
 }
 
 /// Writes the inputs of the stage: the skill with the verify stage's run scripts in its `runner/`,
-/// and the task files of the sub-agent roles in `prompts/`.
-fn write_inputs(case: &CaseDir) -> io::Result<()> {
+/// and the task files of the sub-agent roles in `prompts/`, each with the rules of the stage and
+/// the rules of every sub-agent.
+fn write_inputs(case: &CaseDir, prepared: &PreparedAgent) -> io::Result<()> {
     let skill = case.inputs().join("agent_skills").join(SKILL);
     write_dir(&SKILL_FILES, &skill)?;
     let runner = skill.join("runner");
@@ -137,7 +139,7 @@ fn write_inputs(case: &CaseDir) -> io::Result<()> {
     let prompts = case.inputs().join("prompts");
     fs::create_dir_all(&prompts)?;
     for (name, text) in ROLE_PROMPTS {
-        fs::write(prompts.join(name), with_rules(text))?;
+        fs::write(prompts.join(name), prepared.render(&with_rules(text)))?;
     }
     Ok(())
 }
@@ -445,7 +447,28 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn inputs_hold_the_skill_runner_and_worker_task() {
         let case = CaseDir::new().unwrap();
-        write_inputs(&case).unwrap();
+        let toolchain = agent_runner::RustToolchainContext {
+            required_version: "1.99.0".to_owned(),
+            prompt_block: "### Rust toolchain contract".to_owned(),
+            test_corpus_root: None,
+        };
+        let env = HashMap::new();
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
+            phase: AgentPhase::Quality,
+            agent: harvest_core::config::AgentKind::Claude,
+            case: &case,
+            prompt: "",
+            timeout_secs: 1,
+            model: None,
+            subagent_model: None,
+            no_plan: false,
+            teamclaude: true,
+            extra_env: &env,
+            output_log_path: None,
+            rust_toolchain: &toolchain,
+        })
+        .unwrap();
+        write_inputs(&case, &prepared).unwrap();
         let skill = case.inputs().join("agent_skills/rust_quality");
         for file in [
             "SKILL.md",
@@ -465,9 +488,10 @@ mod tests {
         assert!(!skill.join("tests").exists());
         for (name, _) in ROLE_PROMPTS {
             let text = fs::read_to_string(case.inputs().join("prompts").join(name)).unwrap();
-            // Every role task carries the rules.
+            // Every role task carries the rules of the stage and the rules of every sub-agent.
             assert!(text.contains("### Rules for every change"), "{name}");
-            assert!(!text.contains("{RULES}"), "{name}");
+            assert!(text.contains("## Rules for every sub-agent"), "{name}");
+            assert_eq!(agent_runner::placeholders(&text), [""; 0], "{name}");
         }
         // Every role file that the main prompt names exists, and the other way round.
         for (name, _) in ROLE_PROMPTS {

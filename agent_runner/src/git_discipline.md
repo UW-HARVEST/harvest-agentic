@@ -6,8 +6,7 @@
   from the last commit.
 - For each sub-agent that changes files, create a worktree and a branch under
   the same short name: `git worktree add wt/<name> -b <name>`. Give the
-  sub-agent the worktree path as its working directory, and copy these rules
-  into the sub-agent prompt.
+  sub-agent the worktree path as its working directory.
 - Worktrees let sub-agents work at the same time. Send the sub-agents of
   independent subtasks in one message. A subtask waits for another one only
   when it needs code that the other one writes.
@@ -17,6 +16,12 @@
 - When a sub-agent finishes, you merge its branch into `main`, you resolve the
   conflicts, and you remove the worktree with `git worktree remove wt/<name>`.
   Do not fast-forward merge, so that the history shows who changed what.
+- Before you merge a branch, read its changes (`git diff HEAD...<name>`). Read
+  every conflict carefully. Resolve each conflict so that the result keeps the
+  work of both sides. Take one side's version of a whole file (`--ours`,
+  `--theirs`, `-X ours`, `-X theirs`) only after you read both sides and
+  find that the other side has no work to keep. After the merge, check that the work of the branches merged before is still
+  in the files.
 - A sub-agent that only reads or investigates needs no worktree.
 - The framework maintains `.gitignore` for you. Build outputs (`target/`,
   `build*/`, `cbuild/`), `scratch/` and worktrees (`wt/`) stay untracked. Do

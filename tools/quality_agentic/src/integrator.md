@@ -74,3 +74,5 @@ Also, for this task:
 
 At most 20 lines: merged and rejected branches with reasons, unsafe operations and lints before
 and after, the gate line, and anything the main agent must decide.
+
+{SUBAGENT_RULES}

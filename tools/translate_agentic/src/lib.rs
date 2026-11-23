@@ -5,7 +5,7 @@
 //! post-processed to satisfy downstream tool expectations.
 //! The translated project is stored in the IR as a [`CargoPackage`](full_source::CargoPackage).
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir, PreparedAgent};
 use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
@@ -23,9 +23,21 @@ use tracing::{info, warn};
 const PROMPT_TRANSLATE: &str = include_str!("prompt_translate.md");
 const PROMPT_TRANSLATE_NO_PLAN: &str = include_str!("prompt_translate_no_plan.md");
 
+/// The plan file of the main agent, which the framework writes into the workspace as `PLAN.md`
+/// before the agent starts: the invariants, and the sections that the agent fills in.
+const PLAN_MD: &str = include_str!("plan_md.md");
+/// The rules of the translation: the one copy, put into `PLAN.md`, into the task files of the
+/// roles that write or check code, and into the no-plan prompt.
+const TRANSLATION_RULES: &str = include_str!("translation_rules.md");
+const NO_STUBS: &str = include_str!("no_stubs.md");
+const COMPLETION_GATE: &str = include_str!("completion_gate.md");
+
+/// Task files of the sub-agent roles, written into `inputs/prompts/`.
 const SCOUT: &str = include_str!("scout.md");
+const TRANSLATOR: &str = include_str!("translator.md");
+const REVIEWER: &str = include_str!("reviewer.md");
 const SCOUT_TAB2RUST: &str = include_str!("scout_tab2rust.md");
-const TAB2RUST_TRANSLATOR: &str = include_str!("tab2rust_translator.md");
+const TAB2RUST: &str = include_str!("tab2rust.md");
 const TAB2RUST_INVARIANT: &str = include_str!("tab2rust_invariant.md");
 const SAFE_WRAPPER_DESIGNER: &str = include_str!("safe_wrapper_designer.md");
 const SAFE_WRAPPER_TRANSLATOR: &str = include_str!("safe_wrapper_translator.md");
@@ -71,8 +83,8 @@ impl Tool for TranslateAgentic {
             PROMPT_TRANSLATE
         };
 
-        // The agent works in case_dir/workspace/. The C source and, with scouts, the task files and
-        // the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
+        // The agent works in case_dir/workspace/. The C source and, with the plan prompt, the task
+        // files and the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
         let case = CaseDir::new()?;
         let workspace = case.workspace();
         raw_source.dir.materialize(case.c_src())?;
@@ -83,10 +95,6 @@ impl Tool for TranslateAgentic {
         let tab2rust = scouts && config.tab2rust;
         // check_scout_option has refused safe_wrapper with no_plan.
         let safe_wrapper = config.safe_wrapper;
-        if scouts {
-            write_scout_files(&case, tab2rust, safe_wrapper)?;
-        }
-        let reference_guard = case.lock_inputs()?;
 
         let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
             &context.config.input,
@@ -98,12 +106,15 @@ impl Tool for TranslateAgentic {
             ""
         };
         let translate_prompt = agent_runner::fill_tool_wishlist(
-            &fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper),
+            &fill_rules(&fill_safe_wrapper(
+                &fill_tab2rust(translate_prompt, tab2rust),
+                safe_wrapper,
+            )),
             config.tool_wishlist,
         )
         .replace("{WORKFLOW_HINT}", workflow_hint);
 
-        agent_runner::invoke_agent(AgentInvocation {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Translate,
             agent,
             case: &case,
@@ -117,10 +128,15 @@ impl Tool for TranslateAgentic {
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
         })?;
+        if scouts {
+            write_plan_files(&case, &prepared, tab2rust, safe_wrapper)?;
+        }
+        let reference_guard = case.lock_inputs()?;
+        prepared.run()?;
 
-        // The plan prompt always asks for PLAN.md; the no-plan prompt never does.
+        // The framework wrote PLAN.md for the plan prompt; the no-plan prompt has none.
         if !no_plan && !workspace.join("PLAN.md").exists() {
-            warn!("Agent did not produce a PLAN.md, although the prompt asks for one");
+            warn!("The agent removed PLAN.md, which the framework wrote");
         }
         if !workspace.join("Cargo.toml").exists() {
             return Err("Agent did not produce a Cargo.toml".into());
@@ -203,61 +219,87 @@ fn check_scout_option(option: &str, no_plan: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The scout task, with the Cargo feature rule, and the tab2rust part when tab2rust is on.
-fn render_scout(tab2rust: bool) -> String {
-    let scout = SCOUT
-        .replace(
-            "{TAB2RUST_SCOUT}",
-            if tab2rust { SCOUT_TAB2RUST } else { "" },
-        )
-        .replace("{CARGO_FEATURES}", agent_runner::cargo_features());
-    fill_tab2rust(&scout, tab2rust)
+/// Fills the placeholders of the translation rules: `{TRANSLATION_RULES}` (the rules and "No
+/// stubs"), `{NO_STUBS}` and `{COMPLETION_GATE}`.
+fn fill_rules(text: &str) -> String {
+    let rules = format!(
+        "{}\n\n{}",
+        TRANSLATION_RULES.trim_end(),
+        NO_STUBS.trim_end()
+    );
+    text.replace("{TRANSLATION_RULES}", &rules)
+        .replace("{NO_STUBS}", NO_STUBS.trim_end())
+        .replace("{COMPLETION_GATE}", COMPLETION_GATE.trim_end())
 }
 
-/// Fills the tab2rust placeholder of a prompt: the data-table rule, or nothing.
-fn fill_tab2rust(prompt: &str, tab2rust: bool) -> String {
-    let invariant = if tab2rust { TAB2RUST_INVARIANT } else { "" };
-    prompt.replace("{TAB2RUST_INVARIANT}", invariant)
+/// Fills the tab2rust placeholders of a text: the part of scout 1 and the data-table rule, or
+/// nothing.
+fn fill_tab2rust(text: &str, tab2rust: bool) -> String {
+    let (scout, invariant) = if tab2rust {
+        (SCOUT_TAB2RUST, TAB2RUST_INVARIANT)
+    } else {
+        ("", "")
+    };
+    text.replace("{TAB2RUST_SCOUT}", scout)
+        .replace("{TAB2RUST_INVARIANT}", invariant)
 }
 
-/// Fills the safe-wrapper placeholders of a prompt: the designer in the scout wave and the design
+/// Fills the safe-wrapper placeholders of a text: the designer in the scout wave and the design
 /// rule, or nothing.
-fn fill_safe_wrapper(prompt: &str, safe_wrapper: bool) -> String {
+fn fill_safe_wrapper(text: &str, safe_wrapper: bool) -> String {
     let (dispatch, invariant) = if safe_wrapper {
         (SAFE_WRAPPER_DISPATCH, SAFE_WRAPPER_INVARIANT)
     } else {
         ("", "")
     };
-    prompt
-        .replace("{SAFE_WRAPPER_DISPATCH}", dispatch)
+    text.replace("{SAFE_WRAPPER_DISPATCH}", dispatch)
         .replace("{SAFE_WRAPPER_INVARIANT}", invariant)
 }
 
-/// Writes the scout inputs into `inputs/`: `prompts/SCOUT.md`; with tab2rust, the skill
-/// (`agent_skills/tab2rust/`) and `prompts/TRANSLATOR.md`; with safe_wrapper,
+/// A file that the framework writes for the agents of the plan prompt, with every placeholder
+/// filled in: those of this tool, then the shared ones.
+fn render_file(text: &str, prepared: &PreparedAgent, tab2rust: bool, safe_wrapper: bool) -> String {
+    prepared.render(&fill_rules(&fill_safe_wrapper(
+        &fill_tab2rust(text, tab2rust),
+        safe_wrapper,
+    )))
+}
+
+/// Writes the files of the plan prompt. Into the workspace: `PLAN.md`, the plan file of the main
+/// agent, with its invariants. Into `inputs/`: the task files of the roles (`prompts/SCOUT.md`,
+/// `prompts/TRANSLATOR.md`, `prompts/REVIEWER.md`); with tab2rust, the skill
+/// (`agent_skills/tab2rust/`) and `prompts/TAB2RUST.md`; with safe_wrapper,
 /// `prompts/SAFE_WRAPPER_DESIGNER.md`, `prompts/SAFE_WRAPPER_TRANSLATOR.md` and the framework items
 /// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses. The scouts
 /// and the designer write their reports in `workspace/scout/`, which is created here.
-fn write_scout_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::Result<()> {
+fn write_plan_files(
+    case: &CaseDir,
+    prepared: &PreparedAgent,
+    tab2rust: bool,
+    safe_wrapper: bool,
+) -> io::Result<()> {
+    let render = |text: &str| render_file(text, prepared, tab2rust, safe_wrapper);
+    fs::write(case.workspace().join("PLAN.md"), render(PLAN_MD))?;
     let prompts = case.inputs().join("prompts");
     fs::create_dir_all(&prompts)?;
-    fs::write(prompts.join("SCOUT.md"), render_scout(tab2rust))?;
+    let mut task_files = vec![
+        ("SCOUT.md", SCOUT),
+        ("TRANSLATOR.md", TRANSLATOR),
+        ("REVIEWER.md", REVIEWER),
+    ];
     if tab2rust {
         case.write_skill("tab2rust")?;
-        fs::write(prompts.join("TRANSLATOR.md"), TAB2RUST_TRANSLATOR)?;
+        task_files.push(("TAB2RUST.md", TAB2RUST));
     }
     if safe_wrapper {
         let rt = case.inputs().join("safe_wrapper_rt");
         fs::create_dir_all(&rt)?;
         SAFE_WRAPPER_RT.extract(&rt)?;
-        fs::write(
-            prompts.join("SAFE_WRAPPER_DESIGNER.md"),
-            SAFE_WRAPPER_DESIGNER,
-        )?;
-        fs::write(
-            prompts.join("SAFE_WRAPPER_TRANSLATOR.md"),
-            SAFE_WRAPPER_TRANSLATOR,
-        )?;
+        task_files.push(("SAFE_WRAPPER_DESIGNER.md", SAFE_WRAPPER_DESIGNER));
+        task_files.push(("SAFE_WRAPPER_TRANSLATOR.md", SAFE_WRAPPER_TRANSLATOR));
+    }
+    for (name, text) in task_files {
+        fs::write(prompts.join(name), render(text))?;
     }
     fs::create_dir_all(case.workspace().join("scout"))
 }
@@ -423,10 +465,124 @@ mod tests {
         (fs::read_to_string(dir.join("Cargo.toml")).unwrap(), files)
     }
 
+    /// Runs `check` with an agent that is prepared in a new case directory.
+    fn with_prepared(check: impl Fn(&CaseDir, &PreparedAgent)) {
+        let case = CaseDir::new().unwrap();
+        let toolchain = agent_runner::RustToolchainContext {
+            required_version: "1.99.0".to_owned(),
+            prompt_block: "### Rust toolchain contract".to_owned(),
+            test_corpus_root: None,
+        };
+        let env = HashMap::new();
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
+            phase: AgentPhase::Translate,
+            agent: AgentKind::Claude,
+            case: &case,
+            prompt: "",
+            timeout_secs: 1,
+            model: None,
+            subagent_model: None,
+            no_plan: false,
+            teamclaude: true,
+            extra_env: &env,
+            output_log_path: None,
+            rust_toolchain: &toolchain,
+        })
+        .unwrap();
+        check(&case, &prepared);
+        case.finish();
+    }
+
     #[test]
-    fn scout_task_has_no_placeholder_left() {
-        for tab2rust in [false, true] {
-            assert!(!render_scout(tab2rust).contains("{CARGO_FEATURES}"));
+    #[cfg_attr(miri, ignore)]
+    fn plan_files_are_complete_and_have_no_placeholder_left() {
+        with_prepared(|case, prepared| {
+            for (tab2rust, safe_wrapper) in [(false, false), (true, true)] {
+                write_plan_files(case, prepared, tab2rust, safe_wrapper).unwrap();
+                let plan = fs::read_to_string(case.workspace().join("PLAN.md")).unwrap();
+                for section in [
+                    "### Role of the main agent",
+                    "### Directories of this run",
+                    "### Cargo features",
+                    "### C ABI",
+                    "### No stubs",
+                    "### Completion gate",
+                    "### Git discipline",
+                    "## Translation subtasks",
+                ] {
+                    assert!(plan.contains(section), "{section}");
+                }
+                assert_eq!(plan.contains("### Data tables (tab2rust)"), tab2rust);
+                assert_eq!(plan.contains("### Safe API wrappers"), safe_wrapper);
+                assert_eq!(agent_runner::placeholders(&plan), [""; 0]);
+
+                let prompts = case.inputs().join("prompts");
+                let mut task_files = vec!["SCOUT.md", "TRANSLATOR.md", "REVIEWER.md"];
+                if tab2rust {
+                    task_files.push("TAB2RUST.md");
+                }
+                if safe_wrapper {
+                    task_files.extend(["SAFE_WRAPPER_DESIGNER.md", "SAFE_WRAPPER_TRANSLATOR.md"]);
+                }
+                for name in task_files {
+                    let text = fs::read_to_string(prompts.join(name)).unwrap();
+                    assert_eq!(agent_runner::placeholders(&text), [""; 0], "{name}");
+                    // A task file that a prompt names alone carries the rules of a sub-agent.
+                    let alone = !matches!(name, "TAB2RUST.md" | "SAFE_WRAPPER_TRANSLATOR.md");
+                    assert_eq!(
+                        text.contains("## Rules for every sub-agent"),
+                        alone,
+                        "{name}"
+                    );
+                }
+                for (name, rules) in [
+                    ("TRANSLATOR.md", "### C ABI"),
+                    ("REVIEWER.md", "### Completion gate"),
+                ] {
+                    let text = fs::read_to_string(prompts.join(name)).unwrap();
+                    assert!(
+                        text.contains(rules) && text.contains("### No stubs"),
+                        "{name}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn prompts_name_the_task_files_and_copy_no_rules() {
+        for name in ["SCOUT.md", "TRANSLATOR.md", "REVIEWER.md"] {
+            assert!(
+                PROMPT_TRANSLATE.contains(&format!("inputs/prompts/{name}")),
+                "{name}"
+            );
+        }
+        assert!(TAB2RUST_INVARIANT.contains("inputs/prompts/TAB2RUST.md"));
+        assert!(SAFE_WRAPPER_INVARIANT.contains("inputs/prompts/SAFE_WRAPPER_TRANSLATOR.md"));
+        assert!(SAFE_WRAPPER_DISPATCH.contains("inputs/prompts/SAFE_WRAPPER_DESIGNER.md"));
+        // The invariants are in PLAN.md, which the framework writes: the prompt has no template.
+        assert!(!PROMPT_TRANSLATE.contains("## Invariants ("));
+        // After the placeholders of this tool, only shared ones are left in the prompts.
+        for prompt in [PROMPT_TRANSLATE, PROMPT_TRANSLATE_NO_PLAN] {
+            let filled = agent_runner::fill_tool_wishlist(
+                &fill_rules(&fill_safe_wrapper(&fill_tab2rust(prompt, true), true)),
+                false,
+            )
+            .replace("{WORKFLOW_HINT}", "");
+            for placeholder in agent_runner::placeholders(&filled) {
+                assert!(
+                    [
+                        "{MODEL_LIMITS}",
+                        "{RUST_TOOLCHAIN_CONTEXT}",
+                        "{CASE_LAYOUT}",
+                        "{CARGO_FEATURES}",
+                        "{GIT_DISCIPLINE}",
+                        "{AGENT_BUG_WORKAROUNDS}",
+                    ]
+                    .contains(&placeholder),
+                    "{placeholder}"
+                );
+            }
         }
     }
 
