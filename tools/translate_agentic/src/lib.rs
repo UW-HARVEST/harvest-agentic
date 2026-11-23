@@ -20,9 +20,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const PROMPT_KIRO_EXECUTABLE: &str = include_str!("prompt_kiro_executable.md");
-const PROMPT_KIRO_LIBRARY: &str = include_str!("prompt_kiro_library.md");
-const PROMPT_KIRO_CONFIGURABLE: &str = include_str!("prompt_kiro_configurable.md");
 const PROMPT_TRANSLATE: &str = include_str!("prompt_translate.md");
 const PROMPT_TRANSLATE_NO_PLAN: &str = include_str!("prompt_translate_no_plan.md");
 
@@ -61,14 +58,18 @@ impl Tool for TranslateAgentic {
             .ok_or("No ProjectSpec representation found in IR")?;
 
         let agent = context.config.agentic_agent;
+        let no_plan = config.no_plan;
         if !config.tab2rust {
-            check_scout_option("tab2rust = false", config.no_plan, agent)?;
+            check_scout_option("tab2rust = false", no_plan)?;
         }
         if config.safe_wrapper {
-            check_scout_option("safe_wrapper = true", config.no_plan, agent)?;
+            check_scout_option("safe_wrapper = true", no_plan)?;
         }
-        let translate_prompt = load_prompt(&config, &project_spec.kind, agent);
-        let no_plan = config.no_plan;
+        let translate_prompt = if no_plan {
+            PROMPT_TRANSLATE_NO_PLAN
+        } else {
+            PROMPT_TRANSLATE
+        };
 
         // The agent works in case_dir/workspace/. The C source and, with scouts, the task files and
         // the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
@@ -77,9 +78,11 @@ impl Tool for TranslateAgentic {
         raw_source.dir.materialize(case.c_src())?;
         info!("Working directory: {}", workspace.display());
 
-        let scouts = sends_scouts(config.no_plan, agent);
+        // The plan prompt sends scouts; the no-plan prompt does not.
+        let scouts = !no_plan;
         let tab2rust = scouts && config.tab2rust;
-        let safe_wrapper = scouts && config.safe_wrapper;
+        // check_scout_option has refused safe_wrapper with no_plan.
+        let safe_wrapper = config.safe_wrapper;
         if scouts {
             write_scout_files(&case, tab2rust, safe_wrapper)?;
         }
@@ -115,8 +118,8 @@ impl Tool for TranslateAgentic {
             rust_toolchain: &rust_toolchain_context,
         })?;
 
-        // The plan prompt always asks for PLAN.md; the no-plan and Kiro prompts never do.
-        if scouts && !workspace.join("PLAN.md").exists() {
+        // The plan prompt always asks for PLAN.md; the no-plan prompt never does.
+        if !no_plan && !workspace.join("PLAN.md").exists() {
             warn!("Agent did not produce a PLAN.md, although the prompt asks for one");
         }
         if !workspace.join("Cargo.toml").exists() {
@@ -180,7 +183,7 @@ fn post_process(
             cargo.save()?;
         }
         None => {
-            // The configurable prompt instructs the agent to produce both [lib] and [[bin]].
+            // The agent decides the targets of a configurable project from its C source.
             // Only ensure workspace is present (already added above); leave the rest intact.
             cargo.save()?;
         }
@@ -188,40 +191,16 @@ fn post_process(
     Ok(())
 }
 
-/// Loads the translate prompt, selecting between Kiro (per-kind) and Claude (unified) variants.
-fn load_prompt(config: &Config, kind: &ProjectKind, agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Claude | AgentKind::OpenCode if config.no_plan => PROMPT_TRANSLATE_NO_PLAN,
-        AgentKind::Claude | AgentKind::OpenCode => PROMPT_TRANSLATE,
-        AgentKind::Kiro => match kind {
-            ProjectKind::Executable => PROMPT_KIRO_EXECUTABLE,
-            ProjectKind::Library => PROMPT_KIRO_LIBRARY,
-            ProjectKind::Configurable => PROMPT_KIRO_CONFIGURABLE,
-            // Kiro has no prompt for a program with both: it translates the library.
-            ProjectKind::HarvestBench(program) if program.lib.is_none() => PROMPT_KIRO_EXECUTABLE,
-            ProjectKind::HarvestBench(_) => PROMPT_KIRO_LIBRARY,
-        },
-    }
-}
-
-/// Whether the prompt sends scouts: the plan prompt of Claude and OpenCode.
-fn sends_scouts(no_plan: bool, agent: AgentKind) -> bool {
-    agent != AgentKind::Kiro && !no_plan
-}
-
 /// Refuses an option of the scout wave (`tab2rust = false`, `safe_wrapper = true`) where it has
-/// no effect: only the prompt that sends scouts (the plan prompt of Claude and OpenCode) uses
-/// tab2rust and the Safe API Wrapper Designer. The translate stage checks the resolved config; the
-/// benchmark checks its command line before the run starts.
-pub fn check_scout_option(option: &str, no_plan: bool, agent: AgentKind) -> Result<(), String> {
-    if sends_scouts(no_plan, agent) {
-        return Ok(());
+/// no effect: only the prompt that sends scouts (the plan prompt) uses tab2rust and the Safe API
+/// Wrapper Designer.
+fn check_scout_option(option: &str, no_plan: bool) -> Result<(), String> {
+    if no_plan {
+        return Err(format!(
+            "{option} has no effect with no_plan: only the plan prompt sends scouts"
+        ));
     }
-    Err(format!(
-        "{option} has no effect with agent {agent}{}: only the plan prompt of Claude and \
-         OpenCode sends scouts",
-        if no_plan { " and no_plan" } else { "" }
-    ))
+    Ok(())
 }
 
 /// The scout task, with the Cargo feature rule, and the tab2rust part when tab2rust is on.
@@ -299,7 +278,6 @@ pub struct Config {
 
     /// Default model of the sub-agents that the main agent dispatches, in the
     /// same format as `model`. If absent, the sub-agents use the main model.
-    /// Not supported with Kiro.
     pub subagent_model: Option<String>,
 
     /// If true, use the pre-anti-compaction prompt (no PLAN.md / Invariants /
@@ -454,13 +432,7 @@ mod tests {
 
     #[test]
     fn every_prompt_has_the_tool_wishlist_placeholder() {
-        for prompt in [
-            PROMPT_TRANSLATE,
-            PROMPT_TRANSLATE_NO_PLAN,
-            PROMPT_KIRO_EXECUTABLE,
-            PROMPT_KIRO_LIBRARY,
-            PROMPT_KIRO_CONFIGURABLE,
-        ] {
+        for prompt in [PROMPT_TRANSLATE, PROMPT_TRANSLATE_NO_PLAN] {
             assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
         }
     }

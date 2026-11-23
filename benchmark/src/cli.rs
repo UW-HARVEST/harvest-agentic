@@ -122,7 +122,7 @@ pub struct Args {
     )]
     pub agentic: Option<Vec<Stage>>,
 
-    /// Which agent to use: opencode (default), claude, or kiro.
+    /// Which agent to use: opencode (default) or claude.
     #[arg(long, requires = "agentic", value_parser = |s: &str| s.parse::<AgentKind>())]
     pub agent: Option<AgentKind>,
 
@@ -175,17 +175,15 @@ pub struct Args {
     /// Do not give the translate stage the tab2rust skill. By default the
     /// scouts find the C data tables with tab2rust and the translation
     /// sub-agents generate them. Requires the translate stage. Only the plan
-    /// prompt of Claude and OpenCode uses tab2rust, so the translate stage
-    /// stops with an error when the flag is given with --no-plan or Kiro.
-    #[arg(long, requires = "agentic")]
+    /// prompt uses tab2rust, so the flag is an error with --no-plan.
+    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
     pub no_tab2rust: bool,
 
     /// Send a Safe API Wrapper Designer with the scouts of the translate
     /// stage. It designs the safe Rust boundary of the C library, and the
     /// translation follows the design. Requires the translate stage. Only the
-    /// plan prompt of Claude and OpenCode sends scouts, so the translate stage
-    /// stops with an error when the flag is given with --no-plan or Kiro.
-    #[arg(long, requires = "agentic")]
+    /// plan prompt sends scouts, so the flag is an error with --no-plan.
+    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
     pub safe_wrapper: bool,
 
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
@@ -287,16 +285,6 @@ impl Args {
                 self.subagent_model.as_deref(),
             )?;
         }
-        // The translate stage checks the resolved config too (an agent set in a config file).
-        for (set, flag) in translate_only_flags {
-            if set {
-                translate_agentic::check_scout_option(
-                    flag,
-                    self.no_plan,
-                    self.agent.unwrap_or_default(),
-                )?;
-            }
-        }
         let verify_only_flags = [
             (self.no_fuzz, "--no-fuzz"),
             (self.verify_harness.is_some(), "--verify-harness"),
@@ -328,10 +316,6 @@ impl Args {
                  stage is not translate (got --agentic={})",
                 stages_str()
             ));
-        }
-        if has(Stage::Quality) {
-            quality_agentic::check_agent(self.agent.unwrap_or_default())
-                .map_err(|e| format!("--agentic={}: {e}", stages_str()))?;
         }
         Ok(())
     }
@@ -369,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn quality_stage_resumes_and_rejects_kiro() {
+    fn quality_stage_resumes() {
         let args = parse(&["bench", "--agentic=q,v", "in", "out"]).unwrap();
         assert_eq!(args.stages(), [Stage::Verify, Stage::Quality]);
         args.validate_stages(&args.stages()).unwrap();
@@ -383,8 +367,6 @@ mod tests {
         ])
         .unwrap();
         args.validate_stages(&args.stages()).unwrap();
-        let args = parse(&["bench", "--agentic=t,q", "--agent", "kiro", "in", "out"]).unwrap();
-        assert!(args.validate_stages(&args.stages()).is_err());
     }
 
     #[test]
@@ -432,9 +414,11 @@ mod tests {
             "bench",
             "--agentic=t",
             "--agent",
-            "kiro",
+            "claude",
+            "--model",
+            "sonnet",
             "--subagent-model",
-            "x",
+            "openrouter,a/b",
             "in",
             "out",
         ])
@@ -465,16 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn scout_flags_need_a_prompt_that_sends_scouts() {
+    fn scout_flags_conflict_with_no_plan() {
         for flag in ["--no-tab2rust", "--safe-wrapper"] {
-            for extra in [&["--no-plan"][..], &["--agent", "kiro"]] {
-                let mut argv = vec!["bench", "--agentic=t", flag];
-                argv.extend_from_slice(extra);
-                argv.extend(["in", "out"]);
-                let args = parse(&argv).unwrap();
-                let err = args.validate_stages(&args.stages()).unwrap_err();
-                assert!(err.starts_with(flag), "{err}");
-            }
+            assert!(parse(&["bench", "--agentic=t", flag, "--no-plan", "in", "out"]).is_err());
         }
     }
 

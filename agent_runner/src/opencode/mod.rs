@@ -89,7 +89,7 @@ pub(crate) fn invoke_opencode(
         invocation.timeout_secs,
         "opencode",
         &opencode_run_args(invocation, None),
-        Some(invocation.prompt),
+        invocation.prompt,
         &env,
     )?;
 
@@ -190,7 +190,7 @@ pub(crate) fn invoke_opencode(
                     remaining_secs,
                     "opencode",
                     &opencode_run_args(invocation, Some(&session_id)),
-                    Some(OPENCODE_RESUME_PROMPT),
+                    OPENCODE_RESUME_PROMPT,
                     &env,
                 )?;
             }

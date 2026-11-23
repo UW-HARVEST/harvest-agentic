@@ -2,8 +2,7 @@
 
 Stage `quality`/`q` of the agentic pipeline (experimental; bare `--agentic` never runs it). An
 agent refactors a translated crate toward safe, idiomatic Rust (fewer operations that need
-`unsafe`, fewer clippy and rustc lints) without changing its behavior. Claude Code and OpenCode
-only.
+`unsafe`, fewer clippy and rustc lints) without changing its behavior.
 
 ## Files
 

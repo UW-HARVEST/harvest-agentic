@@ -57,7 +57,6 @@ pub struct Config {
 
     /// Default model of the sub-agents that the main agent dispatches, in the
     /// same format as `model`. If absent, the sub-agents use the main model.
-    /// Not supported with Kiro.
     pub subagent_model: Option<String>,
 
     /// Extra environment variables to inject into the agent process.

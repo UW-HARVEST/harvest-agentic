@@ -46,7 +46,7 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub stage_input: Option<PathBuf>,
 
-    /// Which agent to use for agentic translation: opencode (default), claude, or kiro (requires --agentic).
+    /// Which agent to use for agentic translation: opencode (default) or claude (requires --agentic).
     #[arg(long = "agent", requires = "agentic", value_parser = |s: &str| s.parse::<harvest_core::config::AgentKind>())]
     pub agentic_agent: Option<harvest_core::config::AgentKind>,
 

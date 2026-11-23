@@ -9,7 +9,6 @@ use tracing::{info, warn};
 mod agent_env;
 pub mod case_dir;
 mod claude;
-mod kiro;
 mod opencode;
 mod prompt;
 mod skills;
@@ -96,10 +95,9 @@ impl AgentInvocation<'_> {
 
 /// The sub-agent model of a run: `None` when the sub-agents use the main
 /// model (none given, or the same as `model`), which makes the run identical to
-/// one without a sub-agent model. Errors when the backend cannot give its
-/// sub-agents a model of their own: Kiro has no such setting, and Claude Code
-/// routes all of its requests through one endpoint, so both models must use
-/// CCR (`provider,model`) or neither.
+/// one without a sub-agent model. Errors when Claude Code cannot give its
+/// sub-agents a model of their own: it routes all of its requests through one
+/// endpoint, so both models must use CCR (`provider,model`) or neither.
 pub fn effective_subagent_model<'a>(
     agent: AgentKind,
     model: Option<&str>,
@@ -108,18 +106,15 @@ pub fn effective_subagent_model<'a>(
     let Some(sub) = subagent_model.filter(|sub| Some(*sub) != model) else {
         return Ok(None);
     };
-    match agent {
-        AgentKind::Kiro => Err(format!(
-            "a sub-agent model ({sub}) is not supported with Kiro: kiro-cli has no setting for it"
-        )),
-        AgentKind::Claude if claude_uses_ccr(model) != claude_uses_ccr(Some(sub)) => Err(format!(
+    if agent == AgentKind::Claude && claude_uses_ccr(model) != claude_uses_ccr(Some(sub)) {
+        return Err(format!(
             "Claude Code sends the main and the sub-agent requests to one endpoint: the main \
              model ({}) and the sub-agent model ({sub}) must both use CCR (`provider,model`) or \
              neither",
             model.unwrap_or("CLI default")
-        )),
-        AgentKind::Claude | AgentKind::OpenCode => Ok(Some(sub)),
+        ));
     }
+    Ok(Some(sub))
 }
 
 pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
@@ -131,7 +126,7 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     )?;
     let limits = match invocation.agent {
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
-        AgentKind::Claude | AgentKind::Kiro => RegistryLimits::default(),
+        AgentKind::Claude => RegistryLimits::default(),
     };
     let prompt = invocation.render_prompt(&limits);
     invocation.prompt = &prompt;
@@ -147,7 +142,6 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     fs::write(&log_path, "")?;
 
     let agent_display = match invocation.agent {
-        AgentKind::Kiro => "Kiro",
         AgentKind::Claude => "Claude Code",
         AgentKind::OpenCode => "OpenCode",
     };
@@ -166,7 +160,6 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
     );
 
     let status = match invocation.agent {
-        AgentKind::Kiro => kiro::invoke_kiro(&invocation, &log_path)?,
         AgentKind::Claude => claude::invoke_claude(&invocation, &log_path)?,
         AgentKind::OpenCode => opencode::invoke_opencode(&invocation, &log_path, &limits)?,
     };
@@ -214,11 +207,9 @@ pub fn invoke_agent(invocation: AgentInvocation<'_>) -> Result<(), Box<dyn std::
 
 fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
-        AgentKind::Kiro => {}
-        AgentKind::Claude => claude::write_claude_sandbox(invocation.case.root())?,
-        AgentKind::OpenCode => opencode::write_project(invocation)?,
+        AgentKind::Claude => claude::write_claude_sandbox(invocation.case.root()),
+        AgentKind::OpenCode => opencode::write_project(invocation),
     }
-    Ok(())
 }
 
 /// The exit code of `timeout` when the deadline ends the command.
@@ -235,7 +226,7 @@ struct BackendEnv {
 }
 
 /// Runs `program args` in the work dir under `timeout`, so the stage deadline
-/// ends it with exit code 124. `prompt`, if given, is its stdin. Its output is
+/// ends it with exit code 124. `prompt` is its stdin. Its output is
 /// copied, as it comes, to the per-agent log, the shared output log (if any)
 /// and our stdout.
 fn run_agent(
@@ -244,7 +235,7 @@ fn run_agent(
     timeout_secs: u64,
     program: &str,
     args: &[&str],
-    prompt: Option<&str>,
+    prompt: &str,
     env: &BackendEnv,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
@@ -298,14 +289,9 @@ fn run_agent(
     // The prompt goes on stdin, not on the command line: there, an agent's
     // `pgrep -f`/`pkill -f` for a word of its task matches `timeout` and the
     // CLI, and the agent kills its own run.
-    let stdin = match prompt {
-        Some(prompt) => {
-            let path = log_path.with_extension("prompt");
-            fs::write(&path, prompt)?;
-            Stdio::from(fs::File::open(&path)?)
-        }
-        None => Stdio::null(),
-    };
+    let prompt_path = log_path.with_extension("prompt");
+    fs::write(&prompt_path, prompt)?;
+    let stdin = Stdio::from(fs::File::open(&prompt_path)?);
     end_with_parent(&mut cmd);
     Ok(run_teed(cmd, stdin, sinks)?)
 }
@@ -556,7 +542,6 @@ mod tests {
             eff(AgentKind::Claude, Some("sonnet"), Some("sonnet")),
             Ok(None)
         );
-        assert_eq!(eff(AgentKind::Kiro, Some("x"), Some("x")), Ok(None));
         assert_eq!(
             eff(AgentKind::Claude, None, Some("haiku")),
             Ok(Some("haiku"))
@@ -578,7 +563,6 @@ mod tests {
             Ok(Some("openrouter,c/d"))
         );
         // Unsupported setups.
-        assert!(eff(AgentKind::Kiro, None, Some("x")).is_err());
         assert!(eff(AgentKind::Claude, Some("sonnet"), Some("openrouter,a/b")).is_err());
     }
 

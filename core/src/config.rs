@@ -13,8 +13,6 @@ pub enum AgentKind {
     #[default]
     OpenCode,
     Claude,
-    /// Legacy backend with per-project-kind prompts, kept for comparison.
-    Kiro,
 }
 
 /// One agentic pipeline stage. Stages compose in pipeline order
@@ -62,7 +60,6 @@ impl fmt::Display for AgentKind {
         match self {
             AgentKind::OpenCode => write!(f, "opencode"),
             AgentKind::Claude => write!(f, "claude"),
-            AgentKind::Kiro => write!(f, "kiro"),
         }
     }
 }
@@ -74,9 +71,8 @@ impl FromStr for AgentKind {
         match s.to_lowercase().as_str() {
             "opencode" | "oc" => Ok(AgentKind::OpenCode),
             "claude" => Ok(AgentKind::Claude),
-            "kiro" => Ok(AgentKind::Kiro),
             other => Err(format!(
-                "unknown agent kind: {other} (expected: opencode/oc, claude, kiro)"
+                "unknown agent kind: {other} (expected: opencode/oc, claude)"
             )),
         }
     }
@@ -241,7 +237,6 @@ mod tests {
         assert_eq!("opencode".parse::<AgentKind>(), Ok(AgentKind::OpenCode));
         assert_eq!("OC".parse::<AgentKind>(), Ok(AgentKind::OpenCode));
         assert_eq!("claude".parse::<AgentKind>(), Ok(AgentKind::Claude));
-        assert_eq!("kiro".parse::<AgentKind>(), Ok(AgentKind::Kiro));
         assert!(
             "gpt"
                 .parse::<AgentKind>()

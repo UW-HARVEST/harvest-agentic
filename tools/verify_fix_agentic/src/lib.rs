@@ -17,7 +17,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const PROMPT_KIRO_VERIFY: &str = include_str!("prompt_kiro_verify.md");
 const PROMPT_VERIFY: &str = include_str!("prompt_verify.md");
 const PROMPT_VERIFY_NO_PLAN: &str = include_str!("prompt_verify_no_plan.md");
 
@@ -127,18 +126,14 @@ impl Tool for VerifyFixAgentic {
         } else {
             ""
         };
-        let prompt = agent_runner::fill_tool_wishlist(
-            &load_verify_prompt(&config, agent),
-            config.tool_wishlist,
-        )
-        .replace("{WORKFLOW_HINT}", workflow_hint);
+        let prompt =
+            agent_runner::fill_tool_wishlist(&load_verify_prompt(&config), config.tool_wishlist)
+                .replace("{WORKFLOW_HINT}", workflow_hint);
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
         // no-plan ablation prompt is libloading-only, so skip it there.
-        let gtest_harness_active = config.verify_harness == VerifyHarness::Gtest
-            && !config.no_plan
-            && matches!(agent, AgentKind::Claude | AgentKind::OpenCode);
+        let gtest_harness_active = config.verify_harness == VerifyHarness::Gtest && !config.no_plan;
         if gtest_harness_active {
             materialize_verify_env(&case, config.fuzz)?;
             info!(
@@ -347,18 +342,14 @@ fn write_script(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-fn load_verify_prompt(config: &Config, agent: AgentKind) -> String {
-    match agent {
-        // The no-plan ablation prompt is libloading-only by construction (it
-        // predates the harness split); the harness/fuzz switch applies to the
-        // standard prompt.
-        AgentKind::Claude | AgentKind::OpenCode if config.no_plan => {
-            PROMPT_VERIFY_NO_PLAN.to_owned()
-        }
-        AgentKind::Claude | AgentKind::OpenCode => {
-            PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config))
-        }
-        AgentKind::Kiro => PROMPT_KIRO_VERIFY.to_owned(),
+fn load_verify_prompt(config: &Config) -> String {
+    // The no-plan ablation prompt is libloading-only by construction (it
+    // predates the harness split); the harness/fuzz switch applies to the
+    // standard prompt.
+    if config.no_plan {
+        PROMPT_VERIFY_NO_PLAN.to_owned()
+    } else {
+        PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config))
     }
 }
 
@@ -388,7 +379,6 @@ pub struct Config {
 
     /// Default model of the sub-agents that the main agent dispatches, in the
     /// same format as `model`. If absent, the sub-agents use the main model.
-    /// Not supported with Kiro.
     pub subagent_model: Option<String>,
 
     /// If true, use the pre-anti-compaction prompt (no HYPOTHESES.md / Invariants
@@ -903,7 +893,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     }
 
     #[test]
-    fn claude_and_opencode_prompts_carry_bug_workarounds() {
+    fn every_prompt_carries_the_bug_workarounds() {
         for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
             assert!(prompt.contains("{AGENT_BUG_WORKAROUNDS}"));
         }
@@ -911,7 +901,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
 
     #[test]
     fn every_prompt_has_the_tool_wishlist_placeholder() {
-        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN, PROMPT_KIRO_VERIFY] {
+        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
             assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
         }
         let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
@@ -927,21 +917,16 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
 
     #[test]
     fn disabled_fuzz_is_not_disclosed_in_builtin_prompts() {
-        for agent in [AgentKind::Claude, AgentKind::OpenCode, AgentKind::Kiro] {
-            for harness in ["gtest", "libloading"] {
-                for mode in ["standard", "no_plan"] {
-                    let config: Config = serde_json::from_value(serde_json::json!({
-                        "fuzz": false, "verify_harness": harness,
-                        "no_plan": mode == "no_plan",
-                    }))
-                    .unwrap();
-                    let prompt = load_verify_prompt(&config, agent).to_ascii_lowercase();
-                    for hint in ["fuzz", "coverage-guided", "property-based"] {
-                        assert!(
-                            !prompt.contains(hint),
-                            "{agent:?}/{harness}/{mode} reveals {hint}"
-                        );
-                    }
+        for harness in ["gtest", "libloading"] {
+            for mode in ["standard", "no_plan"] {
+                let config: Config = serde_json::from_value(serde_json::json!({
+                    "fuzz": false, "verify_harness": harness,
+                    "no_plan": mode == "no_plan",
+                }))
+                .unwrap();
+                let prompt = load_verify_prompt(&config).to_ascii_lowercase();
+                for hint in ["fuzz", "coverage-guided", "property-based"] {
+                    assert!(!prompt.contains(hint), "{harness}/{mode} reveals {hint}");
                 }
             }
         }

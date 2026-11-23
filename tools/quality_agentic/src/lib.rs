@@ -13,7 +13,7 @@
 
 use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
 use full_source::{CargoPackage, RawSource};
-use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
+use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use include_dir::{Dir, include_dir};
@@ -61,7 +61,6 @@ impl Tool for QualityAgentic {
         let config: Config = context.config.tool()?;
         config.validate();
         let agent = context.config.agentic_agent;
-        check_agent(agent)?;
 
         let cargo_package = context
             .ir_snapshot
@@ -122,16 +121,6 @@ impl Tool for QualityAgentic {
             .map_err(|e| format!("removing verify_env/build-*: {e}"))?;
         let dir = case.freeze(&reference_guard, config.reference_audit_dir.as_deref())?;
         Ok(Box::new(CargoPackage { dir }))
-    }
-}
-
-/// The quality prompts exist for Claude Code and OpenCode only.
-pub fn check_agent(agent: AgentKind) -> Result<(), String> {
-    match agent {
-        AgentKind::Claude | AgentKind::OpenCode => Ok(()),
-        AgentKind::Kiro => {
-            Err("the quality stage supports the Claude and OpenCode agents, not Kiro".to_owned())
-        }
     }
 }
 
@@ -504,11 +493,5 @@ mod tests {
         }
         let plan = with_rules(QUALITY_MD);
         assert!(plan.contains("### Rules for every change") && !plan.contains("{RULES}"));
-    }
-
-    #[test]
-    fn kiro_is_rejected() {
-        assert!(check_agent(AgentKind::Kiro).is_err());
-        assert!(check_agent(AgentKind::OpenCode).is_ok());
     }
 }

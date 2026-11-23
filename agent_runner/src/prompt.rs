@@ -13,7 +13,7 @@ pub(crate) struct ModelLimits {
 
 /// The registry limits of the run's models, read once per stage: the prompt
 /// and the backend both use them. Only OpenCode has a registry (see
-/// `opencode::load_registry_limits`); other backends leave this empty.
+/// `opencode::load_registry_limits`); Claude Code leaves this empty.
 #[derive(Debug, Default)]
 pub(crate) struct RegistryLimits {
     pub(crate) main: Option<ModelLimits>,
@@ -46,11 +46,7 @@ impl AgentInvocation<'_> {
 fn render_model_limits(subagent_model: Option<&str>, limits: &RegistryLimits) -> String {
     let mut sections = Vec::new();
     if let Some(main) = &limits.main {
-        sections.push(limits_section(
-            "### Model limits",
-            None,
-            Some(main),
-        ));
+        sections.push(limits_section("### Model limits", None, Some(main)));
     }
     if let Some(sub) = subagent_model {
         sections.push(limits_section(
@@ -88,7 +84,6 @@ fn limits_section(heading: &str, model: Option<&str>, limits: Option<&ModelLimit
 /// fix ships.
 fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
     match agent {
-        AgentKind::Kiro => "",
         // Async sub-agent kill, report-file guard, and the Agent tool's advice
         // against sub-agents.
         AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),

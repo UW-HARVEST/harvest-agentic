@@ -95,7 +95,7 @@ pub(crate) fn invoke_claude(
         invocation.timeout_secs,
         program,
         &args,
-        Some(invocation.prompt),
+        invocation.prompt,
         &env,
     )
 }

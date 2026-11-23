@@ -1,7 +1,7 @@
 # Harvest Agentic Translator
 
 Harvest translates C projects into pure-Rust Cargo packages by driving coding
-agents (OpenCode, Claude Code, Kiro) through staged translation and
+agents (OpenCode, Claude Code) through staged translation and
 verification, then grades the result against an external GoogleTest suite
 built from the C library's own upstream tests.
 The agentic translator builds on the ideas of
@@ -46,8 +46,7 @@ later stage can resume from an earlier run's output directory.
    bare `--agentic` never runs it. An agent refactors the crate toward safe,
    idiomatic Rust (fewer operations that need `unsafe`, fewer lints) without
    changing its behavior, with the tests that the verify stage left in the
-   crate as the regression gate. Claude and OpenCode only. See
-   `tools/quality_agentic/README.md`.
+   crate as the regression gate. See `tools/quality_agentic/README.md`.
 4. **Conform** (`tools/conform_agentic`, stage `conform`/`c`). Experimental,
    research use only: not part of the standard translation pipeline, and bare
    `--agentic` never runs it. A third agent is given the external test suite
@@ -120,8 +119,6 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   `provider,model` model is then an error. `--no-teamclaude` (config:
   `teamclaude = false`) starts `claude` directly, or through CCR, as above.
 
-**Kiro** (`--agent kiro`): legacy backend using per-project-kind prompts; kept for comparison.
-
 ## Prompt modes
 
 - **Plan mode (default)**: the agent maintains a persistent `PLAN.md`
@@ -156,14 +153,14 @@ harness build would otherwise report every test as a failure.
 | Flag | Meaning |
 |------|---------|
 | `--agentic[=STAGES]` | Run the agentic pipeline. STAGES is a comma list of `translate`/`t`, `verify`/`v`, `quality`/`q`, `conform`/`c` in pipeline order; bare `--agentic` means `translate,verify` (`quality` and `conform` are experimental research stages). The value form requires `=` (`--agentic=v`, not `--agentic v`). |
-| `--agent <A>` | `opencode`/`oc`, `claude`, or `kiro` |
+| `--agent <A>` | `opencode`/`oc` or `claude` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
-| `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. Not supported with Kiro. On Claude Code both models must use CCR or neither. |
+| `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. On Claude Code both models must use CCR or neither. |
 | `--no-teamclaude` | Claude only: start `claude` directly (or through CCR) also when `teamclaude` is on PATH. See "Claude Code" above |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
-| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt of Claude and OpenCode uses tab2rust. The flag is an error with `--no-plan` or with the Kiro agent |
-| `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` or with the Kiro agent |
+| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt uses tab2rust. The flag is an error with `--no-plan` |
+| `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
 | `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
 | `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
