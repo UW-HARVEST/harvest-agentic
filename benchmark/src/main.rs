@@ -142,6 +142,7 @@ pub struct RunOptions {
     pub no_tab2rust: bool,
     pub safe_wrapper: bool,
     pub no_fuzz: bool,
+    pub tool_wishlist: bool,
     pub force: bool,
 }
 
@@ -556,9 +557,9 @@ fn benchmark_single_program(
     }
 
     // Inject per-stage tool config for the agentic stages that actually run
-    // in this invocation. The agents' reports (PLAN.md, HYPOTHESES.md,
-    // tool_wishlist.json, ...) stay in the crate. The framework's own records
-    // live under the snapshot's meta directory.
+    // in this invocation. The agents' reports (PLAN.md, HYPOTHESES.md, ...)
+    // stay in the crate. The framework's own records live under the
+    // snapshot's meta directory.
     let meta_dir = stage_manifest::meta_dir(&output_dir);
     std::fs::create_dir_all(&meta_dir).ok();
 
@@ -609,6 +610,9 @@ fn benchmark_single_program(
         }
         if opts.workflow {
             overrides.push(format!("tools.{tool}.workflow=true"));
+        }
+        if opts.tool_wishlist {
+            overrides.push(format!("tools.{tool}.tool_wishlist=true"));
         }
     };
     if opts.has(Stage::Translate) {
@@ -1292,6 +1296,7 @@ fn run(args: Args) -> HarvestResult<()> {
         no_tab2rust: args.no_tab2rust,
         safe_wrapper: args.safe_wrapper,
         no_fuzz: args.no_fuzz,
+        tool_wishlist: args.tool_wishlist,
         force: args.force,
     };
     let (results, quality_reports) = run_all_benchmarks(&program_runs, output_dir, &opts)?;

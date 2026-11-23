@@ -111,6 +111,21 @@ pub fn cargo_features() -> &'static str {
     CARGO_FEATURES_BODY.trim_end()
 }
 
+const TOOL_WISHLIST_BODY: &str = include_str!("tool_wishlist.md");
+
+/// Fills the `{TOOL_WISHLIST}` placeholder of the translate and verify prompts.
+/// Experimental and off by default: when on, the agent records the analysis
+/// tools it wanted in `tool_wishlist.json` of the crate; when off, the
+/// placeholder becomes empty.
+pub fn fill_tool_wishlist(prompt: &str, on: bool) -> String {
+    let section = if on {
+        TOOL_WISHLIST_BODY.trim_end()
+    } else {
+        ""
+    };
+    prompt.replace("{TOOL_WISHLIST}", section)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +163,14 @@ mod tests {
         assert!(prompt.contains("### Cargo features"));
         assert!(!prompt.contains('{'), "{prompt}");
         case.finish();
+    }
+
+    #[test]
+    fn tool_wishlist_is_filled_only_when_on() {
+        let on = fill_tool_wishlist("a\n{TOOL_WISHLIST}\nb", true);
+        assert!(on.contains("tool_wishlist.json"), "{on}");
+        assert!(!on.contains("{TOOL_WISHLIST}"));
+        assert_eq!(fill_tool_wishlist("a\n{TOOL_WISHLIST}\nb", false), "a\n\nb");
     }
 
     #[test]

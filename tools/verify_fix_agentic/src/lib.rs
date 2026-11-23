@@ -127,7 +127,11 @@ impl Tool for VerifyFixAgentic {
         } else {
             ""
         };
-        let prompt = load_verify_prompt(&config, agent).replace("{WORKFLOW_HINT}", workflow_hint);
+        let prompt = agent_runner::fill_tool_wishlist(
+            &load_verify_prompt(&config, agent),
+            config.tool_wishlist,
+        )
+        .replace("{WORKFLOW_HINT}", workflow_hint);
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
@@ -409,6 +413,11 @@ pub struct Config {
     /// No effect under the libloading harness.
     #[serde(default = "default_fuzz")]
     pub fuzz: bool,
+
+    /// Experimental: ask the agent to record the analysis tools it wanted in
+    /// `tool_wishlist.json`. Off by default; the benchmark flag `--tool-wishlist` turns it on.
+    #[serde(default)]
+    pub tool_wishlist: bool,
 
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
@@ -898,6 +907,15 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
             assert!(prompt.contains("{AGENT_BUG_WORKAROUNDS}"));
         }
+    }
+
+    #[test]
+    fn every_prompt_has_the_tool_wishlist_placeholder() {
+        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN, PROMPT_KIRO_VERIFY] {
+            assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
+        }
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!config.tool_wishlist);
     }
 
     #[test]

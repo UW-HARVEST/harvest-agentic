@@ -94,9 +94,11 @@ impl Tool for TranslateAgentic {
         } else {
             ""
         };
-        let translate_prompt =
-            fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper)
-                .replace("{WORKFLOW_HINT}", workflow_hint);
+        let translate_prompt = agent_runner::fill_tool_wishlist(
+            &fill_safe_wrapper(&fill_tab2rust(translate_prompt, tab2rust), safe_wrapper),
+            config.tool_wishlist,
+        )
+        .replace("{WORKFLOW_HINT}", workflow_hint);
 
         agent_runner::invoke_agent(AgentInvocation {
             phase: AgentPhase::Translate,
@@ -326,6 +328,11 @@ pub struct Config {
     #[serde(default)]
     pub safe_wrapper: bool,
 
+    /// Experimental: ask the agent to record the analysis tools it wanted in
+    /// `tool_wishlist.json`. Off by default; the benchmark flag `--tool-wishlist` turns it on.
+    #[serde(default)]
+    pub tool_wishlist: bool,
+
     /// Extra environment variables to inject into the agent process.
     /// Useful for CCR provider API keys, proxy settings, etc.
     /// Defined as a TOML table under `[tools.translate_agentic.env]`.
@@ -442,6 +449,19 @@ mod tests {
     fn scout_task_has_no_placeholder_left() {
         for tab2rust in [false, true] {
             assert!(!render_scout(tab2rust).contains("{CARGO_FEATURES}"));
+        }
+    }
+
+    #[test]
+    fn every_prompt_has_the_tool_wishlist_placeholder() {
+        for prompt in [
+            PROMPT_TRANSLATE,
+            PROMPT_TRANSLATE_NO_PLAN,
+            PROMPT_KIRO_EXECUTABLE,
+            PROMPT_KIRO_LIBRARY,
+            PROMPT_KIRO_CONFIGURABLE,
+        ] {
+            assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
         }
     }
 

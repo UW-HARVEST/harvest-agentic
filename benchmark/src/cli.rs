@@ -195,6 +195,12 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub no_fuzz: bool,
 
+    /// Experimental: ask the translate and verify agents to record the
+    /// analysis tools they wanted in `tool_wishlist.json` of the crate. Off by
+    /// default. Requires the translate or verify stage.
+    #[arg(long, requires = "agentic")]
+    pub tool_wishlist: bool,
+
     /// Set a configuration value; format $NAME=$VALUE.
     #[arg(long, short)]
     pub config: Vec<String>,
@@ -303,8 +309,11 @@ impl Args {
                 ));
             }
         }
-        let translate_or_verify_flags =
-            [(self.no_plan, "--no-plan"), (self.workflow, "--workflow")];
+        let translate_or_verify_flags = [
+            (self.no_plan, "--no-plan"),
+            (self.workflow, "--workflow"),
+            (self.tool_wishlist, "--tool-wishlist"),
+        ];
         for (set, flag) in translate_or_verify_flags {
             if set && !has(Stage::Translate) && !has(Stage::Verify) {
                 return Err(format!(
@@ -391,6 +400,18 @@ mod tests {
         let args = parse(&["bench", "--agentic=t", "--no-fuzz", "in", "out"]).unwrap();
         let err = args.validate_stages(&args.stages()).unwrap_err();
         assert!(err.contains("--no-fuzz"), "{err}");
+    }
+
+    #[test]
+    fn tool_wishlist_requires_translate_or_verify_stage() {
+        for spec in ["--agentic=t", "--agentic=v", "--agentic=t,v,q"] {
+            let args = parse(&["bench", spec, "--tool-wishlist", "in", "out"]).unwrap();
+            args.validate_stages(&args.stages()).unwrap();
+        }
+        let args = parse(&["bench", "--agentic=c", "--tool-wishlist", "in", "out"]).unwrap();
+        let err = args.validate_stages(&args.stages()).unwrap_err();
+        assert!(err.contains("--tool-wishlist"), "{err}");
+        assert!(parse(&["bench", "--tool-wishlist", "in", "out"]).is_err());
     }
 
     #[test]
