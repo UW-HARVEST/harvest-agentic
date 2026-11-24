@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Runs one agent command inside its scope and tells the agent when the shared
-# memory limit stopped or slowed it. Stays small, so the OOM killer picks the
-# command.
+# Runs one agent command inside its scope, under the file-system allowlist of
+# harvest-sandbox, and tells the agent when the shared memory limit stopped or
+# slowed it. Stays small, so the OOM killer picks the command.
 set -uo pipefail
+
+here="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
 slice="${cg%/*}"
@@ -12,7 +14,7 @@ slice="${cg%/*}"
 trap 'echo 1 > "$cg/cgroup.kill"' TERM INT HUP
 # A background job reads /dev/null unless stdin is passed on explicitly.
 exec 3<&0
-/bin/bash -c "$1" <&3 3<&- &
+python3 "$here/harvest-sandbox" "$1" <&3 3<&- &
 child=$!
 while :; do
   # The redirect drops bash's own "Killed" job report, not the command's stderr.

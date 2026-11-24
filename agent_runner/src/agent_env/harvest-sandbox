@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Runs one agent command (`bash -c <command>`) under a Landlock file-system allowlist.
+
+The command and its children can read and run the system files and the Rust toolchain, and
+can write only the run's case directory (the parent of this script's directory), the Cargo
+home and /dev. Every other path, for example other runs and results on the host, fails with
+EACCES. Linux >= 5.13; on an older kernel, or with HARVEST_SANDBOX=off, the command runs
+without the allowlist. `--probe` prints the Landlock ABI version (0: not available).
+"""
+import ctypes
+import os
+import struct
+import sys
+
+SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
+CREATE_RULESET_VERSION = 1
+RULE_PATH_BENEATH = 1
+PR_SET_NO_NEW_PRIVS = 38
+
+EXECUTE, WRITE_FILE, READ_FILE, READ_DIR = 1 << 0, 1 << 1, 1 << 2, 1 << 3
+# The access rights that each ABI version handles: bits 0-12, then REFER, TRUNCATE, -, IOCTL_DEV.
+ABI_RIGHTS = {1: (1 << 13) - 1, 2: (1 << 14) - 1, 3: (1 << 15) - 1, 4: (1 << 15) - 1,
+              5: (1 << 16) - 1}
+FILE_RIGHTS = EXECUTE | WRITE_FILE | READ_FILE | (1 << 14) | (1 << 15)
+READ = EXECUTE | READ_FILE | READ_DIR
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+
+
+def abi():
+    version = libc.syscall(SYS_CREATE_RULESET, None, ctypes.c_size_t(0), CREATE_RULESET_VERSION)
+    return max(version, 0)
+
+
+CASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+HOME = os.path.expanduser("~")
+CARGO_HOME = os.environ.get("CARGO_HOME") or os.path.join(HOME, ".cargo")
+RUSTUP_HOME = os.environ.get("RUSTUP_HOME") or os.path.join(HOME, ".rustup")
+
+
+def allowlist():
+    """(path, access) pairs. Missing paths are skipped."""
+    read = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt", "/run",
+            "/proc", "/sys", "/nix"]
+    write = [CASE_DIR, CARGO_HOME, RUSTUP_HOME, "/dev"]
+    return [(p, READ) for p in read] + [(p, -1) for p in write]
+
+
+def restrict(version):
+    handled = ABI_RIGHTS[min(version, max(ABI_RIGHTS))]
+    attr = ctypes.c_uint64(handled)
+    ruleset = libc.syscall(SYS_CREATE_RULESET, ctypes.byref(attr), ctypes.c_size_t(8), 0)
+    if ruleset < 0:
+        raise OSError(ctypes.get_errno(), "landlock_create_ruleset")
+    for path, access in allowlist():
+        try:
+            fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
+        except OSError:
+            continue
+        rights = handled & access
+        if not os.path.isdir(path):
+            rights &= FILE_RIGHTS
+        # struct landlock_path_beneath_attr, packed: u64 allowed_access, s32 parent_fd.
+        rule = ctypes.create_string_buffer(struct.pack("=Qi", rights, fd), 12)
+        if libc.syscall(SYS_ADD_RULE, ruleset, RULE_PATH_BENEATH, rule, 0) < 0:
+            raise OSError(ctypes.get_errno(), f"landlock_add_rule {path}")
+        os.close(fd)
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS)")
+    if libc.syscall(SYS_RESTRICT_SELF, ruleset, 0) < 0:
+        raise OSError(ctypes.get_errno(), "landlock_restrict_self")
+    os.close(ruleset)
+
+
+def main():
+    if sys.argv[1:] == ["--probe"]:
+        print(abi())
+        return
+    if len(sys.argv) != 2:
+        sys.exit("usage: harvest-sandbox <command> | --probe")
+    version = abi()
+    if version and os.environ.get("HARVEST_SANDBOX") != "off":
+        restrict(version)
+        # The home directory of the host user is outside the allowlist: give the command a
+        # home in the case directory, and keep the toolchain where it is.
+        home = os.path.join(CASE_DIR, "home")
+        os.makedirs(home, exist_ok=True)
+        os.environ.update(HOME=home, CARGO_HOME=CARGO_HOME, RUSTUP_HOME=RUSTUP_HOME)
+    os.execv("/bin/bash", ["/bin/bash", "-c", sys.argv[1]])
+
+
+main()
