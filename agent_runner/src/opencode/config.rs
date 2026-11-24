@@ -5,6 +5,7 @@ use std::path::Path;
 use tracing::warn;
 
 use super::registry::{parse_opencode_model, run_opencode_models};
+use super::routing::Route;
 use crate::{AgentInvocation, CaseDir, agent_env, command_stdout};
 
 struct OpenCodeAgentConfig<'a> {
@@ -65,8 +66,9 @@ fn opencode_task_permission() -> String {
 /// What the run's OpenCode project config carries besides its fixed settings.
 #[derive(Default)]
 struct OpenCodeProjectOptions<'a> {
-    model: Option<&'a str>,
     subagent_model: Option<&'a str>,
+    /// The OpenRouter routes of the run's models (see `routing`).
+    routes: &'a [Route<'a>],
     /// The custom-provider definitions of the run's models (see
     /// `custom_provider_stages`).
     staged_providers: &'a [(String, serde_json::Value)],
@@ -77,6 +79,7 @@ struct OpenCodeProjectOptions<'a> {
 /// Writes the run's OpenCode project into the workspace of the invocation's case.
 pub(crate) fn write_project(
     invocation: &AgentInvocation<'_>,
+    routes: &[Route<'_>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_opencode_agent(
         invocation.case,
@@ -91,6 +94,7 @@ pub(crate) fn write_project(
         },
         invocation.model,
         invocation.subagent_model,
+        routes,
         agent_env::install(invocation.case.root()).as_deref(),
     )
 }
@@ -101,6 +105,7 @@ fn write_opencode_agent(
     config: OpenCodeAgentConfig<'_>,
     model: Option<&str>,
     subagent_model: Option<&str>,
+    routes: &[Route<'_>],
     shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let work_dir = case.workspace();
@@ -114,8 +119,8 @@ fn write_opencode_agent(
         opencode_project_config(
             case.root(),
             &OpenCodeProjectOptions {
-                model,
                 subagent_model,
+                routes,
                 staged_providers: &staged,
                 shell,
             },
@@ -182,12 +187,7 @@ fn write_opencode_agent(
 /// has no model parameter, so the main agent cannot pick another one.
 fn opencode_project_config(case_root: &Path, options: &OpenCodeProjectOptions<'_>) -> String {
     let tempdir_pattern = format!("{}/**", case_root.display());
-    let models: Vec<&str> = options
-        .model
-        .into_iter()
-        .chain(options.subagent_model)
-        .collect();
-    let provider_block = match opencode_provider_config(&models, options.staged_providers) {
+    let provider_block = match opencode_provider_config(options.routes, options.staged_providers) {
         Some(value) => format!(
             ",\n  \"provider\": {}",
             serde_json::to_string(&value).expect("provider block serializes to JSON"),
@@ -236,59 +236,25 @@ fn opencode_project_config(case_root: &Path, options: &OpenCodeProjectOptions<'_
     )
 }
 
-/// The `provider` section for the run's models: the OpenRouter pins, then the
-/// staged custom providers. A pin wins over a staged entry of the same
-/// provider (`or_insert_with`): a user shadowing a built-in provider (e.g.
-/// openrouter) keeps today's routing behavior.
+/// The `provider` section for the run's models: the staged custom providers,
+/// then the OpenRouter routes. A route goes into the model options of a staged
+/// `openrouter` entry, so a user definition of the built-in provider stays in
+/// effect. A model without a route has no entry: OpenRouter's default routing
+/// applies.
 fn opencode_provider_config(
-    models: &[&str],
+    routes: &[Route<'_>],
     staged_providers: &[(String, serde_json::Value)],
 ) -> Option<serde_json::Value> {
-    let pins: serde_json::Map<String, serde_json::Value> = models
-        .iter()
-        .filter_map(|model| openrouter_provider_pin(model))
-        .collect();
-    let mut providers = serde_json::Map::new();
-    if !pins.is_empty() {
-        providers.insert(
-            "openrouter".to_string(),
-            serde_json::json!({ "models": pins }),
-        );
-    }
-    for (id, definition) in staged_providers {
-        providers
-            .entry(id.clone())
-            .or_insert_with(|| definition.clone());
+    let mut providers: serde_json::Map<String, serde_json::Value> =
+        staged_providers.iter().cloned().collect();
+    for route in routes {
+        let openrouter = providers
+            .entry("openrouter")
+            .or_insert_with(|| serde_json::json!({}));
+        // Indexing a missing key adds it, as an object.
+        openrouter["models"][route.model_id]["options"]["provider"] = route.provider();
     }
     (!providers.is_empty()).then_some(serde_json::Value::Object(providers))
-}
-
-/// OpenRouter multiplexes each model across several upstream endpoints and
-/// load-balances across them by default, so `openrouter/xiaomi/mimo-v2.5-pro`
-/// may be served by any host — including ones with a smaller context window,
-/// higher price, or worse uptime than the model author's own first-party
-/// endpoint (a run was once routed to a 262k-context, 5x-priced third party
-/// that then dropped the stream). Pin the request to the author's first-party
-/// endpoint and disable fallbacks: for a first-party author OpenRouter's
-/// provider slug equals the author segment of the model id (verified for
-/// `xiaomi` and holds for `deepseek`, `minimax`, etc.), so a run never silently
-/// lands on an inferior host. Returns the model's registry id and its
-/// provider options, or None for non-OpenRouter models (direct providers route
-/// to a single upstream and need no hint).
-fn openrouter_provider_pin(model: &str) -> Option<(String, serde_json::Value)> {
-    let rest = model.strip_prefix("openrouter/")?;
-    // Drop any routing suffix (e.g. ":floor") so the key matches the registry
-    // model id, then take the author segment as the first-party provider slug.
-    let model_id = rest.split(':').next().unwrap_or(rest);
-    let author = model_id.split('/').next().filter(|s| !s.is_empty())?;
-    Some((
-        model_id.to_string(),
-        serde_json::json!({
-            "options": {
-                "provider": { "only": [author], "allow_fallbacks": false }
-            }
-        }),
-    ))
 }
 
 /// The custom-provider definitions of the run's models, for staging into the
@@ -400,7 +366,7 @@ mod tests {
         // OpenCode resolves rules last-match-wins: the catch-all deny must
         // appear before the tempdir allow in the serialized config.
         assert!(raw.find("\"*\"").unwrap() < raw.find("/tmp/.tmpAbc123/**").unwrap());
-        // No model → no provider routing block.
+        // No route and no staged provider → no provider block.
         assert!(config.get("provider").is_none());
     }
 
@@ -411,18 +377,19 @@ mod tests {
             "harvest-hyak".to_string(),
             serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
         );
-        for (model, staged) in [
-            (None, &[][..]),
-            (Some("openrouter/xiaomi/mimo-v2.5-pro"), &[][..]),
-            (
-                Some("harvest-hyak/qwen3.8-27b"),
-                std::slice::from_ref(&staged),
-            ),
+        let routes = [Route {
+            model_id: "xiaomi/mimo-v2.5-pro",
+            only: vec!["xiaomi"],
+        }];
+        for (routes, staged) in [
+            (&[][..], &[][..]),
+            (&routes[..], &[][..]),
+            (&[][..], std::slice::from_ref(&staged)),
         ] {
             let raw = opencode_project_config(
                 case_root,
                 &OpenCodeProjectOptions {
-                    model,
+                    routes,
                     staged_providers: staged,
                     ..Default::default()
                 },
@@ -457,43 +424,26 @@ mod tests {
     }
 
     #[test]
-    fn opencode_project_config_pins_openrouter_to_author_endpoint() {
+    fn opencode_project_config_sets_openrouter_route() {
         let case_root = Path::new("/tmp/.tmpAbc123");
+        let routes = [Route {
+            model_id: "deepseek/deepseek-v4-pro",
+            only: vec!["deepinfra/fp8", "fireworks"],
+        }];
         let raw = opencode_project_config(
             case_root,
             &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
+                routes: &routes,
                 ..Default::default()
             },
         );
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
-        let opts = config
-            .pointer("/provider/openrouter/models/xiaomi~1mimo-v2.5-pro/options/provider")
-            .expect("openrouter provider pin present");
         assert_eq!(
-            opts.pointer("/only").and_then(|v| v.as_array()),
-            Some(&vec![serde_json::json!("xiaomi")])
+            config
+                .pointer("/provider/openrouter/models/deepseek~1deepseek-v4-pro/options/provider"),
+            Some(&serde_json::json!({ "only": ["deepinfra/fp8", "fireworks"] }))
         );
-        assert_eq!(
-            opts.pointer("/allow_fallbacks").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn opencode_project_config_no_pin_for_non_openrouter() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("opencode-go/mimo-v2.5"),
-                ..Default::default()
-            },
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        assert!(config.get("provider").is_none());
     }
 
     #[test]
@@ -506,7 +456,6 @@ mod tests {
         let raw = opencode_project_config(
             case_root,
             &OpenCodeProjectOptions {
-                model: Some("harvest-hyak/qwen3.8-27b"),
                 staged_providers: &[("harvest-hyak".to_string(), definition)],
                 ..Default::default()
             },
@@ -522,23 +471,34 @@ mod tests {
     }
 
     #[test]
-    fn opencode_project_config_prefers_openrouter_pin_over_staged_entry() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
+    fn opencode_project_config_adds_route_to_staged_openrouter_entry() {
+        let routes = [Route {
+            model_id: "xiaomi/mimo-v2.5-pro",
+            only: vec!["xiaomi"],
+        }];
         let raw = opencode_project_config(
-            case_root,
+            Path::new("/tmp/.tmpAbc123"),
             &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
+                routes: &routes,
                 staged_providers: &[(
                     "openrouter".to_string(),
-                    serde_json::json!({"npm": "shadowed"}),
+                    serde_json::json!({
+                        "options": { "baseURL": "https://gateway.example/v1" },
+                        "models": { "xiaomi/mimo-v2.5-pro": { "options": { "x": 1 } } }
+                    }),
                 )],
                 ..Default::default()
             },
         );
-        let config: serde_json::Value =
-            serde_json::from_str(&raw).expect("project config must be valid JSON");
-        assert!(config.pointer("/provider/openrouter/models").is_some());
-        assert!(config.pointer("/provider/openrouter/npm").is_none());
+        let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            config.pointer("/provider/openrouter/options/baseURL"),
+            Some(&serde_json::json!("https://gateway.example/v1"))
+        );
+        assert_eq!(
+            config.pointer("/provider/openrouter/models/xiaomi~1mimo-v2.5-pro/options"),
+            Some(&serde_json::json!({ "x": 1, "provider": { "only": ["xiaomi"] } }))
+        );
     }
 
     #[test]
@@ -547,7 +507,6 @@ mod tests {
         let raw = opencode_project_config(
             case_root,
             &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
                 subagent_model: Some("openrouter/deepseek/deepseek-v4-flash"),
                 ..Default::default()
             },
@@ -560,29 +519,25 @@ mod tests {
                 Some(&serde_json::json!("openrouter/deepseek/deepseek-v4-flash"))
             );
         }
-        // Both models are pinned to their author's endpoint.
-        let pins = config.pointer("/provider/openrouter/models").unwrap();
-        assert!(pins.get("xiaomi/mimo-v2.5-pro").is_some());
-        assert!(pins.get("deepseek/deepseek-v4-flash").is_some());
+        // No route: OpenRouter's default routing for both models.
+        assert!(config.get("provider").is_none());
         // Without a sub-agent model the sub-agents keep the main model.
-        let raw = opencode_project_config(
-            case_root,
-            &OpenCodeProjectOptions {
-                model: Some("opencode-go/mimo-v2.5"),
-                ..Default::default()
-            },
-        );
+        let raw = opencode_project_config(case_root, &Default::default());
         let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(config.get("agent").is_none());
     }
 
     #[test]
-    fn opencode_project_config_pins_openrouter_and_stages_custom_provider() {
+    fn opencode_project_config_routes_openrouter_and_stages_custom_provider() {
+        let routes = [Route {
+            model_id: "xiaomi/mimo-v2.5-pro",
+            only: vec!["xiaomi"],
+        }];
         let raw = opencode_project_config(
             Path::new("/tmp/.tmpAbc123"),
             &OpenCodeProjectOptions {
-                model: Some("openrouter/xiaomi/mimo-v2.5-pro"),
                 subagent_model: Some("harvest-hyak/qwen3.8-27b"),
+                routes: &routes,
                 staged_providers: &[(
                     "harvest-hyak".to_string(),
                     serde_json::json!({"npm": "@ai-sdk/openai-compatible"}),
@@ -626,6 +581,7 @@ mod tests {
             },
             None,
             None,
+            &[],
             None,
         )
         .unwrap();
@@ -661,6 +617,7 @@ mod tests {
             },
             None,
             None,
+            &[],
             None,
         )
         .unwrap();

@@ -124,6 +124,8 @@ pub fn effective_subagent_model<'a>(
 pub struct PreparedAgent<'a> {
     invocation: AgentInvocation<'a>,
     limits: RegistryLimits,
+    /// The OpenRouter routes of the models (OpenCode only).
+    routes: Vec<opencode::Route<'a>>,
 }
 
 /// Resolves the models of the stage and their registry limits, and writes
@@ -138,6 +140,19 @@ pub fn prepare_agent(
         invocation.model,
         invocation.subagent_model,
     )?;
+    let routes = match invocation.agent {
+        AgentKind::OpenCode => {
+            opencode::take_routes(&mut invocation.model, &mut invocation.subagent_model)?
+        }
+        AgentKind::Claude => Vec::new(),
+    };
+    for route in &routes {
+        info!(
+            "OpenRouter route of {}: only {}",
+            route.model_id,
+            route.only.join(",")
+        );
+    }
     let limits = match invocation.agent {
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
         AgentKind::Claude => RegistryLimits::default(),
@@ -148,7 +163,11 @@ pub fn prepare_agent(
         prompts.join(SUBAGENT_RULES_FILE),
         invocation.subagent_rules_file(&limits),
     )?;
-    Ok(PreparedAgent { invocation, limits })
+    Ok(PreparedAgent {
+        invocation,
+        limits,
+        routes,
+    })
 }
 
 impl PreparedAgent<'_> {
@@ -163,18 +182,19 @@ impl PreparedAgent<'_> {
         let prompt = self.render(self.invocation.prompt);
         let mut invocation = self.invocation;
         invocation.prompt = &prompt;
-        run_prepared(&invocation, &self.limits)
+        run_prepared(&invocation, &self.limits, &self.routes)
     }
 }
 
 fn run_prepared(
     invocation: &AgentInvocation<'_>,
     limits: &RegistryLimits,
+    routes: &[opencode::Route<'_>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_workdir_git(&invocation.case.workspace());
     invocation.case.commit_links();
 
-    prepare_agent_env(invocation)?;
+    prepare_agent_env(invocation, routes)?;
 
     let logs_dir = invocation.case.root().join("logs");
     fs::create_dir_all(&logs_dir)?;
@@ -246,10 +266,13 @@ fn run_prepared(
     Ok(())
 }
 
-fn prepare_agent_env(invocation: &AgentInvocation<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn prepare_agent_env(
+    invocation: &AgentInvocation<'_>,
+    routes: &[opencode::Route<'_>],
+) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
         AgentKind::Claude => claude::write_claude_sandbox(invocation.case.root()),
-        AgentKind::OpenCode => opencode::write_project(invocation),
+        AgentKind::OpenCode => opencode::write_project(invocation, routes),
     }
 }
 

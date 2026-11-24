@@ -129,6 +129,8 @@ pub struct Args {
     /// Agent model for the agentic stages of this run.
     /// Claude accepts short aliases ("sonnet", "opus", "haiku") or full model IDs.
     /// OpenCode expects provider/model format (for example, "opencode-go/deepseek-v4-pro").
+    /// An OpenCode "openrouter/..." model can end in "#<provider>[,<provider>...]" to send its
+    /// requests only to those OpenRouter providers (for example, "#deepinfra/fp8,fireworks").
     #[arg(long, requires = "agentic")]
     pub model: Option<String>,
 
