@@ -5,7 +5,14 @@ Reader: an implementer of the quality stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/quality/rules.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You carry out one sub-task of a planned change of the data model of a Rust crate translated from
 C. The plan is a proposal file (`quality/proposals/P<n>.md`) that the main agent chose; its scout

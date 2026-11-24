@@ -105,6 +105,7 @@ impl Tool for QualityAgentic {
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
             additional_prompts: &[],
             stage_facts: &facts,
@@ -343,6 +344,10 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
+    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    pub prompt_record_dir: Option<PathBuf>,
+
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract. Injected from the
     /// stage manifest when resuming from a snapshot.
     pub test_corpus_root: Option<PathBuf>,
@@ -461,6 +466,7 @@ mod tests {
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
+            prompt_record_dir: None,
             rust_toolchain: &toolchain,
             additional_prompts: &[],
             stage_facts: &facts,
@@ -541,6 +547,12 @@ mod tests {
                         "runtime.md",
                         "subagent.md"
                     ],
+                    "{name}"
+                );
+                // A role file names every file itself: a sub-agent does not follow a chain.
+                assert_eq!(
+                    agent_runner::prompt_check::not_listed(&files, &format!("quality/{name}")),
+                    [""; 0],
                     "{name}"
                 );
                 // The main prompt names every role file.

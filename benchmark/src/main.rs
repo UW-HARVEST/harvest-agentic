@@ -567,6 +567,7 @@ fn benchmark_single_program(
     // to the same log file as benchmark messages.
     let output_log_path = output_root_dir.join("output.log");
     let reference_modified_dir = meta_dir.join(stage_manifest::REFERENCE_MODIFIED_DIR);
+    let prompts_dir = meta_dir.join(stage_manifest::PROMPTS_DIR);
     let mut effective_overrides = opts.config_overrides.clone();
     if opts.no_teamclaude {
         effective_overrides.push("teamclaude=false".to_owned());
@@ -581,6 +582,10 @@ fn benchmark_single_program(
         overrides.push(format!(
             "tools.{tool}.reference_audit_dir={}",
             reference_modified_dir.join(stage.to_string()).display()
+        ));
+        overrides.push(format!(
+            "tools.{tool}.prompt_record_dir={}",
+            prompts_dir.join(stage.to_string()).display()
         ));
         if let Some(root) = &program_run.test_corpus_root {
             overrides.push(format!("tools.{tool}.test_corpus_root={}", root.display()));

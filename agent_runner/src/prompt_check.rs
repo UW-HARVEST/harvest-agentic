@@ -152,6 +152,18 @@ pub fn must_read(files: &PromptFiles, entry: &str) -> BTreeSet<String> {
     found
 }
 
+/// The files that the reader of `entry` must read and that the "read first" list of `entry` does
+/// not name itself. The file that a task message names for a sub-agent (its role file, or
+/// `subagent.md`) must leave none: sub-agents read the files of that list, but they do not
+/// reliably go on to the list of a file that they read.
+pub fn not_listed(files: &PromptFiles, entry: &str) -> Vec<String> {
+    let listed = files.get(entry).map(|text| read_first(text));
+    must_read(files, entry)
+        .into_iter()
+        .filter(|file| file != entry && !listed.iter().flatten().any(|named| named == file))
+        .collect()
+}
+
 /// A cycle of "read first" lists that starts at `file`, if there is one.
 fn cycle(files: &PromptFiles, file: &str, path: &mut Vec<String>) -> Option<String> {
     if path.iter().any(|seen| seen == file) {
@@ -280,6 +292,9 @@ mod tests {
         let files = load(dir.path()).unwrap();
         let read: Vec<String> = must_read(&files, "s/main.md").into_iter().collect();
         assert_eq!(read, ["c.md", "m.md", "s/main.md"]);
+        // main.md leaves c.md to the list of m.md; m.md names all that its reader must read.
+        assert_eq!(not_listed(&files, "s/main.md"), ["c.md"]);
+        assert_eq!(not_listed(&files, "m.md"), [""; 0]);
         assert_eq!(problems(dir.path()).unwrap(), [""; 0]);
     }
 

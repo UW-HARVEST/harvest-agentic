@@ -4,10 +4,11 @@
 
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use harvest_core::config::AgentKind;
 
-use crate::{AgentInvocation, AgentPhase};
+use crate::{AgentInvocation, AgentPhase, CaseDir};
 
 /// The directory of the prompt files, as the agents name it: relative to the root of a checkout.
 pub const PROMPTS_PATH: &str = "inputs/prompts";
@@ -73,6 +74,35 @@ pub fn main_prompt(phase: AgentPhase) -> String {
         phase.label(),
         phase.prompt_dir()
     )
+}
+
+/// The file of a prompt record that holds the prompt of the main agent.
+const RECORDED_PROMPT_FILE: &str = "PROMPT.md";
+
+/// Keeps what the agents of the stage are given in `record`, a directory of the output: the
+/// prompt of the main agent ([`RECORDED_PROMPT_FILE`]) and a copy of `inputs/prompts/`. The
+/// case directory does not outlive the stage, and `run.md` exists nowhere else. A record of an
+/// earlier run of the stage is replaced.
+pub(crate) fn record_prompts(case: &CaseDir, prompt: &str, record: &Path) -> io::Result<()> {
+    fn copy(from: &Path, to: &Path) -> io::Result<()> {
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let target = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy(&entry.path(), &target)?;
+            } else {
+                // Not `fs::copy`: the inputs are read-only, and the record must not be.
+                fs::write(target, fs::read(entry.path())?)?;
+            }
+        }
+        Ok(())
+    }
+    if record.exists() {
+        fs::remove_dir_all(record)?;
+    }
+    copy(&case.prompts(), record)?;
+    fs::write(record.join(RECORDED_PROMPT_FILE), prompt)
 }
 
 /// A fact of the stage for `run.md`: a section with its heading.
@@ -278,6 +308,7 @@ mod tests {
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
+            prompt_record_dir: None,
             rust_toolchain: &toolchain,
             additional_prompts: if options { &additional } else { &[] },
             stage_facts: &facts,
@@ -322,6 +353,11 @@ mod tests {
                         "subagent.md"
                     ]
                 );
+                // A sub-agent without a role file starts at subagent.md, which lists all.
+                assert_eq!(
+                    crate::prompt_check::not_listed(&files, "subagent.md"),
+                    [""; 0]
+                );
                 assert!(files.contains_key("cargo_features.md"));
                 assert_eq!(files["verify/method.md"], "# Method\n");
                 assert!(files["tool_wishlist.md"].contains("tool_wishlist.json"));
@@ -365,6 +401,7 @@ mod tests {
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
+            prompt_record_dir: None,
             rust_toolchain: &toolchain,
             additional_prompts: &[],
             stage_facts: &[],
@@ -459,6 +496,40 @@ mod tests {
                 assert!(run.contains(models), "{run}");
             },
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prompt_record_holds_the_prompt_and_the_prompt_files() {
+        with_invocation(AgentKind::Claude, None, true, |invocation| {
+            invocation
+                .write_shared_prompts(&RegistryLimits::default())
+                .unwrap();
+            let inputs = invocation.case.lock_inputs().unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let record = out.path().join("prompts/verify");
+            // A record of an earlier run of the stage goes.
+            fs::create_dir_all(&record).unwrap();
+            fs::write(record.join("stale.md"), "old").unwrap();
+            record_prompts(invocation.case, "the prompt\n", &record).unwrap();
+            assert!(!record.join("stale.md").exists());
+            assert_eq!(
+                fs::read_to_string(record.join(RECORDED_PROMPT_FILE)).unwrap(),
+                "the prompt\n"
+            );
+            for file in ["run.md", "common.md", "verify/method.md"] {
+                assert_eq!(
+                    fs::read(record.join(file)).unwrap(),
+                    fs::read(invocation.case.prompts().join(file)).unwrap(),
+                    "{file}"
+                );
+            }
+            // The inputs are read-only; the record is an ordinary file.
+            let writable = |path: &Path| !fs::metadata(path).unwrap().permissions().readonly();
+            assert!(!writable(&invocation.case.prompts().join("run.md")));
+            assert!(writable(&record.join("run.md")));
+            drop(inputs);
+        });
     }
 
     #[test]

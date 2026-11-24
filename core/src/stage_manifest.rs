@@ -19,6 +19,8 @@
 //!     c_src/                                  C source (RawSource), rewritten every stage
 //!     suite/                                  external tests, rewritten every stage
 //!     reference_modified/<stage>/<name>       read-only inputs an agent changed (audit)
+//!     prompts/<stage>/                        what the agents of the stage got: PROMPT.md and
+//!                                             a copy of the run's inputs/prompts/
 //!     results.err
 //!     quality.json  unsafe_ops.tsv            code-quality report (benchmark)
 //! ```
@@ -57,6 +59,10 @@ pub const SUITE_DIR: &str = "suite";
 /// Audit record of the read-only inputs an agent changed: one file per input, under a directory
 /// per stage.
 pub const REFERENCE_MODIFIED_DIR: &str = "reference_modified";
+
+/// Record of what the agents of each stage were given: under a directory per stage, the prompt of
+/// the main agent and a copy of the prompt files of the run.
+pub const PROMPTS_DIR: &str = "prompts";
 
 /// Every directory name that can constitute an external test suite. The
 /// authoritative copy lives under `.harvest/suite/`, but the cando2 grader

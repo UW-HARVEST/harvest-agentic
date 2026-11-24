@@ -5,8 +5,15 @@ Reader: a sub-agent of the verification stage that fixes the Rust code.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/verify/verify_rules.md`
 - `inputs/prompts/cargo_features.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You fix one problem of a C-to-Rust translation that the main agent found: a divergence between
 the C code and the Rust code, or entries that `SYMBOLS.md` marks as missing. The C code is in

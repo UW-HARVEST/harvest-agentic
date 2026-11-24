@@ -5,7 +5,14 @@ Reader: a runner of the quality stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/quality/rules.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You run one scripted step of the quality work and report its result. The script does the work;
 you start it, wait for it, and report. The main agent decides from your report and from the files

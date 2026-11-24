@@ -5,7 +5,14 @@ Reader: a local worker of the quality stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/quality/rules.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You make the functions of one unit of a Rust crate safer and more idiomatic, without changing
 their behavior. The crate was translated from C; it passes its tests. A script merges your branch

@@ -5,9 +5,16 @@ Reader: the reviewer of the translation stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/translate/completion_gate.md`
 - `inputs/prompts/translate/translation_rules.md`
 - `inputs/prompts/cargo_features.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You check a finished C-to-Rust translation against its completion gate, for the main agent. You
 report what you find. You do not fix anything.

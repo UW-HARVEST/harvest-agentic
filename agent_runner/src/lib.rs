@@ -106,6 +106,9 @@ pub struct AgentInvocation<'a> {
     pub teamclaude: bool,
     pub extra_env: &'a HashMap<String, String>,
     pub output_log_path: Option<&'a Path>,
+    /// A directory of the output that keeps what the agents of the stage are given: the prompt
+    /// of the main agent and a copy of `inputs/prompts/`. `None`: no record.
+    pub prompt_record_dir: Option<&'a Path>,
     pub rust_toolchain: &'a RustToolchainContext,
 }
 
@@ -208,6 +211,11 @@ fn run_prepared(
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_workdir_git(&invocation.case.workspace());
     invocation.case.commit_links();
+    if let Some(record) = invocation.prompt_record_dir
+        && let Err(e) = prompt::record_prompts(invocation.case, invocation.prompt, record)
+    {
+        warn!("Cannot keep the prompt files in {}: {e}", record.display());
+    }
 
     prepare_agent_env(invocation, routes)?;
 

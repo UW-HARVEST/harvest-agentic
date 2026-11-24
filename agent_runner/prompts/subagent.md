@@ -7,6 +7,11 @@ Read these files first:
 
 - `inputs/prompts/common.md`
 - `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 - Do the task that your task message gives, and only that task. When the task message names a
   prompt file of your role, that file tells the steps and the form of your reply.

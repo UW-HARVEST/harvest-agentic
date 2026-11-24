@@ -5,7 +5,14 @@ Reader: the reviewer of the verification stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/verify/verify_rules.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You do the final cross-review of the verification of a C-to-Rust translation, for the main agent.
 You report what you find. You do not fix anything.

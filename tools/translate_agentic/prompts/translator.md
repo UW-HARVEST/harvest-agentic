@@ -5,8 +5,15 @@ Reader: a translator of the translation stage.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/translate/translation_rules.md`
 - `inputs/prompts/cargo_features.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 You translate one subtask of a C-to-Rust translation, or you fix code of it. The C code is in
 `inputs/c_src`. The Rust crate is in your checkout. The main agent made the plan and gave you the

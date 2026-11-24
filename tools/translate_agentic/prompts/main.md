@@ -61,17 +61,15 @@ more prompt files when this run uses them.
 
 ### 0.1 Self-assessment
 
-Output the following in your first response:
+Fill in the "Self-assessment" section of `PLAN.md` now, before you send the scouts:
 
-```
-Self-assessment:
-- Model: <your model name as best you know it>
-- Approximate usable context window: <the context window in inputs/prompts/run.md>
-- Approximate budget rule of thumb: ~4 chars per token; 200k tokens ≈ 800kB of text
-- Approximate single-response output token limit: <the output limit in inputs/prompts/run.md>
-- Sub-agent model, window, output limit: <from inputs/prompts/run.md>
-  (The sub-agent output limit caps how much Rust code a single sub-agent call can write.)
-```
+- Model: your model name as best you know it.
+- Window and output token limit: the context window and the output limit of the main agent in
+  `inputs/prompts/run.md`.
+- Sub-agents: their model, context window and output limit in `inputs/prompts/run.md`. The
+  sub-agent output limit caps how much Rust code a single sub-agent call can write.
+
+Rule of thumb for the budget: ~4 chars per token; 200k tokens ≈ 800kB of text.
 
 ### 0.2 Send scouts to explore the C code
 
@@ -107,7 +105,7 @@ yourself: your context is for the plan and the build.
 `PLAN.md` is your **lifeline across compactions**: after a compaction, you read it again to recover
 your state. It is a plain markdown file that you maintain yourself, not the TODO list of a tool.
 
-When the scouts reply, immediately fill in its sections: "Self-assessment" (from 0.1), "Codebase
+When the scouts reply, immediately fill in its other sections: "Codebase
 summary" and "Translation subtasks" (from the scout replies and your own analysis), and later
 "Notes for future-me". Each section of `PLAN.md` shows the form of its entries. Merge the replies of
 all scouts, and number the subtasks T1, T2, .... You can split, merge or reorder subtasks for
@@ -115,6 +113,8 @@ their size and their dependencies. All subtasks together must cover all of the C
 
 - **Fill it in BEFORE your context fills up.** Its sections must be complete before the first
   compaction.
+- **Each subtask has its own line with a checkbox in `PLAN.md` before you send it.** This applies
+  to every subtask of every wave. Do not leave a group of subtasks as a note to fill in later.
 - **Update the checkboxes and "Notes for future-me" IMMEDIATELY after any work completes**,
   whether it was you or a sub-agent. Mark a subtask `[x]` only after its branch is merged into
   `main`.
@@ -185,7 +185,7 @@ Send each subtask to a translator. Its prompt has this form, and no rules:
 Read inputs/prompts/translate/translator.md and do the task in it.
 Checkout: wt/<name> (branch <name>).
 Subtask <Tn>: <name>.
-C files and functions: <list>.
+C files and functions: <list; give each C file as a path that starts with inputs/c_src/>.
 Rust files to write: <list>.
 Dependencies: <types, constants and signatures of other subtasks, or where to find them>.
 Scout report sections: <sections of scout/REPORT_<n>.md>.

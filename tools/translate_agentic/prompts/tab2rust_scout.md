@@ -1,7 +1,8 @@
 # Data tables (tab2rust): the part of scout 1
 
 Reader: scout 1 of the translation stage, when its task message names this file. Do this part
-first, before you explore.
+first, before you explore. This part covers all of `inputs/c_src`, not only the files of your
+file group.
 
 tab2rust finds large C data tables and writes them as Rust with the exact compiled values. Read
 `inputs/agent_skills/tab2rust/SKILL.md` and `inputs/agent_skills/tab2rust/references/tool-usage.md`.

@@ -6,7 +6,14 @@ completeness check.
 Read these files first:
 
 - `inputs/prompts/subagent.md`
+- `inputs/prompts/common.md`
+- `inputs/prompts/git_subagent.md`
+- `inputs/prompts/run.md`
+- `inputs/prompts/runtime.md`
 - `inputs/prompts/verify/verify_rules.md`
+
+Read each of these files completely, before you start your task. Do not cut
+a file with `head`, and do not skip a file.
 
 The four surface files `SYMBOLS.md`, `CONDITIONALS.md`, `ERRORS.md` and `CONFIGS.md` are the test
 plan of the verification of a C-to-Rust translation. The tests of the main agent cover their rows.

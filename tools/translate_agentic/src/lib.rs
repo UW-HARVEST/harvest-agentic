@@ -155,6 +155,7 @@ impl Tool for TranslateAgentic {
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
             additional_prompts: &additional,
             stage_facts: &[],
@@ -371,6 +372,10 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
+    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    pub prompt_record_dir: Option<PathBuf>,
+
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
     /// Injected from the stage manifest when resuming from a snapshot, whose
     /// C source no longer sits inside the corpus.
@@ -488,6 +493,7 @@ mod tests {
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
+            prompt_record_dir: None,
             rust_toolchain: &toolchain,
             additional_prompts: &additional_prompts(tab2rust, safe_wrapper, true),
             stage_facts: &[],
@@ -602,6 +608,11 @@ mod tests {
                     sorted(&[&EVERY_AGENT, role, more]),
                     "{entry}"
                 );
+                // A role file names every file itself: a sub-agent does not follow a chain.
+                if entry != "translate/main.md" {
+                    let not_listed = agent_runner::prompt_check::not_listed(&files, entry);
+                    assert_eq!(not_listed, [""; 0], "{entry}");
+                }
             }
             // The parts that an option adds to a role name no files of their own to read first.
             for part in [

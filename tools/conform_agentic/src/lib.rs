@@ -91,6 +91,10 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
+    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    pub prompt_record_dir: Option<PathBuf>,
+
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
     /// Injected from the stage manifest when resuming from a snapshot, whose
     /// C source no longer sits inside the corpus.
@@ -175,6 +179,7 @@ impl Tool for ConformAgentic {
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
             additional_prompts: &[],
             stage_facts: &facts,
@@ -262,6 +267,7 @@ mod tests {
                 teamclaude: true,
                 extra_env: &env,
                 output_log_path: None,
+                prompt_record_dir: None,
                 rust_toolchain: &toolchain,
                 additional_prompts: &[],
                 stage_facts: &facts,

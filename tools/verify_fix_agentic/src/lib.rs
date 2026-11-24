@@ -177,6 +177,7 @@ impl Tool for VerifyFixAgentic {
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
             additional_prompts: &additional,
             stage_facts: &[],
@@ -470,6 +471,10 @@ pub struct Config {
     /// Directory that records the read-only inputs the agent changed, one file each
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
+
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
+    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    pub prompt_record_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
     /// Injected from the stage manifest when resuming from a snapshot, whose
@@ -962,6 +967,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
+            prompt_record_dir: None,
             rust_toolchain: &toolchain,
             additional_prompts: &additional,
             stage_facts: &[],
@@ -1052,6 +1058,12 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
             let mut fixer = vec!["cargo_features.md"];
             fixer.extend(subagent);
             assert_eq!(must_read(&files, "verify/fixer.md"), fixer);
+            // A role file names every file itself: a sub-agent does not follow a chain.
+            for role in ["surface.md", "fixer.md", "reviewer.md"] {
+                let not_listed =
+                    agent_runner::prompt_check::not_listed(&files, &format!("verify/{role}"));
+                assert_eq!(not_listed, [""; 0], "{role}");
+            }
             // The generic boundaries have one copy, which the main agent and the method files name.
             let boundaries = "generic boundaries of `inputs/prompts/verify/verify_rules.md`";
             assert!(files["verify/verify_rules.md"].contains("## Generic boundaries"));
