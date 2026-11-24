@@ -104,7 +104,7 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   of a stage share one OpenRouter session, so each model stays on the
   provider of its first request while that provider works.
 - The model's context/output limits are read from `opencode models --verbose`
-  and injected into the prompt so the agent knows its real window.
+  and written into its prompt files, so the agent knows its real window.
 - After each run, all OpenCode sessions (including sub-agents) are exported
   and appended to the logs, so traces are complete.
 
@@ -128,11 +128,11 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
 
 ## Prompt modes
 
-- **Plan mode (default)**: the agent maintains a persistent `PLAN.md`
-  (translation) and `HYPOTHESES.md` (verification) on disk as an
-  anti-compaction mechanism. After any context compaction it re-reads them to
-  recover state. Recommended for large repositories.
-- **`--no-plan`**: the original minimal prompts. No plan files, no sub-agent
+- **Plan mode (default)**: the agent maintains a persistent state file
+  (`PLAN.md` for translation, `HYPOTHESES.md` for verification) on disk as an
+  anti-compaction mechanism. After any context compaction it re-reads its
+  rules and the state file. Recommended for large repositories.
+- **`--no-plan`**: the original minimal prompts. No state files, no sub-agent
   guidance. For controlled experiments measuring the impact of the
   anti-compaction mechanism.
 - **`--workflow`** (requires `--no-plan`, Claude only): injects a hint asking

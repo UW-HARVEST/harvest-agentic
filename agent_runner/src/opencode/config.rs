@@ -11,16 +11,17 @@ use crate::{AgentInvocation, CaseDir, agent_env, command_stdout};
 struct OpenCodeAgentConfig<'a> {
     name: &'a str,
     description: &'a str,
-    /// `cat <files>` command for post-compaction memory recovery. None when
-    /// plan files are disabled (nothing to recover). Some → the
-    /// compaction-recovery plugin is written next to the agent definition.
-    recovery_command: Option<String>,
+    /// The `cat <file>` commands for post-compaction recovery (see
+    /// `recovery_commands`). None when plan files are disabled (nothing to
+    /// recover). Some → the compaction-recovery plugin is written next to the
+    /// agent definition.
+    recovery_commands: Option<String>,
 }
 
 /// Project-local OpenCode plugin (auto-loaded from `.opencode/plugin/`) that
-/// tells the model to restore its plan files after a compaction; a
-/// system-prompt hint alone is often skipped. `{RECOVERY_CMD}` is replaced
-/// with the phase's recovery command in the whole file, comments included.
+/// tells the model to read its rules and its state file again after a
+/// compaction; a system-prompt hint alone is often skipped. `{RECOVERY_CMDS}`
+/// is replaced with the phase's recovery commands in the whole file.
 /// The agent can read the plugin, so keep its comments free of history.
 const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("compaction_recovery.js");
 
@@ -88,15 +89,22 @@ pub(crate) fn write_project(
             description: invocation.phase.opencode_description(),
             // The recovery files (PLAN.md/HYPOTHESES.md/CONFORM.md) do
             // not exist when plan files are disabled.
-            recovery_command: invocation
+            recovery_commands: invocation
                 .plan_files_enabled()
-                .then(|| format!("cat {}", invocation.phase.recovery_files().join(" "))),
+                .then(|| recovery_commands(&invocation.phase.recovery_files())),
         },
         invocation.model,
         invocation.subagent_model,
         routes,
         agent_env::install(invocation.case.root()).as_deref(),
     )
+}
+
+/// The commands that restore the rules and the state of the main agent after a compaction, as
+/// the plugin text lists them: one `cat` for each file, so that no output is cut off.
+fn recovery_commands(files: &[String]) -> String {
+    let commands: Vec<String> = files.iter().map(|file| format!("`cat {file}`")).collect();
+    commands.join(", ")
 }
 
 /// Writes the OpenCode project config and agent definition into the workspace of `case`.
@@ -157,10 +165,10 @@ fn write_opencode_agent(
         OPENCODE_RESILIENCE_PLUGIN,
     )?;
 
-    if let Some(recovery_command) = &config.recovery_command {
+    if let Some(recovery_commands) = &config.recovery_commands {
         fs::write(
             plugin_dir.join("compaction-recovery.js"),
-            OPENCODE_COMPACTION_PLUGIN.replace("{RECOVERY_CMD}", recovery_command),
+            OPENCODE_COMPACTION_PLUGIN.replace("{RECOVERY_CMDS}", recovery_commands),
         )?;
     }
     Ok(())
@@ -597,7 +605,7 @@ mod tests {
             OpenCodeAgentConfig {
                 name: "harvest-translate",
                 description: "test",
-                recovery_command: None,
+                recovery_commands: None,
             },
             None,
             None,
@@ -633,7 +641,10 @@ mod tests {
             OpenCodeAgentConfig {
                 name: "harvest-verify",
                 description: "test",
-                recovery_command: Some("cat PLAN.md HYPOTHESES.md".to_string()),
+                recovery_commands: Some(recovery_commands(&[
+                    "inputs/prompts/main_agent.md".to_string(),
+                    "PLAN.md".to_string(),
+                ])),
             },
             None,
             None,
@@ -643,8 +654,16 @@ mod tests {
         .unwrap();
         let plugin =
             fs::read_to_string(dir.join(".opencode/plugin/compaction-recovery.js")).unwrap();
-        assert!(plugin.contains("run `cat PLAN.md HYPOTHESES.md` to restore"));
-        assert!(!plugin.contains("{RECOVERY_CMD}"));
+        assert!(plugin.contains("memory: `cat inputs/prompts/main_agent.md`, `cat PLAN.md`. "));
+        // A compacted sub-agent reads its own prompt files again, not those of the main agent.
+        assert!(plugin.contains("If you are the main agent of the"));
+        assert!(
+            plugin.contains(
+                "If you are a sub-agent, read again the prompt file that your task message"
+            )
+        );
+        assert!(plugin.contains("`inputs/prompts/subagent.md`"));
+        assert!(!plugin.contains("{RECOVERY_CMDS}"));
         assert!(plugin.contains("experimental.chat.messages.transform"));
         assert!(plugin.contains("experimental.session.compacting"));
         // Fallback predicate must not depend solely on the unstable metadata marker.

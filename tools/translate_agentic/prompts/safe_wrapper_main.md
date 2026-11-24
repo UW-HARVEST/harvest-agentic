@@ -1,0 +1,44 @@
+# Safe API wrappers: the main agent
+
+Reader: the main agent of the translation stage, when `inputs/prompts/run.md` lists this file.
+
+This run translates to a safe boundary design: the C exports, a wrapper layer, and internal code
+without `unsafe`.
+
+## The designer
+
+In step 0.2, in the same message as the scouts, also send one Safe API Wrapper Designer. It
+designs the safe Rust boundary of the library. Give it this prompt:
+
+```
+Read inputs/prompts/translate/safe_wrapper_designer.md and do the task in it.
+Context window: <sub-agent window from 0.1>. Output token limit: <sub-agent output limit from 0.1>.
+```
+
+It writes `scout/safe_wrapper/DESIGN.md` and a code skeleton in `scout/safe_wrapper/skeleton/`,
+and replies with a boundary summary. The next section tells how the plan uses the design.
+
+## The plan and the design
+
+- The boundary design is `scout/safe_wrapper/DESIGN.md`, with its code skeleton in
+  `scout/safe_wrapper/skeleton/`. After the designer replies, you own the design. You fix the
+  skeleton and the bad signatures, and you record each change in `DESIGN.md`.
+- The crate has three modules: `api` (the C exports, with the C ABI rules of
+  `inputs/prompts/translate/translation_rules.md`), `wrap` (the
+  wrapper layer) and `internal` (`src/internal/mod.rs` starts with `#![forbid(unsafe_code)]`).
+  `src/wrap/rt/` holds the framework items that the design uses. Never change it.
+- Make the subtasks from the scout proposals and the design together:
+  - T1 copies the skeleton into `src/`, and makes `cargo build` pass with the `todo!()` bodies.
+  - Wave 1: the wrapper types of `wrap` are their own subtasks. A C module that the design wraps
+    whole (8.2) goes into them.
+  - Wave 2, after wave 1 ends: the subtask of a C file `X.c` writes `src/internal/X.rs` and
+    `src/api/X.rs`.
+  - Each subtask lists its sections of `DESIGN.md`: `— safe wrapper: <names>`. Its sub-agent prompt
+    also contains: `Read inputs/prompts/translate/safe_wrapper_translator.md and the sections <names> of scout/safe_wrapper/DESIGN.md.`
+- After each wave, record the design changes that the sub-agents report in `DESIGN.md`, before
+  the next step starts. For functions that the designer did not design, send the designer again
+  with the line `Add to the design: <list>.` Only one designer runs at a time.
+- The design and the sub-agent reports mark non-local jumps, variadic functions and heap
+  allocations that C does not make (S5). Decide how to handle each one, and write it in "Notes for
+  future-me".
+- At the end, `grep -rn 'todo!' src/` finds nothing.

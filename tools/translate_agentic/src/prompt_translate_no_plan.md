@@ -2,6 +2,18 @@
 Translate the C code in inputs/c_src to Rust that produces **byte-identical output** for the same inputs.
 Write Cargo.toml and src/ files in the current directory (NOT in inputs/c_src).
 
+Before you start, read these files. They hold rules of this run that this prompt does not repeat:
+
+- `inputs/prompts/common.md`: the directories of the run, the command environment and the Rust
+  toolchain. It names two more files to read.
+- `inputs/prompts/git_main.md`: the git discipline.
+- `inputs/prompts/cargo_features.md`: the Cargo features of the C build options.
+- `inputs/prompts/translate/completion_gate.md`: the completion gate.
+- `inputs/prompts/translate/translation_rules.md`: read its section "No stubs".
+- Each additional prompt file that `inputs/prompts/run.md` lists.
+
+When you send a sub-agent, start its prompt with the line `Read inputs/prompts/subagent.md first.`
+
 {WORKFLOW_HINT}
 **CRITICAL CONSTRAINT: Pure Rust Translation Only**
 
@@ -26,8 +38,10 @@ A `build.rs` is allowed for legitimate build-time needs (code generation,
 feature detection, etc.), but it must NOT reference, compile, or link any
 file under `inputs/c_src`.
 
-If the codebase is large, you must still translate all of it, with no stubs (see "Completion
-gate" below). Never refuse or abort a translation because the codebase seems too big.
+If the codebase is large, you must still translate all of it, with no stubs (see the completion
+gate). Never refuse or abort a translation because the codebase seems too big. This
+framework has translated C code bases of more than a million lines, and the budget of this run is
+sufficient for this code base.
 
 ## Step 1: Analyze BEFORE writing any code
 
@@ -45,13 +59,11 @@ Before writing a single line of Rust, you MUST:
 ## Step 2: Plan the translation
 
 If the project has build-time configurability (CMake cache variables selecting different
-source files or parameters), you MUST preserve this with Cargo features (see "Cargo features"
-below):
+source files or parameters), you MUST preserve this with Cargo features (see
+`inputs/prompts/cargo_features.md`):
 - Use `#[cfg(feature = "...")]` to conditionally compile modules and set constants.
 - Plan which source files map to which features before writing code.
 - Do NOT hardcode a single configuration — every variant must be implemented.
-
-{CARGO_FEATURES}
 
 For large projects, break the work into phases: shared/core code first, then each
 backend or variant, then wire up feature gates.
@@ -80,14 +92,11 @@ backend or variant, then wire up feature gates.
 ## Step 4: Check the completion gate
 
 Run `cargo build --release` and fix any errors until it compiles.
-If the project has Cargo features, also run the configuration builds (see "Cargo features"
-above) and fix them until they compile.
+If the project has Cargo features, also run the configuration builds (see
+`inputs/prompts/cargo_features.md`) and fix them until they compile.
 
-{COMPLETION_GATE}
-
-{NO_STUBS}
-
-Before you end, check each point of the completion gate yourself. Search all of `src/` with `grep`
+Before you end, check each point of the completion gate
+(`inputs/prompts/translate/completion_gate.md`) yourself. Search all of `src/` with `grep`
 for each stub form of "No stubs". For each exported function, check that its body is a real translation of the C
 function. Fix what you find, and check again.
 
@@ -96,16 +105,3 @@ after you and does the thorough execution testing. Beyond the one smoke test, do
 suites or differential tests here.
 
 Do NOT modify anything in inputs/c_src.
-
-{MODEL_LIMITS}
-
-{RUST_TOOLCHAIN_CONTEXT}
-
-{AGENT_BUG_WORKAROUNDS}
-
-{CASE_LAYOUT}
-
-{TOOL_WISHLIST}
-
-## Git discipline
-{GIT_DISCIPLINE}

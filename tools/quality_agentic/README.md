@@ -8,11 +8,12 @@ agent refactors a translated crate toward safe, idiomatic Rust (fewer operations
 
 | Path | Content |
 |---|---|
-| `src/lib.rs` | The framework: materializes the crate and the C source, backs up the regression tests, writes the skill, the role task files and `QUALITY.md`, invokes the agent, restores changed tests, freezes the result |
-| `src/prompt_quality.md` | The main agent's prompt: the manager's flow in seven steps |
-| `src/quality_md.md` | The template of `QUALITY.md`, the manager's plan file |
-| `src/rules.md` | The rules for every change; the framework puts them into `QUALITY.md` and into each role task |
-| `src/runner.md`, `worker.md`, `scout.md`, `implementer.md`, `integrator.md` | The task files of the sub-agent roles (`inputs/prompts/QUALITY_*.md` at run time) |
+| `src/lib.rs` | The framework: materializes the crate and the C source, backs up the regression tests, writes the skill, the prompt files and `QUALITY.md`, invokes the agent, restores changed tests, freezes the result |
+| `prompts/` | The prompt files of the stage, written to `inputs/prompts/quality/` as they are. A file names the files that its reader needs by their path |
+| `prompts/main.md` | The main agent: its role, the manager's flow in seven steps, the completion gate |
+| `prompts/rules.md` | The rules for every change. The main agent and every role read them |
+| `prompts/runner.md`, `worker.md`, `scout.md`, `implementer.md`, `integrator.md` | The sub-agent roles |
+| `src/quality_md.md` | `QUALITY.md`, the state file of the main agent: the sections that it fills in |
 | `skill/` | The `rust_quality` agent skill, written to `inputs/agent_skills/rust_quality/`: `SKILL.md` (the tools), `RECIPES.md` (local refactorings), `GLOBAL.md` (global refactorings), `CURSORS.md` (the cursor model), `scripts/` |
 
 ## Tools

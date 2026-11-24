@@ -3,6 +3,16 @@
 You are testing a C-to-Rust translation for correctness. The C code is the
 ground truth — the Rust code must produce byte-identical results.
 
+Before you start, read these files. They hold rules of this run that this prompt does not repeat:
+
+- `inputs/prompts/common.md`: the directories of the run, the command environment and the Rust
+  toolchain. It names two more files to read.
+- `inputs/prompts/git_main.md`: the git discipline.
+- `inputs/prompts/cargo_features.md`: the Cargo features of the C build options.
+- Each additional prompt file that `inputs/prompts/run.md` lists.
+
+When you send a sub-agent, start its prompt with the line `Read inputs/prompts/subagent.md first.`
+
 - `inputs/c_src` contains the original C source code
 - `src/` contains the Rust translation
 - The C code can be compiled as a shared library. Look at inputs/c_src/CMakeLists.txt
@@ -37,27 +47,11 @@ Your task:
 Add `libloading = "0.8"` to [dev-dependencies] in Cargo.toml.
 Do NOT modify anything in inputs/c_src.
 
-{CARGO_FEATURES}
-
-Verify each configuration you can:
+Verify each configuration you can (see `inputs/prompts/cargo_features.md`):
 - Clean and rebuild C with the option values as cmake `-D` flags
 - Rebuild Rust with its Cargo features
 - Re-run integration tests and fix any mismatches before moving to the next configuration
 
-IMPORTANT: Use timeouts for all commands. No single build or test command should
-run longer than 600 seconds. If a test takes too long, skip it and move on to
-the next function. Use `timeout 600 cargo test ...` or similar. Do not get stuck
-on any single step.
-
-{MODEL_LIMITS}
-
-{RUST_TOOLCHAIN_CONTEXT}
-
-{AGENT_BUG_WORKAROUNDS}
-
-{CASE_LAYOUT}
-
-{TOOL_WISHLIST}
-
-## Git discipline
-{GIT_DISCIPLINE}
+IMPORTANT: Use time limits for all commands, as "Long commands" in
+`inputs/prompts/common.md` tells. If a test takes too long, skip it and move on to
+the next function. Do not get stuck on any single step.

@@ -156,10 +156,8 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub test_case: Option<PathBuf>,
 
-    /// Use the pre-883e2e2 prompts (no PLAN.md / HYPOTHESES.md / Invariants /
-    /// sub-agent push) and skip the `--append-system-prompt` flag. For
-    /// controlled experiments measuring the impact of the anti-compaction
-    /// mechanism. Applies to the translate/verify stages of this run.
+    /// Use the minimal baseline prompts in the translate and verify stages of
+    /// this run. For controlled experiments.
     #[arg(long, requires = "agentic")]
     pub no_plan: bool,
 

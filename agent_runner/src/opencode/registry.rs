@@ -27,7 +27,7 @@ pub(crate) fn load_registry_limits(
 /// OpenCode caps each model at `min(limit.output, cap)`, and a model with
 /// no output limit at the cap itself. So the cap is the larger limit, set
 /// only when every model has one; else `None` keeps the 32k default.
-pub(super) fn output_cap(limits: &RegistryLimits) -> Option<u64> {
+pub(crate) fn output_cap(limits: &RegistryLimits) -> Option<u64> {
     let main = limits.main.as_ref()?.output?;
     match &limits.subagent {
         None => Some(main),

@@ -15,6 +15,7 @@ tempfile.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+agent_runner = { workspace = true, features = ["test-support"] }
 toml_edit.workspace = true
 
 [lints]

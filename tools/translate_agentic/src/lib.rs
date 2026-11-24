@@ -5,7 +5,7 @@
 //! post-processed to satisfy downstream tool expectations.
 //! The translated project is stored in the IR as a [`CargoPackage`](full_source::CargoPackage).
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir, PreparedAgent};
+use agent_runner::{AdditionalPrompt, AgentInvocation, AgentPhase, CaseDir};
 use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
@@ -20,29 +20,65 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const PROMPT_TRANSLATE: &str = include_str!("prompt_translate.md");
+/// The whole task of the main agent when the stage runs without a plan file and without scouts.
 const PROMPT_TRANSLATE_NO_PLAN: &str = include_str!("prompt_translate_no_plan.md");
 
-/// The plan file of the main agent, which the framework writes into the workspace as `PLAN.md`
-/// before the agent starts: the invariants, and the sections that the agent fills in.
+/// The state file of the main agent, which the framework writes into the workspace as `PLAN.md`
+/// before the agent starts: the sections that the agent fills in. It holds no rules.
 const PLAN_MD: &str = include_str!("plan_md.md");
-/// The rules of the translation: the one copy, put into `PLAN.md`, into the task files of the
-/// roles that write or check code, and into the no-plan prompt.
-const TRANSLATION_RULES: &str = include_str!("translation_rules.md");
-const NO_STUBS: &str = include_str!("no_stubs.md");
-const COMPLETION_GATE: &str = include_str!("completion_gate.md");
 
-/// Task files of the sub-agent roles, written into `inputs/prompts/`.
-const SCOUT: &str = include_str!("scout.md");
-const TRANSLATOR: &str = include_str!("translator.md");
-const REVIEWER: &str = include_str!("reviewer.md");
-const SCOUT_TAB2RUST: &str = include_str!("scout_tab2rust.md");
-const TAB2RUST: &str = include_str!("tab2rust.md");
-const TAB2RUST_INVARIANT: &str = include_str!("tab2rust_invariant.md");
-const SAFE_WRAPPER_DESIGNER: &str = include_str!("safe_wrapper_designer.md");
-const SAFE_WRAPPER_TRANSLATOR: &str = include_str!("safe_wrapper_translator.md");
-const SAFE_WRAPPER_DISPATCH: &str = include_str!("safe_wrapper_dispatch.md");
-const SAFE_WRAPPER_INVARIANT: &str = include_str!("safe_wrapper_invariant.md");
+/// The prompt files of the stage, by their name in `inputs/prompts/translate/`. Each rule has
+/// one copy; a file names the files that its reader needs.
+///
+/// The rules of the translation, for every prompt of the stage.
+const RULE_FILES: [(&str, &str); 2] = [
+    (
+        "translation_rules.md",
+        include_str!("../prompts/translation_rules.md"),
+    ),
+    (
+        "completion_gate.md",
+        include_str!("../prompts/completion_gate.md"),
+    ),
+];
+/// The main agent and the sub-agent roles of the plan prompt.
+const PLAN_FILES: [(&str, &str); 4] = [
+    ("main.md", include_str!("../prompts/main.md")),
+    ("scout.md", include_str!("../prompts/scout.md")),
+    ("translator.md", include_str!("../prompts/translator.md")),
+    ("reviewer.md", include_str!("../prompts/reviewer.md")),
+];
+/// With tab2rust: the part of the main agent, an additional prompt file of the run.
+const TAB2RUST_MAIN: (&str, &str, &str) = (
+    "tab2rust_main.md",
+    "the C data tables, which a tool generates (tab2rust)",
+    include_str!("../prompts/tab2rust_main.md"),
+);
+/// With tab2rust: the parts of scout 1 and of a translator.
+const TAB2RUST_FILES: [(&str, &str); 2] = [
+    (
+        "tab2rust_scout.md",
+        include_str!("../prompts/tab2rust_scout.md"),
+    ),
+    ("tab2rust.md", include_str!("../prompts/tab2rust.md")),
+];
+/// With safe_wrapper: the part of the main agent, an additional prompt file of the run.
+const SAFE_WRAPPER_MAIN: (&str, &str, &str) = (
+    "safe_wrapper_main.md",
+    "the safe API wrapper design of this run",
+    include_str!("../prompts/safe_wrapper_main.md"),
+);
+/// With safe_wrapper: the designer role and the part of a translator.
+const SAFE_WRAPPER_FILES: [(&str, &str); 2] = [
+    (
+        "safe_wrapper_designer.md",
+        include_str!("../prompts/safe_wrapper_designer.md"),
+    ),
+    (
+        "safe_wrapper_translator.md",
+        include_str!("../prompts/safe_wrapper_translator.md"),
+    ),
+];
 static SAFE_WRAPPER_RT: Dir = include_dir!("$CARGO_MANIFEST_DIR/safe_wrapper_rt/src");
 
 pub struct TranslateAgentic;
@@ -77,14 +113,9 @@ impl Tool for TranslateAgentic {
         if config.safe_wrapper {
             check_scout_option("safe_wrapper = true", no_plan)?;
         }
-        let translate_prompt = if no_plan {
-            PROMPT_TRANSLATE_NO_PLAN
-        } else {
-            PROMPT_TRANSLATE
-        };
 
-        // The agent works in case_dir/workspace/. The C source and, with the plan prompt, the task
-        // files and the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
+        // The agent works in case_dir/workspace/. The C source, the prompt files and, with the plan
+        // prompt, the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
         let case = CaseDir::new()?;
         let workspace = case.workspace();
         raw_source.dir.materialize(case.c_src())?;
@@ -105,15 +136,13 @@ impl Tool for TranslateAgentic {
         } else {
             ""
         };
-        let translate_prompt = agent_runner::fill_tool_wishlist(
-            &fill_rules(&fill_safe_wrapper(
-                &fill_tab2rust(translate_prompt, tab2rust),
-                safe_wrapper,
-            )),
-            config.tool_wishlist,
-        )
-        .replace("{WORKFLOW_HINT}", workflow_hint);
+        let translate_prompt = if no_plan {
+            PROMPT_TRANSLATE_NO_PLAN.replace("{WORKFLOW_HINT}", workflow_hint)
+        } else {
+            agent_runner::main_prompt(AgentPhase::Translate)
+        };
 
+        let additional = additional_prompts(tab2rust, safe_wrapper, config.tool_wishlist);
         let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Translate,
             agent,
@@ -127,10 +156,10 @@ impl Tool for TranslateAgentic {
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
+            additional_prompts: &additional,
+            stage_facts: &[],
         })?;
-        if scouts {
-            write_plan_files(&case, &prepared, tab2rust, safe_wrapper)?;
-        }
+        write_stage_files(&case, scouts, tab2rust, safe_wrapper)?;
         let reference_guard = case.lock_inputs()?;
         prepared.run()?;
 
@@ -219,88 +248,60 @@ fn check_scout_option(option: &str, no_plan: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Fills the placeholders of the translation rules: `{TRANSLATION_RULES}` (the rules and "No
-/// stubs"), `{NO_STUBS}` and `{COMPLETION_GATE}`.
-fn fill_rules(text: &str) -> String {
-    let rules = format!(
-        "{}\n\n{}",
-        TRANSLATION_RULES.trim_end(),
-        NO_STUBS.trim_end()
-    );
-    text.replace("{TRANSLATION_RULES}", &rules)
-        .replace("{NO_STUBS}", NO_STUBS.trim_end())
-        .replace("{COMPLETION_GATE}", COMPLETION_GATE.trim_end())
+/// The prompt files that the options of the run add for the main agent. `agent_runner` writes
+/// them and lists them in `run.md`. Each file of an option names the files of the option for the
+/// sub-agents.
+fn additional_prompts(
+    tab2rust: bool,
+    safe_wrapper: bool,
+    tool_wishlist: bool,
+) -> Vec<AdditionalPrompt> {
+    let stage = AgentPhase::Translate.prompt_dir();
+    let options = [(tab2rust, TAB2RUST_MAIN), (safe_wrapper, SAFE_WRAPPER_MAIN)];
+    let mut files: Vec<AdditionalPrompt> = options
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, (name, purpose, text))| AdditionalPrompt {
+            path: format!("{stage}/{name}"),
+            purpose,
+            text,
+        })
+        .collect();
+    files.extend(tool_wishlist.then(agent_runner::tool_wishlist));
+    files
 }
 
-/// Fills the tab2rust placeholders of a text: the part of scout 1 and the data-table rule, or
-/// nothing.
-fn fill_tab2rust(text: &str, tab2rust: bool) -> String {
-    let (scout, invariant) = if tab2rust {
-        (SCOUT_TAB2RUST, TAB2RUST_INVARIANT)
-    } else {
-        ("", "")
-    };
-    text.replace("{TAB2RUST_SCOUT}", scout)
-        .replace("{TAB2RUST_INVARIANT}", invariant)
-}
-
-/// Fills the safe-wrapper placeholders of a text: the designer in the scout wave and the design
-/// rule, or nothing.
-fn fill_safe_wrapper(text: &str, safe_wrapper: bool) -> String {
-    let (dispatch, invariant) = if safe_wrapper {
-        (SAFE_WRAPPER_DISPATCH, SAFE_WRAPPER_INVARIANT)
-    } else {
-        ("", "")
-    };
-    text.replace("{SAFE_WRAPPER_DISPATCH}", dispatch)
-        .replace("{SAFE_WRAPPER_INVARIANT}", invariant)
-}
-
-/// A file that the framework writes for the agents of the plan prompt, with every placeholder
-/// filled in: those of this tool, then the shared ones.
-fn render_file(text: &str, prepared: &PreparedAgent, tab2rust: bool, safe_wrapper: bool) -> String {
-    prepared.render(&fill_rules(&fill_safe_wrapper(
-        &fill_tab2rust(text, tab2rust),
-        safe_wrapper,
-    )))
-}
-
-/// Writes the files of the plan prompt. Into the workspace: `PLAN.md`, the plan file of the main
-/// agent, with its invariants. Into `inputs/`: the task files of the roles (`prompts/SCOUT.md`,
-/// `prompts/TRANSLATOR.md`, `prompts/REVIEWER.md`); with tab2rust, the skill
-/// (`agent_skills/tab2rust/`) and `prompts/TAB2RUST.md`; with safe_wrapper,
-/// `prompts/SAFE_WRAPPER_DESIGNER.md`, `prompts/SAFE_WRAPPER_TRANSLATOR.md` and the framework items
-/// (`safe_wrapper_rt/`), from which the designer copies the parts that its design uses. The scouts
-/// and the designer write their reports in `workspace/scout/`, which is created here.
-fn write_plan_files(
+/// Writes the files of the stage. Into `inputs/prompts/translate/`: the rules of the
+/// translation. With the plan prompt (`plan`) also: the prompt files of the main agent and of the
+/// roles; with tab2rust, its prompt files for the sub-agents and the skill
+/// (`agent_skills/tab2rust/`); with safe_wrapper, its prompt files for the sub-agents and the
+/// framework items (`safe_wrapper_rt/`), from which the designer copies the parts that its design
+/// uses. `agent_runner` writes the files of the options for the main agent
+/// ([`additional_prompts`]). Into the workspace: `PLAN.md`, the state file
+/// of the main agent, and `scout/`, where the scouts and the designer write their reports.
+fn write_stage_files(
     case: &CaseDir,
-    prepared: &PreparedAgent,
+    plan: bool,
     tab2rust: bool,
     safe_wrapper: bool,
 ) -> io::Result<()> {
-    let render = |text: &str| render_file(text, prepared, tab2rust, safe_wrapper);
-    fs::write(case.workspace().join("PLAN.md"), render(PLAN_MD))?;
-    let prompts = case.inputs().join("prompts");
-    fs::create_dir_all(&prompts)?;
-    let mut task_files = vec![
-        ("SCOUT.md", SCOUT),
-        ("TRANSLATOR.md", TRANSLATOR),
-        ("REVIEWER.md", REVIEWER),
-    ];
+    let stage = AgentPhase::Translate.prompt_dir();
+    case.write_prompts(stage, &RULE_FILES)?;
+    if !plan {
+        return Ok(());
+    }
+    case.write_prompts(stage, &PLAN_FILES)?;
     if tab2rust {
         case.write_skill("tab2rust")?;
-        task_files.push(("TAB2RUST.md", TAB2RUST));
+        case.write_prompts(stage, &TAB2RUST_FILES)?;
     }
     if safe_wrapper {
         let rt = case.inputs().join("safe_wrapper_rt");
         fs::create_dir_all(&rt)?;
         SAFE_WRAPPER_RT.extract(&rt)?;
-        task_files.push(("SAFE_WRAPPER_DESIGNER.md", SAFE_WRAPPER_DESIGNER));
-        task_files.push(("SAFE_WRAPPER_TRANSLATOR.md", SAFE_WRAPPER_TRANSLATOR));
+        case.write_prompts(stage, &SAFE_WRAPPER_FILES)?;
     }
-    for (name, text) in task_files {
-        fs::write(prompts.join(name), render(text))?;
-    }
+    fs::write(case.workspace().join("PLAN.md"), PLAN_MD)?;
     fs::create_dir_all(case.workspace().join("scout"))
 }
 
@@ -322,10 +323,8 @@ pub struct Config {
     /// same format as `model`. If absent, the sub-agents use the main model.
     pub subagent_model: Option<String>,
 
-    /// If true, use the pre-anti-compaction prompt (no PLAN.md / Invariants /
-    /// sub-agent push) and skip the `--append-system-prompt` flag. Intended for
-    /// controlled experiments measuring the impact of the anti-compaction
-    /// mechanism added in 883e2e2.
+    /// If true, use the minimal baseline prompt: no plan file, no scouts and no sub-agent
+    /// guidance. For controlled experiments that measure the effect of the plan prompt.
     #[serde(default)]
     pub no_plan: bool,
 
@@ -465,132 +464,214 @@ mod tests {
         (fs::read_to_string(dir.join("Cargo.toml")).unwrap(), files)
     }
 
-    /// Runs `check` with an agent that is prepared in a new case directory.
-    fn with_prepared(check: impl Fn(&CaseDir, &PreparedAgent)) {
+    /// Runs `check` on a case directory that holds the files of a run with these options, as the
+    /// tool writes them.
+    fn with_stage_files(
+        agent: AgentKind,
+        no_plan: bool,
+        tab2rust: bool,
+        safe_wrapper: bool,
+        check: impl Fn(&CaseDir),
+    ) {
         let case = CaseDir::new().unwrap();
-        let toolchain = agent_runner::RustToolchainContext {
-            required_version: "1.99.0".to_owned(),
-            prompt_block: "### Rust toolchain contract".to_owned(),
-            test_corpus_root: None,
-        };
+        let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
         let env = HashMap::new();
-        let prepared = agent_runner::prepare_agent(AgentInvocation {
+        agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Translate,
-            agent: AgentKind::Claude,
+            agent,
             case: &case,
             prompt: "",
             timeout_secs: 1,
             model: None,
             subagent_model: None,
-            no_plan: false,
+            no_plan,
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
             rust_toolchain: &toolchain,
+            additional_prompts: &additional_prompts(tab2rust, safe_wrapper, true),
+            stage_facts: &[],
         })
         .unwrap();
-        check(&case, &prepared);
+        write_stage_files(&case, !no_plan, tab2rust, safe_wrapper).unwrap();
+        let prompt = if no_plan {
+            PROMPT_TRANSLATE_NO_PLAN.to_owned()
+        } else {
+            agent_runner::main_prompt(AgentPhase::Translate)
+        };
+        let name = format!(
+            "translate-{agent:?}-plan_{}-tab2rust_{tab2rust}-safe_wrapper_{safe_wrapper}",
+            !no_plan
+        );
+        agent_runner::prompt_check::dump(&case, &name, &prompt, &["PLAN.md"]).unwrap();
+        check(&case);
         case.finish();
+    }
+
+    /// The files that the reader of `entry` must read, without `entry`.
+    fn must_read(files: &agent_runner::prompt_check::PromptFiles, entry: &str) -> Vec<String> {
+        agent_runner::prompt_check::must_read(files, entry)
+            .into_iter()
+            .filter(|file| file != entry)
+            .collect()
+    }
+
+    /// What every agent reads, and what a main agent and a sub-agent add to it.
+    const EVERY_AGENT: [&str; 3] = ["common.md", "run.md", "runtime.md"];
+    const MAIN_AGENT: [&str; 2] = ["git_main.md", "main_agent.md"];
+    const SUBAGENT: [&str; 2] = ["git_subagent.md", "subagent.md"];
+
+    fn sorted(groups: &[&[&str]]) -> Vec<String> {
+        let mut files: Vec<String> = groups.concat().iter().map(|f| f.to_string()).collect();
+        files.sort();
+        files
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn plan_files_are_complete_and_have_no_placeholder_left() {
-        with_prepared(|case, prepared| {
-            for (tab2rust, safe_wrapper) in [(false, false), (true, true)] {
-                write_plan_files(case, prepared, tab2rust, safe_wrapper).unwrap();
-                let plan = fs::read_to_string(case.workspace().join("PLAN.md")).unwrap();
-                for section in [
-                    "### Role of the main agent",
-                    "### Directories of this run",
-                    "### Cargo features",
-                    "### C ABI",
-                    "### No stubs",
-                    "### Completion gate",
-                    "### Git discipline",
-                    "## Translation subtasks",
-                ] {
-                    assert!(plan.contains(section), "{section}");
-                }
-                assert_eq!(plan.contains("### Data tables (tab2rust)"), tab2rust);
-                assert_eq!(plan.contains("### Safe API wrappers"), safe_wrapper);
-                assert_eq!(agent_runner::placeholders(&plan), [""; 0]);
-
-                let prompts = case.inputs().join("prompts");
-                let mut task_files = vec!["SCOUT.md", "TRANSLATOR.md", "REVIEWER.md"];
-                if tab2rust {
-                    task_files.push("TAB2RUST.md");
-                }
-                if safe_wrapper {
-                    task_files.extend(["SAFE_WRAPPER_DESIGNER.md", "SAFE_WRAPPER_TRANSLATOR.md"]);
-                }
-                for name in task_files {
-                    let text = fs::read_to_string(prompts.join(name)).unwrap();
-                    assert_eq!(agent_runner::placeholders(&text), [""; 0], "{name}");
-                    // A task file that a prompt names alone carries the rules of a sub-agent.
-                    let alone = !matches!(name, "TAB2RUST.md" | "SAFE_WRAPPER_TRANSLATOR.md");
+    fn prompt_files_are_consistent_for_every_option() {
+        for agent in [AgentKind::Claude, AgentKind::OpenCode] {
+            for (tab2rust, safe_wrapper) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                with_stage_files(agent, false, tab2rust, safe_wrapper, |case| {
+                    let inputs = case.inputs();
                     assert_eq!(
-                        text.contains("## Rules for every sub-agent"),
-                        alone,
-                        "{name}"
+                        agent_runner::prompt_check::problems(&inputs).unwrap(),
+                        [""; 0],
+                        "tab2rust={tab2rust} safe_wrapper={safe_wrapper}"
                     );
-                }
-                for (name, rules) in [
-                    ("TRANSLATOR.md", "### C ABI"),
-                    ("REVIEWER.md", "### Completion gate"),
-                ] {
-                    let text = fs::read_to_string(prompts.join(name)).unwrap();
-                    assert!(
-                        text.contains(rules) && text.contains("### No stubs"),
-                        "{name}"
-                    );
-                }
+                    let files = agent_runner::prompt_check::load(&inputs).unwrap();
+                    // An option that is off leaves no word in the files of the run.
+                    for (on, words) in [
+                        (tab2rust, &["tab2rust"][..]),
+                        (safe_wrapper, &["safe_wrapper", "safe api", "wrapper"][..]),
+                    ] {
+                        for (name, text) in files.iter().filter(|_| !on) {
+                            let text = text.to_ascii_lowercase();
+                            for word in words {
+                                assert!(!text.contains(word), "{name} reveals {word}");
+                            }
+                        }
+                    }
+                    // The options of the run are files of their own, and run.md lists the one
+                    // of the main agent.
+                    let run = &files["run.md"];
+                    for (on, option) in [(tab2rust, "tab2rust"), (safe_wrapper, "safe_wrapper")] {
+                        let main = format!("translate/{option}_main.md");
+                        assert_eq!(files.contains_key(&main), on, "{main}");
+                        assert_eq!(run.contains(&format!("inputs/prompts/{main}")), on);
+                        // The file of the main agent names the files of the sub-agents.
+                        let named: Vec<&String> = files
+                            .keys()
+                            .filter(|name| name.starts_with(&format!("translate/{option}")))
+                            .filter(|name| **name != main)
+                            .collect();
+                        assert_eq!(named.len(), if on { 2 } else { 0 }, "{option}");
+                        for name in named {
+                            assert!(files[&main].contains(&format!("inputs/prompts/{name}")));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn each_reader_must_read_the_files_of_its_rules() {
+        with_stage_files(AgentKind::Claude, false, true, true, |case| {
+            let files = agent_runner::prompt_check::load(&case.inputs()).unwrap();
+            let rules = "translate/translation_rules.md";
+            let gate = "translate/completion_gate.md";
+            let features = "cargo_features.md";
+            for (entry, more) in [
+                ("translate/main.md", &[rules, gate, features][..]),
+                ("translate/scout.md", &[features][..]),
+                ("translate/translator.md", &[rules, features][..]),
+                ("translate/reviewer.md", &[rules, gate, features][..]),
+                ("translate/safe_wrapper_designer.md", &[][..]),
+            ] {
+                let role: &[&str] = if entry == "translate/main.md" {
+                    &MAIN_AGENT
+                } else {
+                    &SUBAGENT
+                };
+                assert_eq!(
+                    must_read(&files, entry),
+                    sorted(&[&EVERY_AGENT, role, more]),
+                    "{entry}"
+                );
+            }
+            // The parts that an option adds to a role name no files of their own to read first.
+            for part in [
+                "translate/tab2rust_main.md",
+                "translate/tab2rust_scout.md",
+                "translate/tab2rust.md",
+                "translate/safe_wrapper_main.md",
+                "translate/safe_wrapper_translator.md",
+            ] {
+                assert_eq!(must_read(&files, part), [""; 0], "{part}");
+            }
+            // The main prompt names the role files.
+            for role in ["scout.md", "translator.md", "reviewer.md"] {
+                assert!(
+                    files["translate/main.md"]
+                        .contains(&format!("inputs/prompts/translate/{role}"))
+                );
             }
         });
     }
 
     #[test]
-    fn prompts_name_the_task_files_and_copy_no_rules() {
-        for name in ["SCOUT.md", "TRANSLATOR.md", "REVIEWER.md"] {
-            assert!(
-                PROMPT_TRANSLATE.contains(&format!("inputs/prompts/{name}")),
-                "{name}"
-            );
-        }
-        assert!(TAB2RUST_INVARIANT.contains("inputs/prompts/TAB2RUST.md"));
-        assert!(SAFE_WRAPPER_INVARIANT.contains("inputs/prompts/SAFE_WRAPPER_TRANSLATOR.md"));
-        assert!(SAFE_WRAPPER_DISPATCH.contains("inputs/prompts/SAFE_WRAPPER_DESIGNER.md"));
-        // The invariants are in PLAN.md, which the framework writes: the prompt has no template.
-        assert!(!PROMPT_TRANSLATE.contains("## Invariants ("));
-        // After the placeholders of this tool, only shared ones are left in the prompts.
-        for prompt in [PROMPT_TRANSLATE, PROMPT_TRANSLATE_NO_PLAN] {
-            let filled = agent_runner::fill_tool_wishlist(
-                &fill_rules(&fill_safe_wrapper(&fill_tab2rust(prompt, true), true)),
-                false,
-            )
-            .replace("{WORKFLOW_HINT}", "");
-            for placeholder in agent_runner::placeholders(&filled) {
-                assert!(
-                    [
-                        "{MODEL_LIMITS}",
-                        "{RUST_TOOLCHAIN_CONTEXT}",
-                        "{CASE_LAYOUT}",
-                        "{CARGO_FEATURES}",
-                        "{GIT_DISCIPLINE}",
-                        "{AGENT_BUG_WORKAROUNDS}",
-                    ]
-                    .contains(&placeholder),
-                    "{placeholder}"
-                );
+    #[cfg_attr(miri, ignore)]
+    fn plan_file_holds_state_and_no_rules() {
+        with_stage_files(AgentKind::Claude, false, true, true, |case| {
+            let plan = fs::read_to_string(case.workspace().join("PLAN.md")).unwrap();
+            for section in [
+                "## Self-assessment",
+                "## Codebase summary",
+                "## Translation subtasks",
+                "## Notes for future-me",
+            ] {
+                assert!(plan.contains(section), "{section}");
             }
-        }
+            assert!(!plan.contains("Invariants") && !plan.contains("inputs/prompts"));
+            assert!(case.workspace().join("scout").is_dir());
+        });
     }
 
     #[test]
-    fn every_prompt_has_the_tool_wishlist_placeholder() {
-        for prompt in [PROMPT_TRANSLATE, PROMPT_TRANSLATE_NO_PLAN] {
-            assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
-        }
+    #[cfg_attr(miri, ignore)]
+    fn no_plan_prompt_names_only_files_that_its_run_has() {
+        // The workflow hint is the one text that the tool puts into the prompt.
+        assert_eq!(
+            agent_runner::prompt_check::placeholders(PROMPT_TRANSLATE_NO_PLAN),
+            ["{WORKFLOW_HINT}"]
+        );
+        with_stage_files(AgentKind::Claude, true, false, false, |case| {
+            let inputs = case.inputs();
+            assert_eq!(
+                agent_runner::prompt_check::problems(&inputs).unwrap(),
+                [""; 0]
+            );
+            let files = agent_runner::prompt_check::load(&inputs).unwrap();
+            let named = agent_runner::prompt_check::references(PROMPT_TRANSLATE_NO_PLAN);
+            assert!(named.contains(&"common.md") && named.contains(&"git_main.md"));
+            for file in named {
+                assert!(files.contains_key(file), "{file}");
+            }
+            // No plan file, no scouts, no roles.
+            assert!(!files.contains_key("translate/main.md"));
+            assert!(!case.workspace().join("PLAN.md").exists());
+        });
+    }
+
+    #[test]
+    fn main_prompt_only_names_the_prompt_file_of_the_stage() {
+        let prompt = agent_runner::main_prompt(AgentPhase::Translate);
+        assert_eq!(prompt.lines().count(), 2);
+        assert!(prompt.contains("inputs/prompts/translate/main.md"));
     }
 
     #[test]

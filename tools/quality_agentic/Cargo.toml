@@ -14,5 +14,8 @@ tempfile.workspace = true
 tracing.workspace = true
 verify_fix_agentic.workspace = true
 
+[dev-dependencies]
+agent_runner = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

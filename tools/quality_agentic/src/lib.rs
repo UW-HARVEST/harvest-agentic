@@ -11,7 +11,7 @@
 //! The tests are the oracle of this stage, so the agent must not change them. The framework keeps
 //! a copy of them, and restores and reports any change before the freeze.
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir, PreparedAgent};
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir, StageFact};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
@@ -24,19 +24,23 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const PROMPT_QUALITY: &str = include_str!("prompt_quality.md");
-/// Task files of the sub-agent roles, written into `inputs/prompts/`.
-const ROLE_PROMPTS: [(&str, &str); 5] = [
-    ("QUALITY_RUNNER.md", include_str!("runner.md")),
-    ("QUALITY_WORKER.md", include_str!("worker.md")),
-    ("QUALITY_SCOUT.md", include_str!("scout.md")),
-    ("QUALITY_IMPLEMENTER.md", include_str!("implementer.md")),
-    ("QUALITY_INTEGRATOR.md", include_str!("integrator.md")),
+/// The prompt files of the stage, by their name in `inputs/prompts/quality/`: the main agent, the
+/// rules for every change, and the sub-agent roles. Each role file names the rules by their path.
+const STAGE_FILES: [(&str, &str); 7] = [
+    ("main.md", include_str!("../prompts/main.md")),
+    ("rules.md", include_str!("../prompts/rules.md")),
+    ("runner.md", include_str!("../prompts/runner.md")),
+    ("worker.md", include_str!("../prompts/worker.md")),
+    ("scout.md", include_str!("../prompts/scout.md")),
+    ("implementer.md", include_str!("../prompts/implementer.md")),
+    ("integrator.md", include_str!("../prompts/integrator.md")),
 ];
-/// The rules for every change: the one copy, put into each role task and into `QUALITY.md`.
-const RULES: &str = include_str!("rules.md");
-/// The manager's plan file, which the framework writes before the agent starts.
+/// The state file of the main agent, which the framework writes into the workspace as
+/// `QUALITY.md` before the agent starts: the sections that the agent fills in. It holds no rules.
 const QUALITY_MD: &str = include_str!("quality_md.md");
+/// The section of `run.md` that tells which regression tests the crate has (see
+/// [`Oracle::describe`]). The prompt of the main agent names it.
+const ORACLE_FACT: &str = "Regression tests of this crate";
 
 /// The agent skill, written into `inputs/agent_skills/rust_quality/`.
 static SKILL_FILES: Dir = include_dir!("$CARGO_MANIFEST_DIR/skill");
@@ -79,7 +83,11 @@ impl Tool for QualityAgentic {
 
         let oracle = Oracle::capture(&workspace, &case.root().join("quality_oracle"))
             .map_err(|e| format!("saving the regression tests: {e}"))?;
-        let prompt = PROMPT_QUALITY.replace("{ORACLE}", &oracle.describe());
+        let prompt = agent_runner::main_prompt(AgentPhase::Quality);
+        let facts = [StageFact {
+            heading: ORACLE_FACT,
+            text: oracle.describe(),
+        }];
 
         let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
             &context.config.input,
@@ -98,9 +106,11 @@ impl Tool for QualityAgentic {
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
+            additional_prompts: &[],
+            stage_facts: &facts,
         })?;
-        write_inputs(&case, &prepared).map_err(|e| format!("writing the inputs: {e}"))?;
-        fs::write(workspace.join("QUALITY.md"), with_rules(QUALITY_MD))
+        write_inputs(&case).map_err(|e| format!("writing the inputs: {e}"))?;
+        fs::write(workspace.join("QUALITY.md"), QUALITY_MD)
             .map_err(|e| format!("writing QUALITY.md: {e}"))?;
         let reference_guard = case.lock_inputs()?;
         prepared.run()?;
@@ -126,9 +136,8 @@ impl Tool for QualityAgentic {
 }
 
 /// Writes the inputs of the stage: the skill with the verify stage's run scripts in its `runner/`,
-/// and the task files of the sub-agent roles in `prompts/`, each with the rules of the stage and
-/// the rules of every sub-agent.
-fn write_inputs(case: &CaseDir, prepared: &PreparedAgent) -> io::Result<()> {
+/// and the prompt files of the stage in `prompts/quality/`.
+fn write_inputs(case: &CaseDir) -> io::Result<()> {
     let skill = case.inputs().join("agent_skills").join(SKILL);
     write_dir(&SKILL_FILES, &skill)?;
     let runner = skill.join("runner");
@@ -136,16 +145,7 @@ fn write_inputs(case: &CaseDir, prepared: &PreparedAgent) -> io::Result<()> {
     for (name, text) in verify_fix_agentic::RUNNER_SCRIPTS {
         fs::write(runner.join(name), text)?;
     }
-    let prompts = case.inputs().join("prompts");
-    fs::create_dir_all(&prompts)?;
-    for (name, text) in ROLE_PROMPTS {
-        fs::write(prompts.join(name), prepared.render(&with_rules(text)))?;
-    }
-    Ok(())
-}
-
-fn with_rules(text: &str) -> String {
-    text.replace("{RULES}", RULES.trim_end())
+    case.write_prompts(AgentPhase::Quality.prompt_dir(), &STAGE_FILES)
 }
 
 /// Writes the files of `dir` below `dest`, without the skipped directories.
@@ -199,7 +199,8 @@ impl Oracle {
         })
     }
 
-    /// The `{ORACLE}` text of the prompt: which regression tests this crate has.
+    /// The fact for `run.md`: which regression tests this crate has. `prompts/main.md` tells
+    /// what the main agent does when there are none.
     fn describe(&self) -> String {
         let mut lines = Vec::new();
         if self.has_harness {
@@ -221,11 +222,7 @@ impl Oracle {
             lines.push("- `tests/`: Rust integration tests (`cargo test`).".to_owned());
         }
         if lines.is_empty() {
-            "- NONE. This crate did not go through the verify stage and has no regression tests. \
-             `regress.py check` can only compare the build and the exported symbols, so nothing \
-             will catch a behavior change. Run only the baseline and the local phase, with the \
-             autofixes and the recipes R1, R2, R9, R10 and R11; skip Steps 3 to 5, give the \
-             final integrator no branches and `finish: yes`, and say so in the report."
+            "- NONE. This crate did not go through the verify stage and has no regression tests."
                 .to_owned()
         } else {
             lines.join("\n")
@@ -443,17 +440,16 @@ mod tests {
         assert!(oracle.describe().starts_with("- NONE."));
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn inputs_hold_the_skill_runner_and_worker_task() {
+    /// Runs `check` on a case directory that holds the inputs of a run, as the tool writes them.
+    fn with_inputs(check: impl Fn(&CaseDir)) {
         let case = CaseDir::new().unwrap();
-        let toolchain = agent_runner::RustToolchainContext {
-            required_version: "1.99.0".to_owned(),
-            prompt_block: "### Rust toolchain contract".to_owned(),
-            test_corpus_root: None,
-        };
+        let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
         let env = HashMap::new();
-        let prepared = agent_runner::prepare_agent(AgentInvocation {
+        let facts = [StageFact {
+            heading: ORACLE_FACT,
+            text: "- NONE.".to_owned(),
+        }];
+        agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Quality,
             agent: harvest_core::config::AgentKind::Claude,
             case: &case,
@@ -466,56 +462,107 @@ mod tests {
             extra_env: &env,
             output_log_path: None,
             rust_toolchain: &toolchain,
+            additional_prompts: &[],
+            stage_facts: &facts,
         })
         .unwrap();
-        write_inputs(&case, &prepared).unwrap();
-        let skill = case.inputs().join("agent_skills/rust_quality");
-        for file in [
-            "SKILL.md",
-            "RECIPES.md",
-            "GLOBAL.md",
-            "CURSORS.md",
-            "scripts/qscan.py",
-            "scripts/qscan_lib/report.py",
-            "scripts/regress.py",
-            "scripts/qflow.py",
-            "runner/run_tests.sh",
-            "runner/run_fuzz.sh",
-            "runner/memory_scope.sh",
-        ] {
-            assert!(skill.join(file).is_file(), "{file} missing");
-        }
-        assert!(!skill.join("tests").exists());
-        for (name, _) in ROLE_PROMPTS {
-            let text = fs::read_to_string(case.inputs().join("prompts").join(name)).unwrap();
-            // Every role task carries the rules of the stage and the rules of every sub-agent.
-            assert!(text.contains("### Rules for every change"), "{name}");
-            assert!(text.contains("## Rules for every sub-agent"), "{name}");
-            assert_eq!(agent_runner::placeholders(&text), [""; 0], "{name}");
-        }
-        // Every role file that the main prompt names exists, and the other way round.
-        for (name, _) in ROLE_PROMPTS {
-            assert!(
-                PROMPT_QUALITY.contains(name),
-                "{name} not in the main prompt"
-            );
-        }
+        write_inputs(&case).unwrap();
+        fs::write(case.workspace().join("QUALITY.md"), QUALITY_MD).unwrap();
+        let prompt = agent_runner::main_prompt(AgentPhase::Quality);
+        agent_runner::prompt_check::dump(&case, "quality", &prompt, &["QUALITY.md"]).unwrap();
+        check(&case);
         case.finish();
     }
 
     #[test]
-    fn prompt_has_the_shared_placeholders() {
-        for placeholder in [
-            "{MODEL_LIMITS}",
-            "{RUST_TOOLCHAIN_CONTEXT}",
-            "{CASE_LAYOUT}",
-            "{GIT_DISCIPLINE}",
-            "{AGENT_BUG_WORKAROUNDS}",
-            "{ORACLE}",
-        ] {
-            assert!(PROMPT_QUALITY.contains(placeholder), "{placeholder}");
+    #[cfg_attr(miri, ignore)]
+    fn inputs_hold_the_skill_and_its_runner() {
+        with_inputs(|case| {
+            let skill = case.inputs().join("agent_skills/rust_quality");
+            for file in [
+                "SKILL.md",
+                "RECIPES.md",
+                "GLOBAL.md",
+                "CURSORS.md",
+                "scripts/qscan.py",
+                "scripts/qscan_lib/report.py",
+                "scripts/regress.py",
+                "scripts/qflow.py",
+                "runner/run_tests.sh",
+                "runner/run_fuzz.sh",
+                "runner/memory_scope.sh",
+            ] {
+                assert!(skill.join(file).is_file(), "{file} missing");
+            }
+            assert!(!skill.join("tests").exists());
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn prompt_files_are_consistent() {
+        with_inputs(|case| {
+            let inputs = case.inputs();
+            assert_eq!(
+                agent_runner::prompt_check::problems(&inputs).unwrap(),
+                [""; 0]
+            );
+            let files = agent_runner::prompt_check::load(&inputs).unwrap();
+            let must_read = |entry: &str| -> Vec<String> {
+                agent_runner::prompt_check::must_read(&files, entry)
+                    .into_iter()
+                    .filter(|file| file != entry)
+                    .collect()
+            };
+            assert_eq!(
+                must_read("quality/main.md"),
+                [
+                    "common.md",
+                    "git_main.md",
+                    "main_agent.md",
+                    "quality/rules.md",
+                    "run.md",
+                    "runtime.md"
+                ]
+            );
+            let main = &files["quality/main.md"];
+            for (name, _) in STAGE_FILES {
+                if matches!(name, "main.md" | "rules.md") {
+                    continue;
+                }
+                // Every role reads the rules of a sub-agent and the rules for every change.
+                assert_eq!(
+                    must_read(&format!("quality/{name}")),
+                    [
+                        "common.md",
+                        "git_subagent.md",
+                        "quality/rules.md",
+                        "run.md",
+                        "runtime.md",
+                        "subagent.md"
+                    ],
+                    "{name}"
+                );
+                // The main prompt names every role file.
+                assert!(
+                    main.contains(&format!("inputs/prompts/quality/{name}")),
+                    "{name} not in the main prompt"
+                );
+            }
+            // The main prompt names the section of run.md that the framework writes.
+            assert!(main.contains(ORACLE_FACT));
+            assert!(files["run.md"].contains(&format!("## {ORACLE_FACT}\n\n- NONE.")));
+        });
+    }
+
+    #[test]
+    fn plan_file_holds_state_and_no_rules() {
+        for section in ["## Baseline", "## Local phase", "## Global phase", "## Log"] {
+            assert!(QUALITY_MD.contains(section), "{section}");
         }
-        let plan = with_rules(QUALITY_MD);
-        assert!(plan.contains("### Rules for every change") && !plan.contains("{RULES}"));
+        assert!(!QUALITY_MD.contains("Invariants") && !QUALITY_MD.contains("inputs/prompts"));
+        let prompt = agent_runner::main_prompt(AgentPhase::Quality);
+        assert_eq!(prompt.lines().count(), 2);
+        assert!(prompt.contains("inputs/prompts/quality/main.md"));
     }
 }

@@ -1,9 +1,224 @@
-//! The placeholders that the prompts and the framework-written files of a stage share, filled
-//! in by [`PreparedAgent::render`](crate::PreparedAgent::render).
+//! The prompt files that every stage gets in `inputs/prompts/`: the rules that all agents, all
+//! main agents and all sub-agents read, and `run.md`, the facts of the run. A prompt file names
+//! another one by its path. The framework does not put the text of one file into another.
+
+use std::fs;
+use std::io;
 
 use harvest_core::config::AgentKind;
 
-use crate::AgentInvocation;
+use crate::{AgentInvocation, AgentPhase};
+
+/// The directory of the prompt files, as the agents name it: relative to the root of a checkout.
+pub const PROMPTS_PATH: &str = "inputs/prompts";
+
+/// The prompt files that are the same in every run, by their name in `inputs/prompts/`.
+const SHARED_FILES: [(&str, &str); 5] = [
+    ("common.md", include_str!("../prompts/common.md")),
+    ("subagent.md", include_str!("../prompts/subagent.md")),
+    ("git_main.md", include_str!("../prompts/git_main.md")),
+    (
+        "git_subagent.md",
+        include_str!("../prompts/git_subagent.md"),
+    ),
+    (
+        "cargo_features.md",
+        include_str!("../prompts/cargo_features.md"),
+    ),
+];
+
+/// The rules of every main agent. Only a run with a state file gets them: nothing names this file
+/// in a run without one.
+const MAIN_AGENT_FILE: (&str, &str) = ("main_agent.md", include_str!("../prompts/main_agent.md"));
+
+/// The known problems of the agent runtime of the run. Each backend has its text in
+/// `prompts/runtime_<agent>.md`: the upstream bug and the behavior that avoids it. Add an item
+/// when a backend needs a temporary fix, and remove it when the upstream fix ships.
+const RUNTIME_FILE: &str = "runtime.md";
+/// The facts of the run, which [`AgentInvocation::run_file`] generates.
+const RUN_FILE: &str = "run.md";
+
+/// The limits that `run.md` gives for a model without a registry value. The output limit is also
+/// the cap that OpenCode keeps for every model when not every model of the run has a registry
+/// output limit (see `opencode::output_cap`).
+const DEFAULT_CONTEXT_LIMIT: u64 = 1_000_000;
+const DEFAULT_OUTPUT_LIMIT: u64 = 32_000;
+
+/// Experimental and off by default: the prompt file that asks the main agent to record the
+/// analysis tools that it wanted in `tool_wishlist.json` of the crate. The tools whose config
+/// turns it on pass it as an additional prompt file.
+pub fn tool_wishlist() -> AdditionalPrompt {
+    AdditionalPrompt {
+        path: "tool_wishlist.md".to_owned(),
+        purpose: "the record of the analysis tools that you wanted",
+        text: include_str!("../prompts/tool_wishlist.md"),
+    }
+}
+
+fn runtime_problems(agent: AgentKind) -> &'static str {
+    match agent {
+        // Async sub-agent kill, report-file guard, and the Agent tool's advice
+        // against sub-agents.
+        AgentKind::Claude => include_str!("../prompts/runtime_claude.md"),
+        AgentKind::OpenCode => include_str!("../prompts/runtime_opencode.md"),
+    }
+}
+
+/// The prompt of the main agent of a stage: it names the prompt file of the stage, which holds
+/// the task.
+pub fn main_prompt(phase: AgentPhase) -> String {
+    format!(
+        "You are the main agent of the {} stage of a C-to-Rust translation run.\n\
+         Read {PROMPTS_PATH}/{}/main.md now, and do the task in it.\n",
+        phase.label(),
+        phase.prompt_dir()
+    )
+}
+
+/// A fact of the stage for `run.md`: a section with its heading.
+pub struct StageFact<'a> {
+    pub heading: &'a str,
+    pub text: String,
+}
+
+/// A prompt file that the run adds for an option of the stage. [`prepare_agent`](crate::prepare_agent)
+/// writes it and `run.md` lists it for the main agent, which reads it and names the files of the
+/// sub-agents in their prompts.
+pub struct AdditionalPrompt {
+    /// Relative to `inputs/prompts/`.
+    pub path: String,
+    /// What the file is for, in a few words.
+    pub purpose: &'static str,
+    /// The text of the file, written as it is.
+    pub text: &'static str,
+}
+
+impl AgentInvocation<'_> {
+    /// Writes the prompt files that every stage gets into `inputs/prompts/`: the shared rules
+    /// (with the rules of every main agent only when the run has a state file), the known
+    /// problems of the agent runtime, the additional prompt files of the run, and `run.md`, which
+    /// lists them.
+    pub(crate) fn write_shared_prompts(&self, limits: &RegistryLimits) -> io::Result<()> {
+        let dir = self.case.prompts();
+        fs::create_dir_all(&dir)?;
+        let main_agent = self.plan_files_enabled().then_some(MAIN_AGENT_FILE);
+        for (name, text) in SHARED_FILES.into_iter().chain(main_agent) {
+            fs::write(dir.join(name), text)?;
+        }
+        fs::write(dir.join(RUNTIME_FILE), runtime_problems(self.agent))?;
+        for file in self.additional_prompts {
+            let path = dir.join(&file.path);
+            fs::create_dir_all(path.parent().expect("a file has a parent"))?;
+            fs::write(path, file.text)?;
+        }
+        fs::write(dir.join(RUN_FILE), self.run_file(limits))
+    }
+
+    /// The text of `run.md`: the stage, the agent runtime, the models and their limits, the Rust
+    /// toolchain, the additional prompt files of the run, and the facts of the stage. Facts only:
+    /// the prompt files say how to use them.
+    pub(crate) fn run_file(&self, limits: &RegistryLimits) -> String {
+        let runtime = match self.agent {
+            AgentKind::Claude => "Claude Code",
+            AgentKind::OpenCode => "OpenCode",
+        };
+        let model = |model: Option<&str>| match model {
+            Some(model) => format!("model `{model}`"),
+            None => "the default model of the agent runtime".to_owned(),
+        };
+        // OpenCode keeps its default output cap for every model when not every model of the run
+        // has a registry output limit.
+        let runtime_cap =
+            self.agent == AgentKind::OpenCode && crate::opencode::output_cap(limits).is_none();
+        let subagents = match self.subagent_model {
+            Some(sub) => format!(
+                "{}\n{}",
+                model(Some(sub)),
+                limit_lines(limits.subagent.as_ref(), runtime_cap)
+            ),
+            None => "the same model and the same limits as the main agent\n".to_owned(),
+        };
+        let toolchain = self.rust_toolchain;
+        let mut lines = vec![
+            "# Facts of this run".to_owned(),
+            String::new(),
+            "Reader: every agent of this run. The framework wrote this file for this run. It holds"
+                .to_owned(),
+            "facts, not rules. The other prompt files tell how to use them.".to_owned(),
+            String::new(),
+            "## Stage".to_owned(),
+            String::new(),
+            format!("- Stage: {}", self.phase.label()),
+            format!("- Agent runtime: {runtime}"),
+            format!(
+                "- Run directory: `{}`. The working directory of the main agent is its \
+                 `workspace/`.",
+                self.case.root().display()
+            ),
+            String::new(),
+            "## Models".to_owned(),
+            String::new(),
+            format!(
+                "- Main agent: {}\n{}- Sub-agents: {}",
+                model(self.model),
+                limit_lines(limits.main.as_ref(), runtime_cap),
+                subagents.trim_end()
+            ),
+            String::new(),
+            "## Rust toolchain".to_owned(),
+            String::new(),
+            format!(
+                "- Required Rust toolchain: `{}`",
+                toolchain.required_version
+            ),
+            format!("- Detected rustc: `{}`", toolchain.rustc_version),
+            format!("- Detected cargo: `{}`", toolchain.cargo_version),
+            String::new(),
+            "## Additional prompt files for the main agent".to_owned(),
+            String::new(),
+            "A sub-agent reads one of these files only when its task message names the file."
+                .to_owned(),
+            String::new(),
+        ];
+        if self.additional_prompts.is_empty() {
+            lines.push("None.".to_owned());
+        }
+        for file in self.additional_prompts {
+            lines.push(format!(
+                "- `{PROMPTS_PATH}/{}`: {}",
+                file.path, file.purpose
+            ));
+        }
+        for fact in self.stage_facts {
+            lines.push(String::new());
+            lines.push(format!("## {}", fact.heading));
+            lines.push(String::new());
+            lines.push(fact.text.trim_end().to_owned());
+        }
+        lines.join("\n") + "\n"
+    }
+}
+
+/// The two limit lines of a model in `run.md`: the registry values, or the defaults. With
+/// `runtime_cap`, the agent runtime caps the output of every model at the default.
+fn limit_lines(limits: Option<&ModelLimits>, runtime_cap: bool) -> String {
+    let no_value = " (default: the agent runtime gives no value)";
+    let cap = " (the default cap of the agent runtime: not every model of this run has an output \
+               limit)";
+    let (context, context_note) = match limits {
+        Some(limits) => (limits.context, ""),
+        None => (DEFAULT_CONTEXT_LIMIT, no_value),
+    };
+    let (output, output_note) = match limits.and_then(|limits| limits.output) {
+        Some(output) if runtime_cap && output > DEFAULT_OUTPUT_LIMIT => (DEFAULT_OUTPUT_LIMIT, cap),
+        Some(output) => (output, ""),
+        None => (DEFAULT_OUTPUT_LIMIT, no_value),
+    };
+    format!(
+        "  - context window: {context} tokens{context_note}\n  \
+         - output limit of one response: {output} tokens{output_note}\n"
+    )
+}
 
 /// A model's context window and output limit, from a backend's model registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +227,7 @@ pub(crate) struct ModelLimits {
     pub(crate) output: Option<u64>,
 }
 
-/// The registry limits of the run's models, read once per stage: the prompt
+/// The registry limits of the run's models, read once per stage: `run.md`
 /// and the backend both use them. Only OpenCode has a registry (see
 /// `opencode::load_registry_limits`); Claude Code leaves this empty.
 #[derive(Debug, Default)]
@@ -21,242 +236,237 @@ pub(crate) struct RegistryLimits {
     pub(crate) subagent: Option<ModelLimits>,
 }
 
-impl AgentInvocation<'_> {
-    /// `text` with the shared placeholders filled in: `{SUBAGENT_RULES}` (the rules of
-    /// [`SUBAGENT_RULES_FILE`] under a `##` heading, for a task file that carries them),
-    /// `{AGENT_BUG_WORKAROUNDS}`, `{GIT_DISCIPLINE}`, `{GIT_SUBAGENT}`,
-    /// `{RUST_TOOLCHAIN_CONTEXT}`, `{CASE_LAYOUT}`, `{MODEL_LIMITS}` and `{CARGO_FEATURES}`.
-    pub(crate) fn render(&self, text: &str, limits: &RegistryLimits) -> String {
-        let model_limits = render_model_limits(self.subagent_model, limits);
-        let subagent_rules = format!("## Rules for every sub-agent\n\n{}", subagent_rules());
-        // First, because its text has placeholders of its own.
-        text.replace("{SUBAGENT_RULES}", &subagent_rules)
-            .replace("{AGENT_BUG_WORKAROUNDS}", agent_bug_workarounds(self.agent))
-            .replace("{GIT_DISCIPLINE}", git_discipline())
-            .replace("{GIT_SUBAGENT}", GIT_SUBAGENT_BODY.trim_end())
-            .replace(
-                "{RUST_TOOLCHAIN_CONTEXT}",
-                &self.rust_toolchain.prompt_block,
-            )
-            .replace("{CASE_LAYOUT}", self.case.layout())
-            .replace("{MODEL_LIMITS}", &model_limits)
-            .replace("{CARGO_FEATURES}", cargo_features())
-    }
-
-    /// The text of [`SUBAGENT_RULES_FILE`]: the rules that a sub-agent without a task file of
-    /// its own reads first.
-    pub(crate) fn subagent_rules_file(&self, limits: &RegistryLimits) -> String {
-        let text = format!(
-            "# Rules for every sub-agent\n\nYou are a sub-agent of this run. These rules apply \
-             to all of your work. Your task message gives the task.\n\n{}\n",
-            subagent_rules()
-        );
-        self.render(&text, limits)
-    }
-}
-
-/// The file in `inputs/prompts/` that every stage gets: the directories of the run, the
-/// toolchain, the git rules of a sub-agent and the agent bug workarounds. The main agent names it
-/// in the prompt of a sub-agent, and so copies no rules. A task file of a role carries the same
-/// rules through `{SUBAGENT_RULES}`.
-pub const SUBAGENT_RULES_FILE: &str = "SUBAGENT_RULES.md";
-
-const SUBAGENT_RULES_BODY: &str = include_str!("subagent_rules.md");
-const GIT_SUBAGENT_BODY: &str = include_str!("git_subagent.md");
-
-fn subagent_rules() -> &'static str {
-    SUBAGENT_RULES_BODY.trim_end()
-}
-
-/// The text for the `{MODEL_LIMITS}` placeholder of the main prompts: the main
-/// model's registry limits, and with a sub-agent model the "Sub-agent model"
-/// section (the model, and its registry limits). Data only: the prompts say
-/// how to use it.
-fn render_model_limits(subagent_model: Option<&str>, limits: &RegistryLimits) -> String {
-    let mut sections = Vec::new();
-    if let Some(main) = &limits.main {
-        sections.push(limits_section("### Model limits", None, Some(main)));
-    }
-    if let Some(sub) = subagent_model {
-        sections.push(limits_section(
-            "### Sub-agent model",
-            Some(sub),
-            limits.subagent.as_ref(),
-        ));
-    }
-    sections.join("\n\n")
-}
-
-/// A heading and its `key: value` lines: the model, if given, then the
-/// registry limits, if known.
-fn limits_section(heading: &str, model: Option<&str>, limits: Option<&ModelLimits>) -> String {
-    let mut lines = vec![heading.to_string()];
-    lines.extend(model.map(|model| format!("model: {model}")));
-    if let Some(limits) = limits {
-        lines.push(format!("context_limit: {}", limits.context));
-        lines.extend(
-            limits
-                .output
-                .map(|output| format!("output_limit: {output}")),
-        );
-    }
-    lines.join("\n")
-}
-
-/// Agent-specific temporary bug workarounds, injected into every prompt and,
-/// through the sub-agent rules, into what every sub-agent reads. Each
-/// backend's text lives in `agent_bug_workarounds/<agent>.md` and states the
-/// known upstream bug and the behavior that avoids it. Add a file when a
-/// backend needs a temporary fix, and remove it when the upstream fix ships.
-fn agent_bug_workarounds(agent: AgentKind) -> &'static str {
-    match agent {
-        // Async sub-agent kill, report-file guard, and the Agent tool's advice
-        // against sub-agents.
-        AgentKind::Claude => include_str!("agent_bug_workarounds/claude.md").trim_end(),
-        AgentKind::OpenCode => include_str!("agent_bug_workarounds/opencode.md").trim_end(),
-    }
-}
-
-const GIT_DISCIPLINE_BODY: &str = include_str!("git_discipline.md");
-
-fn git_discipline() -> &'static str {
-    GIT_DISCIPLINE_BODY.trim_end()
-}
-
-const CARGO_FEATURES_BODY: &str = include_str!("cargo_features.md");
-
-/// The rule for the Cargo features of the C build options, and how to use the `cargo_features`
-/// skill that [`CaseDir::new`](crate::CaseDir::new) gives every stage. The `{CARGO_FEATURES}`
-/// placeholder.
-fn cargo_features() -> &'static str {
-    CARGO_FEATURES_BODY.trim_end()
-}
-
-/// The placeholders (`{UPPER_CASE}`) that `text` has. The tools use it to test that a file for
-/// the agents has none left.
-pub fn placeholders(text: &str) -> Vec<&str> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('{') {
-        rest = &rest[start..];
-        let name_len = rest[1..]
-            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-            .unwrap_or(rest.len() - 1);
-        if name_len > 0 && rest[1 + name_len..].starts_with('}') {
-            found.push(&rest[..name_len + 2]);
-        }
-        rest = &rest[1..];
-    }
-    found
-}
-
-const TOOL_WISHLIST_BODY: &str = include_str!("tool_wishlist.md");
-
-/// Fills the `{TOOL_WISHLIST}` placeholder of the translate and verify prompts.
-/// Experimental and off by default: when on, the agent records the analysis
-/// tools it wanted in `tool_wishlist.json` of the crate; when off, the
-/// placeholder becomes empty.
-pub fn fill_tool_wishlist(prompt: &str, on: bool) -> String {
-    let section = if on {
-        TOOL_WISHLIST_BODY.trim_end()
-    } else {
-        ""
-    };
-    prompt.replace("{TOOL_WISHLIST}", section)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_check::placeholders;
     use crate::{AgentPhase, CaseDir, RustToolchainContext};
     use std::collections::HashMap;
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn render_prompt_fills_shared_placeholders() {
+    /// An invocation in a new case directory, for a check of what it writes. With `options`, the
+    /// run has an additional prompt file of the stage and the tool wishlist.
+    fn with_invocation(
+        agent: AgentKind,
+        subagent_model: Option<&str>,
+        options: bool,
+        check: impl Fn(&AgentInvocation<'_>),
+    ) {
         let case = CaseDir::new().unwrap();
-        let toolchain = RustToolchainContext {
-            required_version: "1.99.0".to_owned(),
-            prompt_block: "TOOLCHAIN".to_owned(),
-            test_corpus_root: None,
-        };
+        let toolchain = RustToolchainContext::for_version("1.99.0");
         let env = HashMap::new();
-        let invocation = AgentInvocation {
-            phase: AgentPhase::Translate,
-            agent: AgentKind::Claude,
+        let additional = [
+            AdditionalPrompt {
+                path: "verify/method.md".to_owned(),
+                purpose: "the test method",
+                text: "# Method\n",
+            },
+            tool_wishlist(),
+        ];
+        let facts = [StageFact {
+            heading: "External test suite",
+            text: "- `inputs/suite/`\n".to_owned(),
+        }];
+        check(&AgentInvocation {
+            phase: AgentPhase::Verify,
+            agent,
             case: &case,
-            prompt: "{AGENT_BUG_WORKAROUNDS}\n{GIT_DISCIPLINE}\n{RUST_TOOLCHAIN_CONTEXT}\n\
-                     {CASE_LAYOUT}\n{MODEL_LIMITS}\n{CARGO_FEATURES}\n{SUBAGENT_RULES}",
+            prompt: "",
             timeout_secs: 1,
-            model: None,
-            subagent_model: None,
+            model: Some("provider/main"),
+            subagent_model,
             no_plan: false,
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
             rust_toolchain: &toolchain,
-        };
-        let limits = RegistryLimits::default();
-        let prompt = invocation.render(invocation.prompt, &limits);
-        assert!(prompt.contains("TOOLCHAIN"));
-        assert_eq!(prompt.matches("### Directories of this run").count(), 2);
-        assert!(prompt.contains("### Cargo features"));
-        assert!(prompt.contains("## Rules for every sub-agent"));
-        assert!(prompt.contains("### Git rules for a sub-agent"));
-        assert!(!prompt.contains('{'), "{prompt}");
-        // The rules file names itself (in the layout), and no prompt tells an agent to copy rules.
-        let rules = invocation.subagent_rules_file(&limits);
-        assert!(rules.starts_with("# Rules for every sub-agent"));
-        assert!(
-            rules.contains(SUBAGENT_RULES_FILE) && !rules.contains('{'),
-            "{rules}"
-        );
-        assert!(!prompt.contains("Copy this"), "{prompt}");
+            additional_prompts: if options { &additional } else { &[] },
+            stage_facts: &facts,
+        });
         case.finish();
     }
 
     #[test]
-    fn placeholders_are_upper_case_names_in_braces() {
-        assert_eq!(
-            placeholders("a {X} b {GIT_DISCIPLINE}{} {x} {A1}c { B } `{`"),
-            ["{X}", "{GIT_DISCIPLINE}", "{A1}"]
-        );
-        assert!(placeholders("fn f() { EXPECT_EQ(RunC(kMode, {}), 1); }").is_empty());
+    #[cfg_attr(miri, ignore)]
+    fn shared_prompt_files_are_consistent() {
+        for agent in [AgentKind::Claude, AgentKind::OpenCode] {
+            with_invocation(agent, None, true, |invocation| {
+                invocation
+                    .write_shared_prompts(&RegistryLimits::default())
+                    .unwrap();
+                let inputs = invocation.case.inputs();
+                // The additional prompt files are written where run.md names them.
+                assert_eq!(crate::prompt_check::problems(&inputs).unwrap(), [""; 0]);
+                let files = crate::prompt_check::load(&inputs).unwrap();
+                let read = |entry: &str| -> Vec<String> {
+                    crate::prompt_check::must_read(&files, entry)
+                        .into_iter()
+                        .collect()
+                };
+                assert_eq!(
+                    read("main_agent.md"),
+                    [
+                        "common.md",
+                        "git_main.md",
+                        "main_agent.md",
+                        "run.md",
+                        "runtime.md"
+                    ]
+                );
+                assert_eq!(
+                    read("subagent.md"),
+                    [
+                        "common.md",
+                        "git_subagent.md",
+                        "run.md",
+                        "runtime.md",
+                        "subagent.md"
+                    ]
+                );
+                assert!(files.contains_key("cargo_features.md"));
+                assert_eq!(files["verify/method.md"], "# Method\n");
+                assert!(files["tool_wishlist.md"].contains("tool_wishlist.json"));
+                let runtime = match agent {
+                    AgentKind::Claude => "Claude Code",
+                    AgentKind::OpenCode => "OpenCode",
+                };
+                assert!(files["runtime.md"].contains(runtime));
+            });
+        }
     }
 
     #[test]
-    fn tool_wishlist_is_filled_only_when_on() {
-        let on = fill_tool_wishlist("a\n{TOOL_WISHLIST}\nb", true);
-        assert!(on.contains("tool_wishlist.json"), "{on}");
-        assert!(!on.contains("{TOOL_WISHLIST}"));
-        assert_eq!(fill_tool_wishlist("a\n{TOOL_WISHLIST}\nb", false), "a\n\nb");
+    #[cfg_attr(miri, ignore)]
+    fn a_run_without_options_lists_no_additional_file() {
+        with_invocation(AgentKind::Claude, None, false, |off| {
+            off.write_shared_prompts(&RegistryLimits::default())
+                .unwrap();
+            assert!(!off.case.prompts().join("tool_wishlist.md").exists());
+            let run = off.run_file(&RegistryLimits::default());
+            assert!(run.contains("## Additional prompt files for the main agent"));
+            assert!(run.contains("\nNone.\n"), "{run}");
+        });
     }
 
     #[test]
-    fn model_limits_list_the_registry_and_subagent_sections() {
-        // OpenCode, both models in the registry.
-        let both = RegistryLimits {
-            main: Some(ModelLimits {
-                context: 1_048_576,
-                output: Some(128_000),
-            }),
-            subagent: Some(ModelLimits {
-                context: 262_144,
-                output: Some(65_536),
-            }),
+    #[cfg_attr(miri, ignore)]
+    fn a_run_without_state_file_gets_no_rules_of_a_main_agent() {
+        let case = CaseDir::new().unwrap();
+        let toolchain = RustToolchainContext::for_version("1.99.0");
+        let env = HashMap::new();
+        let invocation = AgentInvocation {
+            phase: AgentPhase::Translate,
+            agent: AgentKind::Claude,
+            case: &case,
+            prompt: "",
+            timeout_secs: 1,
+            model: None,
+            subagent_model: None,
+            no_plan: true,
+            teamclaude: true,
+            extra_env: &env,
+            output_log_path: None,
+            rust_toolchain: &toolchain,
+            additional_prompts: &[],
+            stage_facts: &[],
         };
+        invocation
+            .write_shared_prompts(&RegistryLimits::default())
+            .unwrap();
+        let prompts = case.prompts();
+        assert!(!prompts.join("main_agent.md").exists());
+        assert!(prompts.join("subagent.md").exists() && prompts.join("common.md").exists());
         assert_eq!(
-            render_model_limits(Some("opencode-go/mimo-v2.6-flash"), &both),
-            "### Model limits\ncontext_limit: 1048576\noutput_limit: 128000\n\n\
-             ### Sub-agent model\nmodel: opencode-go/mimo-v2.6-flash\n\
-             context_limit: 262144\noutput_limit: 65536"
+            crate::prompt_check::problems(&case.inputs()).unwrap(),
+            [""; 0]
         );
-        // Claude Code: no registry, so only the model.
-        let none = RegistryLimits::default();
+        case.finish();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn run_file_gives_the_facts_of_the_run() {
+        // Claude Code: no registry, so the default limits, and marked as such.
+        with_invocation(AgentKind::Claude, None, true, |invocation| {
+            let run = invocation.run_file(&RegistryLimits::default());
+            for line in [
+                "- Stage: verification\n",
+                "- Agent runtime: Claude Code\n",
+                "- Main agent: model `provider/main`\n\
+                 \x20 - context window: 1000000 tokens (default: the agent runtime gives no value)\n\
+                 \x20 - output limit of one response: 32000 tokens (default: the agent runtime gives no value)\n\
+                 - Sub-agents: the same model and the same limits as the main agent\n",
+                "- Required Rust toolchain: `1.99.0`\n",
+                "- `inputs/prompts/verify/method.md`: the test method\n",
+                "- `inputs/prompts/tool_wishlist.md`: ",
+                "\n## External test suite\n\n- `inputs/suite/`\n",
+            ] {
+                assert!(run.contains(line), "{line:?} not in:\n{run}");
+            }
+            assert!(run.contains(&invocation.case.root().display().to_string()));
+            assert_eq!(placeholders(&run), [""; 0]);
+        });
+        // OpenCode, both models with a registry output limit: the registry values hold.
+        with_invocation(
+            AgentKind::OpenCode,
+            Some("provider/sub"),
+            true,
+            |invocation| {
+                let limits = RegistryLimits {
+                    main: Some(ModelLimits {
+                        context: 1_048_576,
+                        output: Some(128_000),
+                    }),
+                    subagent: Some(ModelLimits {
+                        context: 262_144,
+                        output: Some(65_536),
+                    }),
+                };
+                let run = invocation.run_file(&limits);
+                let models = "- Main agent: model `provider/main`\n\
+                 \x20 - context window: 1048576 tokens\n\
+                 \x20 - output limit of one response: 128000 tokens\n\
+                 - Sub-agents: model `provider/sub`\n\
+                 \x20 - context window: 262144 tokens\n\
+                 \x20 - output limit of one response: 65536 tokens\n";
+                assert!(run.contains(models), "{run}");
+            },
+        );
+        // OpenCode, the sub-agent model without an output limit: OpenCode keeps its default cap
+        // for every model, so run.md gives the cap, not the larger registry value.
+        with_invocation(
+            AgentKind::OpenCode,
+            Some("provider/sub"),
+            true,
+            |invocation| {
+                let limits = RegistryLimits {
+                    main: Some(ModelLimits {
+                        context: 1_048_576,
+                        output: Some(128_000),
+                    }),
+                    subagent: Some(ModelLimits {
+                        context: 262_144,
+                        output: None,
+                    }),
+                };
+                let run = invocation.run_file(&limits);
+                let models = "- Main agent: model `provider/main`\n\
+                 \x20 - context window: 1048576 tokens\n\
+                 \x20 - output limit of one response: 32000 tokens (the default cap of the agent \
+                 runtime: not every model of this run has an output limit)\n\
+                 - Sub-agents: model `provider/sub`\n\
+                 \x20 - context window: 262144 tokens\n\
+                 \x20 - output limit of one response: 32000 tokens (default: the agent runtime gives no value)\n";
+                assert!(run.contains(models), "{run}");
+            },
+        );
+    }
+
+    #[test]
+    fn main_prompt_names_the_prompt_file_of_the_stage() {
         assert_eq!(
-            render_model_limits(Some("haiku"), &none),
-            "### Sub-agent model\nmodel: haiku"
+            main_prompt(AgentPhase::Verify),
+            "You are the main agent of the verification stage of a C-to-Rust translation run.\n\
+             Read inputs/prompts/verify/main.md now, and do the task in it.\n"
         );
-        assert_eq!(render_model_limits(None, &none), "");
     }
 }

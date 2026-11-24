@@ -3,7 +3,7 @@
 //! ```text
 //! /var/tmp/.tmpXXXX/      case_dir (in `large_temp_dir()`): removed after a successful run,
 //!                         kept after a failed one
-//!   inputs/               inputs from the framework (C source, task files, skills, suites), read-only
+//!   inputs/               inputs from the framework (C source, prompt files, skills, suites), read-only
 //!   shared/               large files that agents share and that git must not record (tab2rust builds)
 //!   workspace/            the agent's working directory: the crate and the reports. Frozen.
 //!     inputs, shared      symbolic links to the two directories above (absolute targets). Git
@@ -12,7 +12,7 @@
 //!   tmp/                  `TMPDIR` of the agent and of every command it runs (mode 0700)
 //! ```
 //!
-//! The prompts name every file relative to the checkout (the workspace or a worktree):
+//! The prompt files name every file relative to the checkout (the workspace or a worktree):
 //! `inputs/c_src/...`, `shared/...`, `scratch/...`. The framework also keeps its own files in
 //! case_dir (`logs/`, `agent_env/`, `.claude/`, `tmp/`). They go with case_dir. `inputs/` is made
 //! read-only before the agent starts, and any change to it is reported
@@ -40,8 +40,6 @@ pub const SCRATCH: &str = "scratch";
 /// In case_dir.
 pub const TMP: &str = "tmp";
 
-const LAYOUT: &str = include_str!("case_layout.md");
-
 /// The free space that [`large_temp_dir`] must have before a run starts. The C and test builds
 /// of a large project and the agent's temporary files take some GB, and the file system is
 /// usually shared with `/`.
@@ -61,8 +59,8 @@ pub struct CaseDir {
 impl CaseDir {
     /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `shared/` and `tmp/`, and
     /// `inputs/` with the skill that every stage gives (`agent_skills/cargo_features/`, which the
-    /// `{CARGO_FEATURES}` placeholder describes). Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`]
-    /// free.
+    /// prompt file `cargo_features.md` describes). Fails when [`large_temp_dir`] has less than
+    /// [`MIN_FREE_BYTES`] free.
     pub fn new() -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         let base = large_temp_dir();
@@ -120,6 +118,22 @@ impl CaseDir {
         self.inputs().join(C_SOURCE_DIR)
     }
 
+    /// `inputs/prompts/`: the prompt files of the run, at the path by which the agents name them
+    /// ([`PROMPTS_PATH`](crate::PROMPTS_PATH)).
+    pub fn prompts(&self) -> PathBuf {
+        self.root.join(crate::PROMPTS_PATH)
+    }
+
+    /// Writes prompt files of a stage into `inputs/prompts/<stage>/`, each as it is.
+    pub fn write_prompts(&self, stage: &str, files: &[(&str, &str)]) -> io::Result<()> {
+        let dir = self.prompts().join(stage);
+        fs::create_dir_all(&dir)?;
+        for (name, text) in files {
+            fs::write(dir.join(name), text)?;
+        }
+        Ok(())
+    }
+
     /// Writes the skill `name` (a directory of `agent_skills/`) into `inputs/agent_skills/<name>/`.
     pub fn write_skill(&self, name: &str) -> io::Result<()> {
         crate::skills::materialize(name, &self.inputs().join("agent_skills").join(name))
@@ -171,12 +185,6 @@ impl CaseDir {
             Ok(_) => {} // unchanged, or no git record
             Err(e) => warn!("git add of the links failed: {e}"),
         }
-    }
-
-    /// The prompt section that tells the agent the areas and their rules. Every main prompt has
-    /// it as `{CASE_LAYOUT}`, and every sub-agent reads it in the sub-agent rules.
-    pub fn layout(&self) -> &'static str {
-        LAYOUT.trim_end()
     }
 
     /// Freezes the workspace after a successful run and removes case_dir. Before the freeze it
@@ -409,13 +417,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn layout_has_no_placeholders() {
-        let case = CaseDir::new().unwrap();
-        let text = case.layout();
-        assert!(text.contains("`inputs/c_src/`"));
-        assert!(!text.contains('{'), "{text}");
-        case.finish();
+    fn the_prompt_files_are_in_the_inputs() {
+        assert_eq!(crate::PROMPTS_PATH, format!("{INPUTS}/prompts"));
     }
 
     #[test]

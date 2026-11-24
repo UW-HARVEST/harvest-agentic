@@ -11,5 +11,10 @@ serde_json.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 
+[features]
+# The prompt checks and the test helpers (`prompt_check`, `RustToolchainContext::for_version`),
+# for the tests of the tools. Turn it on only in `[dev-dependencies]`.
+test-support = []
+
 [lints]
 workspace = true

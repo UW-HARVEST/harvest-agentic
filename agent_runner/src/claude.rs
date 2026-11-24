@@ -103,11 +103,20 @@ pub(crate) fn invoke_claude(
 /// Compaction-recovery hint, injected per turn. Claude-only: the OpenCode
 /// backend replaces this with the compaction-recovery plugin (see
 /// `OPENCODE_COMPACTION_PLUGIN`), which fires exactly once per compaction
-/// instead of diluting every turn's system prompt.
+/// instead of diluting every turn's system prompt. It tells the main agent
+/// and a sub-agent apart, in case a sub-agent gets it too.
 fn compaction_hint(phase: AgentPhase) -> String {
+    let files = phase.recovery_files();
+    let (last, first) = files.split_last().expect("a phase has a state file");
+    let list = if first.is_empty() {
+        last.clone()
+    } else {
+        format!("{} and {last}", first.join(", "))
+    };
     format!(
-        "After any context compaction, you MUST first read {}.",
-        phase.recovery_files().join(" and ")
+        "After any context compaction, the main agent of the stage MUST first read {list}. \
+         A sub-agent MUST first read again the prompt file that its task message names, and \
+         inputs/prompts/subagent.md, and then continue its own task."
     )
 }
 
@@ -183,17 +192,31 @@ mod tests {
 
     #[test]
     fn compaction_hint_names_the_recovery_files() {
+        let subagent = " A sub-agent MUST first read again the prompt file that its task message \
+                        names, and inputs/prompts/subagent.md, and then continue its own task.";
         assert_eq!(
             compaction_hint(AgentPhase::Verify),
-            "After any context compaction, you MUST first read PLAN.md and HYPOTHESES.md."
+            format!(
+                "After any context compaction, the main agent of the stage MUST first read \
+                 inputs/prompts/main_agent.md, inputs/prompts/verify/main.md, PLAN.md and \
+                 HYPOTHESES.md.{subagent}"
+            )
         );
         assert_eq!(
             compaction_hint(AgentPhase::Quality),
-            "After any context compaction, you MUST first read QUALITY.md."
+            format!(
+                "After any context compaction, the main agent of the stage MUST first read \
+                 inputs/prompts/main_agent.md, inputs/prompts/quality/main.md and \
+                 QUALITY.md.{subagent}"
+            )
         );
         assert_eq!(
             compaction_hint(AgentPhase::Conform),
-            "After any context compaction, you MUST first read CONFORM.md."
+            format!(
+                "After any context compaction, the main agent of the stage MUST first read \
+                 inputs/prompts/main_agent.md, inputs/prompts/conform/main.md and \
+                 CONFORM.md.{subagent}"
+            )
         );
     }
 

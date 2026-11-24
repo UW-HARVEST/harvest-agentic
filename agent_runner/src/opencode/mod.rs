@@ -19,7 +19,7 @@ mod routing;
 
 pub(crate) use config::write_project;
 pub(crate) use export::export_opencode_sessions;
-pub(crate) use registry::load_registry_limits;
+pub(crate) use registry::{load_registry_limits, output_cap};
 pub(crate) use routing::{Route, take_routes};
 
 impl AgentPhase {

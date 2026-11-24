@@ -1,6 +1,6 @@
-## Bounded fuzz campaigns
+# Bounded fuzz campaigns
 
-Additional files: `build_fuzz.sh` builds the campaign binary; `run_fuzz.sh` runs
+This file adds to `README.md`. Additional files: `build_fuzz.sh` builds the campaign binary; `run_fuzz.sh` runs
 it and sets campaign budgets. `run_fuzz.sh` uses the same `memory_scope.sh`
 cgroup launcher as `run_tests.sh`. `docs/` contains vendored official
 FuzzTest reference docs (Apache-2.0).

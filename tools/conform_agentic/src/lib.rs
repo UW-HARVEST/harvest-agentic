@@ -23,7 +23,7 @@
 //!   it leaves a trace in the snapshot.
 
 use agent_runner::case_dir::INPUTS;
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{AgentInvocation, AgentPhase, CaseDir, StageFact};
 use full_source::{CargoPackage, ExternalTestSuite, RawSource, TestSuiteKind};
 use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::stage_manifest::SUITE_DIR;
@@ -35,14 +35,28 @@ use std::fs;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-const PROMPT_CONFORM: &str = include_str!("prompt_conform.md");
-/// The log of the agent, which the framework writes into the workspace as `CONFORM.md` before
-/// the agent starts: the invariants, and the format of a log entry.
+/// The prompt files of the stage that are the same in every run, by their name in
+/// `inputs/prompts/conform/`: the main agent and the rules of the stage.
+const STAGE_FILES: [(&str, &str); 2] = [
+    ("main.md", include_str!("../prompts/main.md")),
+    (
+        "conform_rules.md",
+        include_str!("../prompts/conform_rules.md"),
+    ),
+];
+/// The prompt file that tells how to build and run the external suite: the file for the kind of
+/// the suite, with the toolchain version of the run ([`test_instructions`]). The files name the
+/// suite by its path in the checkout, `inputs/suite` (`INPUTS`/`SUITE_DIR`).
+const TESTS_FILE: &str = "tests.md";
+const TEST_GTEST: &str = include_str!("../prompts/test_gtest.md");
+const TEST_LIB: &str = include_str!("../prompts/test_lib.md");
+const TEST_BIN: &str = include_str!("../prompts/test_bin.md");
+/// The state file of the main agent, which the framework writes into the workspace as
+/// `CONFORM.md` before the agent starts: the format of a log entry. It holds no rules.
 const CONFORM_MD: &str = include_str!("conform_md.md");
-/// How to build and run each kind of external suite (`{CONFORM_TEST_INSTRUCTIONS}`).
-const TEST_GTEST: &str = include_str!("test_gtest.md");
-const TEST_LIB: &str = include_str!("test_lib.md");
-const TEST_BIN: &str = include_str!("test_bin.md");
+/// The section of `run.md` that lists the directories of the external suite. The prompt of the
+/// main agent names it.
+const SUITE_FACT: &str = "External test suite";
 
 /// The agent's final gap-analysis report. It stays in the crate, like its notes
 /// file `CONFORM.md`.
@@ -146,20 +160,8 @@ impl Tool for ConformAgentic {
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-        let suite_path = format!("{INPUTS}/{SUITE_DIR}");
-        let prompt = PROMPT_CONFORM
-            .replace(
-                "{CONFORM_TEST_INSTRUCTIONS}",
-                &test_instructions(
-                    suite.kind,
-                    &suite_path,
-                    &rust_toolchain_context.required_version,
-                ),
-            )
-            .replace(
-                "{EXTERNAL_TEST_DIRS}",
-                &suite_dir_list(suite.kind, &suite_path),
-            );
+        let prompt = agent_runner::main_prompt(AgentPhase::Conform);
+        let facts = [suite_fact(suite.kind)];
 
         let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Conform,
@@ -174,13 +176,12 @@ impl Tool for ConformAgentic {
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
+            additional_prompts: &[],
+            stage_facts: &facts,
         })?;
-        fs::write(
-            workspace.join(CONFORM_LOG),
-            prepared.render(&CONFORM_MD.replace(
-                "{EXTERNAL_TEST_DIRS}",
-                &suite_dir_list(suite.kind, &suite_path),
-            )),
+        write_stage_files(
+            &case,
+            &test_instructions(suite.kind, &rust_toolchain_context.required_version),
         )?;
         // Guarding the suite is what keeps this stage honest: an agent that "passes" by editing
         // the tests is reported. The grade runs a pristine copy of the suite in any case.
@@ -199,28 +200,41 @@ impl Tool for ConformAgentic {
     }
 }
 
-/// Renders the suite's directories as the backtick-quoted list the prompt
-/// splices into `{EXTERNAL_TEST_DIRS}`.
-fn suite_dir_list(kind: TestSuiteKind, suite: &str) -> String {
-    kind.dirs()
+/// Writes the files of the stage. Into `inputs/prompts/conform/`: the prompt files of the stage
+/// and `tests.md`. Into the workspace: `CONFORM.md`, the state file of the main agent.
+fn write_stage_files(case: &CaseDir, tests: &str) -> std::io::Result<()> {
+    let stage = AgentPhase::Conform.prompt_dir();
+    case.write_prompts(stage, &STAGE_FILES)?;
+    case.write_prompts(stage, &[(TESTS_FILE, tests)])?;
+    fs::write(case.workspace().join(CONFORM_LOG), CONFORM_MD)
+}
+
+/// The fact of `run.md` about the external suite: its kind, and its directories as a
+/// backtick-quoted list.
+fn suite_fact(kind: TestSuiteKind) -> StageFact<'static> {
+    let suite = format!("{INPUTS}/{SUITE_DIR}");
+    let dirs = kind
+        .dirs()
         .iter()
         .map(|d| format!("`{suite}/{d}/`"))
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    StageFact {
+        heading: SUITE_FACT,
+        text: format!("- Kind: {kind}\n- Directories: {dirs}"),
+    }
 }
 
-/// Builds the harness-specific "how to build and run the external tests" block
-/// injected into the prompt. Mirrors exactly what the benchmark grader runs so
-/// the agent iterates against the same commands.
-fn test_instructions(kind: TestSuiteKind, suite: &str, toolchain: &str) -> String {
+/// The text of `tests.md`: how to build and run the external tests of this kind of suite, with
+/// the toolchain version of the run. It mirrors what the benchmark grader runs, so that the agent
+/// iterates against the same commands.
+fn test_instructions(kind: TestSuiteKind, toolchain: &str) -> String {
     let text = match kind {
         TestSuiteKind::Gtest => TEST_GTEST,
         TestSuiteKind::Lib => TEST_LIB,
         TestSuiteKind::Bin => TEST_BIN,
     };
-    text.trim_end()
-        .replace("{SUITE}", suite)
-        .replace("{TOOLCHAIN}", toolchain)
+    text.replace("{TOOLCHAIN}", toolchain)
 }
 
 #[cfg(test)]
@@ -228,24 +242,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conform_file_holds_the_invariants_and_the_prompt_has_no_template() {
-        assert!(CONFORM_MD.contains("## Invariants") && CONFORM_MD.contains("## Log"));
-        // After the placeholder of this tool, only shared ones are left.
-        for placeholder in
-            agent_runner::placeholders(&CONFORM_MD.replace("{EXTERNAL_TEST_DIRS}", ""))
-        {
-            assert!(
-                [
-                    "{RUST_TOOLCHAIN_CONTEXT}",
-                    "{CASE_LAYOUT}",
-                    "{CARGO_FEATURES}",
-                    "{GIT_DISCIPLINE}",
-                ]
-                .contains(&placeholder),
-                "{placeholder}"
+    #[cfg_attr(miri, ignore)]
+    fn prompt_files_are_consistent_for_every_kind_of_suite() {
+        let suite = format!("{INPUTS}/{SUITE_DIR}");
+        for kind in [TestSuiteKind::Gtest, TestSuiteKind::Lib, TestSuiteKind::Bin] {
+            let case = CaseDir::new().unwrap();
+            let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
+            let env = HashMap::new();
+            let facts = [suite_fact(kind)];
+            agent_runner::prepare_agent(AgentInvocation {
+                phase: AgentPhase::Conform,
+                agent: harvest_core::config::AgentKind::OpenCode,
+                case: &case,
+                prompt: "",
+                timeout_secs: 1,
+                model: None,
+                subagent_model: None,
+                no_plan: false,
+                teamclaude: true,
+                extra_env: &env,
+                output_log_path: None,
+                rust_toolchain: &toolchain,
+                additional_prompts: &[],
+                stage_facts: &facts,
+            })
+            .unwrap();
+            write_stage_files(&case, &test_instructions(kind, "1.99.0")).unwrap();
+            let prompt = agent_runner::main_prompt(AgentPhase::Conform);
+            let name = format!("conform-{kind}");
+            agent_runner::prompt_check::dump(&case, &name, &prompt, &[CONFORM_LOG]).unwrap();
+
+            let inputs = case.inputs();
+            assert_eq!(
+                agent_runner::prompt_check::problems(&inputs).unwrap(),
+                [""; 0],
+                "{kind}"
             );
+            let files = agent_runner::prompt_check::load(&inputs).unwrap();
+            let read: Vec<String> =
+                agent_runner::prompt_check::must_read(&files, "conform/main.md")
+                    .into_iter()
+                    .collect();
+            assert_eq!(
+                read,
+                [
+                    "cargo_features.md",
+                    "common.md",
+                    "conform/conform_rules.md",
+                    "conform/main.md",
+                    "conform/tests.md",
+                    "git_main.md",
+                    "main_agent.md",
+                    "run.md",
+                    "runtime.md"
+                ],
+                "{kind}"
+            );
+            // The static files name the suite by the path that the framework gives it, and
+            // run.md lists its directories under the heading that the main prompt names.
+            let main = &files["conform/main.md"];
+            assert!(main.contains(&format!("`{suite}/`")) && main.contains(SUITE_FACT));
+            assert!(files["conform/conform_rules.md"].contains(&format!("`{suite}/`")));
+            for dir in kind.dirs() {
+                assert!(
+                    files["run.md"].contains(&format!("`{suite}/{dir}/`")),
+                    "{dir}"
+                );
+            }
+            let tests = &files["conform/tests.md"];
+            assert!(tests.contains("RUSTUP_TOOLCHAIN=1.99.0"));
+            // The files of the suite kinds write out the path of the suite in the checkout.
+            assert_eq!(suite, "inputs/suite");
+            assert!(tests.contains(&format!("`{suite}/")) && !tests.contains("{SUITE}"));
+            assert!(files["run.md"].contains(&format!("- Kind: {kind}\n")));
+
+            let log = fs::read_to_string(case.workspace().join(CONFORM_LOG)).unwrap();
+            assert!(log.contains("## Log") && log.contains("### C<N>:"));
+            assert!(!log.contains("Invariants") && !log.contains("inputs/prompts"));
+            case.finish();
         }
-        assert!(!PROMPT_CONFORM.contains("## Invariants ("));
-        assert!(PROMPT_CONFORM.contains("Read `CONFORM.md` now"));
+    }
+
+    #[test]
+    fn main_prompt_only_names_the_prompt_file_of_the_stage() {
+        let prompt = agent_runner::main_prompt(AgentPhase::Conform);
+        assert_eq!(prompt.lines().count(), 2);
+        assert!(prompt.contains("inputs/prompts/conform/main.md"));
     }
 }

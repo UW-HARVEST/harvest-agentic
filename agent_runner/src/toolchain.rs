@@ -9,7 +9,9 @@ use crate::command_stdout;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustToolchainContext {
     pub required_version: String,
-    pub prompt_block: String,
+    /// The output of `rustc --version` and of `cargo --version`.
+    pub rustc_version: String,
+    pub cargo_version: String,
     /// The Test-Corpus / cando2 checkout the contract was read from, if one
     /// was found. Recorded in the stage manifest so a run resuming from a
     /// snapshot can find it again without the C source's original location.
@@ -87,21 +89,25 @@ pub fn detect_rust_toolchain_context(
         .into());
     }
 
-    let prompt_block = format!(
-        "### Rust toolchain contract\n\
-         - Required Rust toolchain: `{required_version}`\n\
-         - Detected rustc: `{}`\n\
-         - Detected cargo: `{}`\n\
-         - All self-tests and build checks MUST use this exact toolchain. Run Cargo as `RUSTUP_TOOLCHAIN={required_version} cargo ...` (or verify `rustc --version` reports `{required_version}` first). If a different Rust version is active, stop and report an environment/toolchain problem instead of treating test failures as translation bugs.",
-        rustc_version.trim(),
-        cargo_version.trim(),
-    );
-
     Ok(RustToolchainContext {
         required_version,
-        prompt_block,
+        rustc_version: rustc_version.trim().to_owned(),
+        cargo_version: cargo_version.trim().to_owned(),
         test_corpus_root,
     })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RustToolchainContext {
+    /// A context that names `version` without a look at the installed toolchain: for tests.
+    pub fn for_version(version: &str) -> Self {
+        RustToolchainContext {
+            required_version: version.to_owned(),
+            rustc_version: format!("rustc {version}"),
+            cargo_version: format!("cargo {version}"),
+            test_corpus_root: None,
+        }
+    }
 }
 
 /// Locates the Test-Corpus / cando2 checkout for `input_path` without

@@ -12,5 +12,8 @@ serde_json.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+agent_runner = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

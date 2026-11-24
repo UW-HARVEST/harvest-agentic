@@ -14,7 +14,8 @@ A Rust crate translated from C usually keeps the C data model: raw pointers, `un
 everywhere, pointer arithmetic, `memcpy`, `static mut`, integer flags and many `as` casts. It
 passes its tests, but it is not safe Rust. This skill gives you tools to measure the problems per
 function, refactorings with exact conditions, and a regression gate that tells you when a
-refactoring changed the behavior. The rules for every change are in your task file.
+refactoring changed the behavior. The rules for every change are in
+`inputs/prompts/quality/rules.md`.
 
 | File | Content |
 |---|---|
@@ -85,18 +86,11 @@ The last line is `QFLOW: OK` or `QFLOW: FAIL: <reason>`.
 ## Long commands
 
 `regress.py check --quick` takes about 2 to 4 minutes on a mid-size crate, a full check longer,
-and `qflow.py` 10 minutes or more. A shell tool usually stops a command after 2 minutes. So:
+and `qflow.py` 10 minutes or more. So:
 
 - If your shell tool takes a timeout, give it 10 minutes (600000 ms) for `regress.py check`.
-- Run a command that can take longer than that in the background, and wait for it in steps:
-
-  ```
-  nohup sh -c 'python3 S/<command> > scratch/run.log 2>&1; echo "EXIT $?" >> scratch/run.log' > /dev/null 2>&1 &
-  timeout 500 sh -c 'until grep -q "^EXIT" scratch/run.log; do sleep 15; done'; tail -5 scratch/run.log
-  ```
-
-  Repeat the second line until the log has the `EXIT` line. (Without a 10-minute tool timeout, use
-  `timeout 100` instead of `timeout 500`.)
+- Run a command that can take longer than that in the background, as "Long commands" in
+  `inputs/prompts/common.md` shows. The command is `python3 S/<command>`.
 
 ## Two kinds of change
 

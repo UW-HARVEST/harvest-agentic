@@ -120,5 +120,3 @@ it starts the binary. If this check fails, the runner stops. It never runs the
 binary without the cgroup limit. Inside a container or cgroup that already
 limits memory, and only there, set `TEST_HARD_LIMIT_MB=0`. This prints a
 warning and keeps the address-space limit and the time limit.
-
-{FUZZTEST_README}

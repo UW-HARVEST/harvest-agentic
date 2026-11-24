@@ -8,7 +8,7 @@ metadata:
 
 # cargo_features
 
-The naming rule is the "Cargo features" invariant of your prompt. This tool applies it.
+The naming rule is in `inputs/prompts/cargo_features.md`. This tool applies it.
 
 ## The options
 

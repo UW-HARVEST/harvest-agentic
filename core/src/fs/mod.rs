@@ -97,7 +97,7 @@ pub fn hash_dir(root: &Path) -> io::Result<String> {
 }
 
 /// Fingerprints the read-only inputs that an agentic tool hands to an agent: the directories in
-/// case_dir's `inputs/` (the C source, task files, skills, and the conform stage's test suite).
+/// case_dir's `inputs/` (the C source, prompt files, skills, and the conform stage's test suite).
 /// It only reports changes. The inputs are outside the frozen working directory, so a change
 /// cannot reach the output.
 pub struct ReferenceGuard {
@@ -777,13 +777,13 @@ mod tests {
         for (dir, file) in [
             ("c_src", "a.c"),
             ("gtest_suite", "t.cc"),
-            ("prompts", "SCOUT.md"),
+            ("prompts", "scout.md"),
         ] {
             create_dir(inputs.path().join(dir)).unwrap();
             write(inputs.path().join(dir).join(file), "x").unwrap();
         }
         let guard = ReferenceGuard::capture(inputs.path()).unwrap();
-        // The agent "fixes" the oracle, deletes the suite, and leaves its task file alone.
+        // The agent "fixes" the oracle, deletes the suite, and leaves its prompt file alone.
         write(inputs.path().join("c_src/a.c"), "y").unwrap();
         std::fs::remove_dir_all(inputs.path().join("gtest_suite")).unwrap();
 

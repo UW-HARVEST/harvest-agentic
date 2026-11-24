@@ -6,7 +6,7 @@
 //! compares their outputs, and iteratively fixes the Rust code until the two agree (or the agent
 //! gives up). This is dynamic, execution-based verification, not a static or formal analysis.
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{AdditionalPrompt, AgentInvocation, AgentPhase, CaseDir};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
@@ -17,19 +17,36 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-const PROMPT_VERIFY: &str = include_str!("prompt_verify.md");
+/// The whole task of the main agent when the stage runs without a hypothesis log. It uses the
+/// libloading method.
 const PROMPT_VERIFY_NO_PLAN: &str = include_str!("prompt_verify_no_plan.md");
-/// The hypothesis log of the main agent, which the framework writes into the workspace as
-/// `HYPOTHESES.md` before the agent starts: the invariants, and the format of a log entry.
+/// The state file of the main agent, which the framework writes into the workspace as
+/// `HYPOTHESES.md` before the agent starts: the format of a log entry. It holds no rules.
 const HYPOTHESES_MD: &str = include_str!("hypotheses_md.md");
 
-/// Verification-method sections spliced into the standard prompt's
-/// `{VERIFICATION_METHOD}` slot (see `load_verify_prompt`).
-const METHOD_LIBLOADING: &str = include_str!("method_libloading.md");
-const METHOD_GTEST: &str = include_str!("method_gtest.md");
-/// FuzzTest instructions inserted into the gtest method only when
-/// fuzzing is enabled.
-const FUZZTEST_SECTION: &str = include_str!("fuzztest_section.md");
+/// The prompt files of the stage, by their name in `inputs/prompts/verify/`: the main agent, the
+/// rules of the verification, and the sub-agent roles.
+const STAGE_FILES: [(&str, &str); 5] = [
+    ("main.md", include_str!("../prompts/main.md")),
+    (
+        "verify_rules.md",
+        include_str!("../prompts/verify_rules.md"),
+    ),
+    ("surface.md", include_str!("../prompts/surface.md")),
+    ("fixer.md", include_str!("../prompts/fixer.md")),
+    ("reviewer.md", include_str!("../prompts/reviewer.md")),
+];
+/// The test method of the run: one file for each harness. `run.md` lists it for the main agent.
+const METHOD_GTEST: (&str, &str) = (
+    "method_gtest.md",
+    include_str!("../prompts/method_gtest.md"),
+);
+const METHOD_LIBLOADING: (&str, &str) = (
+    "method_libloading.md",
+    include_str!("../prompts/method_libloading.md"),
+);
+/// The FuzzTest part of the gtest method, written only when fuzzing is enabled.
+const FUZZTEST: (&str, &str) = ("fuzztest.md", include_str!("../prompts/fuzztest.md"));
 
 /// Directory (inside the workspace) holding the gtest/fuzztest verification
 /// environment. Materialized for the gtest harness and stripped before freeze.
@@ -129,9 +146,11 @@ impl Tool for VerifyFixAgentic {
         } else {
             ""
         };
-        let prompt =
-            agent_runner::fill_tool_wishlist(&load_verify_prompt(&config), config.tool_wishlist)
-                .replace("{WORKFLOW_HINT}", workflow_hint);
+        let prompt = if config.no_plan {
+            PROMPT_VERIFY_NO_PLAN.replace("{WORKFLOW_HINT}", workflow_hint)
+        } else {
+            agent_runner::main_prompt(AgentPhase::Verify)
+        };
 
         // Materialize the gtest/fuzztest verification environment when that
         // harness is in effect. It matches the prompt the agent will see: the
@@ -145,6 +164,7 @@ impl Tool for VerifyFixAgentic {
             );
         }
 
+        let additional = additional_prompts(&config);
         let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Verify,
             agent,
@@ -158,15 +178,12 @@ impl Tool for VerifyFixAgentic {
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             rust_toolchain: &rust_toolchain_context,
+            additional_prompts: &additional,
+            stage_facts: &[],
         })?;
-        // The plan prompt keeps its log in HYPOTHESES.md. A log that an earlier verification
-        // left in the crate stays: the agent continues it.
         let hypotheses = workspace.join("HYPOTHESES.md");
-        if !config.no_plan && !hypotheses.exists() {
-            fs::write(
-                &hypotheses,
-                prepared.render(&hypotheses_md(gtest_harness_active)),
-            )?;
+        if !config.no_plan {
+            write_stage_files(&case)?;
         }
         let reference_guard = case.lock_inputs()?;
         prepared.run()?;
@@ -196,15 +213,47 @@ impl Tool for VerifyFixAgentic {
     }
 }
 
-/// Builds the verification method, including FuzzTest guidance when enabled.
-fn build_method_section(config: &Config) -> String {
-    match config.verify_harness {
-        VerifyHarness::Gtest => {
-            let section = if config.fuzz { FUZZTEST_SECTION } else { "" };
-            METHOD_GTEST.replace("{FUZZTEST_SECTION}", section)
+/// The prompt files that the options of the run add for the main agent: the method files of a run
+/// with the hypothesis log, and the tool wishlist when it is on. `agent_runner` writes them and
+/// lists them in `run.md`. The harness selects the method, and fuzzing adds its part to the gtest
+/// one. The run without the log has its method in the prompt.
+fn additional_prompts(config: &Config) -> Vec<AdditionalPrompt> {
+    let stage = AgentPhase::Verify.prompt_dir();
+    let method = "the test method of this run: how you build, write and run the tests";
+    let mut files = Vec::new();
+    if !config.no_plan {
+        match config.verify_harness {
+            VerifyHarness::Gtest => {
+                files.push((METHOD_GTEST, method));
+                if config.fuzz {
+                    files.push((FUZZTEST, "property tests and their campaigns"));
+                }
+            }
+            VerifyHarness::Libloading => files.push((METHOD_LIBLOADING, method)),
         }
-        VerifyHarness::Libloading => METHOD_LIBLOADING.to_owned(),
     }
+    let mut files: Vec<AdditionalPrompt> = files
+        .into_iter()
+        .map(|((name, text), purpose)| AdditionalPrompt {
+            path: format!("{stage}/{name}"),
+            purpose,
+            text,
+        })
+        .collect();
+    files.extend(config.tool_wishlist.then(agent_runner::tool_wishlist));
+    files
+}
+
+/// Writes the files of a run with the hypothesis log. Into `inputs/prompts/verify/`: the prompt
+/// files of the stage. Into the workspace: `HYPOTHESES.md`, the state file of the main agent. A
+/// log that an earlier verification left in the crate stays: the agent continues it.
+fn write_stage_files(case: &CaseDir) -> std::io::Result<()> {
+    case.write_prompts(AgentPhase::Verify.prompt_dir(), &STAGE_FILES)?;
+    let hypotheses = case.workspace().join("HYPOTHESES.md");
+    if !hypotheses.exists() {
+        fs::write(hypotheses, HYPOTHESES_MD)?;
+    }
+    Ok(())
 }
 
 /// Best-effort extraction of C preprocessor definitions from a project's
@@ -287,19 +336,19 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
         .replace("{TEST_LINK}", &test_link)
         .replace("{C_COMPILE_DEFS}", &c_defs);
 
-    let readme = VE_README.replace("{FUZZTEST_README}", if fuzz { VE_README_FUZZ } else { "" });
     // (file name, content, executable)
     let mut files: Vec<(&str, &str, bool)> = vec![
         ("CMakeLists.txt", &cmakelists, false),
         ("verification_tests.cc", VE_TESTS_CC, false),
         ("harvest_diff.h", VE_DIFF_H, false),
         ("rust_lib.h", VE_RUST_LIB_H, false),
-        ("README.md", &readme, false),
+        ("README.md", VE_README, false),
         ("build.sh", VE_BUILD_SH, true),
         ("run_tests.sh", VE_RUN_TESTS_SH, true),
         ("memory_scope.sh", VE_MEMORY_SCOPE_SH, false),
     ];
     if fuzz {
+        files.push(("README_fuzz.md", VE_README_FUZZ, false));
         files.push(("build_fuzz.sh", VE_BUILD_FUZZ_SH, true));
         files.push(("run_fuzz.sh", VE_RUN_FUZZ_SH, true));
     }
@@ -353,27 +402,6 @@ fn write_script(path: &Path, contents: &str) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// The rule of the gtest harness in the invariants of `HYPOTHESES.md` (see `method_gtest.md`).
-const GTEST_INVARIANT: &str = "- Run the GoogleTest binary only through `verify_env/run_tests.sh`, never\n  \
-     `build-test/verification_tests` directly.\n";
-
-/// The text of `HYPOTHESES.md`, with the placeholder of this tool filled in.
-fn hypotheses_md(gtest_harness: bool) -> String {
-    let harness = if gtest_harness { GTEST_INVARIANT } else { "" };
-    HYPOTHESES_MD.replace("{HARNESS_INVARIANT}", harness)
-}
-
-fn load_verify_prompt(config: &Config) -> String {
-    // The no-plan ablation prompt is libloading-only by construction (it
-    // predates the harness split); the harness/fuzz switch applies to the
-    // standard prompt.
-    if config.no_plan {
-        PROMPT_VERIFY_NO_PLAN.to_owned()
-    } else {
-        PROMPT_VERIFY.replace("{VERIFICATION_METHOD}", &build_method_section(config))
-    }
-}
-
 /// Comparison mechanism the verification prompt describes.
 #[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -402,10 +430,8 @@ pub struct Config {
     /// same format as `model`. If absent, the sub-agents use the main model.
     pub subagent_model: Option<String>,
 
-    /// If true, use the pre-anti-compaction prompt (no HYPOTHESES.md / Invariants
-    /// / sub-agent push) and skip the `--append-system-prompt` flag. Intended
-    /// for controlled experiments measuring the impact of the anti-compaction
-    /// mechanism added in 883e2e2.
+    /// If true, use the minimal baseline prompt: no hypothesis log, no surface files and no
+    /// sub-agent guidance. For controlled experiments that measure the effect of the plan prompt.
     #[serde(default)]
     pub no_plan: bool,
 
@@ -913,68 +939,222 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         case.finish();
     }
 
+    fn config(json: serde_json::Value) -> Config {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// Runs `check` on a case directory that holds the files of a run with `config`, as the tool
+    /// writes them.
+    fn with_stage_files(config: &Config, check: impl Fn(&CaseDir)) {
+        let case = CaseDir::new().unwrap();
+        let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
+        let env = HashMap::new();
+        let additional = additional_prompts(config);
+        agent_runner::prepare_agent(AgentInvocation {
+            phase: AgentPhase::Verify,
+            agent: AgentKind::Claude,
+            case: &case,
+            prompt: "",
+            timeout_secs: 1,
+            model: None,
+            subagent_model: None,
+            no_plan: config.no_plan,
+            teamclaude: true,
+            extra_env: &env,
+            output_log_path: None,
+            rust_toolchain: &toolchain,
+            additional_prompts: &additional,
+            stage_facts: &[],
+        })
+        .unwrap();
+        if !config.no_plan {
+            write_stage_files(&case).unwrap();
+        }
+        let prompt = if config.no_plan {
+            PROMPT_VERIFY_NO_PLAN.to_owned()
+        } else {
+            agent_runner::main_prompt(AgentPhase::Verify)
+        };
+        let name = format!(
+            "verify-plan_{}-{:?}-fuzz_{}",
+            !config.no_plan, config.verify_harness, config.fuzz
+        );
+        agent_runner::prompt_check::dump(&case, &name, &prompt, &["HYPOTHESES.md"]).unwrap();
+        check(&case);
+        case.finish();
+    }
+
+    /// The files that the reader of `entry` must read, without `entry`.
+    fn must_read(files: &agent_runner::prompt_check::PromptFiles, entry: &str) -> Vec<String> {
+        agent_runner::prompt_check::must_read(files, entry)
+            .into_iter()
+            .filter(|file| file != entry)
+            .collect()
+    }
+
     #[test]
-    fn every_prompt_carries_the_bug_workarounds() {
-        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
-            assert!(prompt.contains("{AGENT_BUG_WORKAROUNDS}"));
+    #[cfg_attr(miri, ignore)]
+    fn prompt_files_are_consistent_for_every_method() {
+        for (harness, fuzz, method) in [
+            ("gtest", true, &["method_gtest.md", "fuzztest.md"][..]),
+            ("gtest", false, &["method_gtest.md"][..]),
+            ("libloading", false, &["method_libloading.md"][..]),
+        ] {
+            let config = config(serde_json::json!({
+                "verify_harness": harness, "fuzz": fuzz, "tool_wishlist": true,
+            }));
+            with_stage_files(&config, |case| {
+                let inputs = case.inputs();
+                assert_eq!(
+                    agent_runner::prompt_check::problems(&inputs).unwrap(),
+                    [""; 0],
+                    "{harness} fuzz={fuzz}"
+                );
+                let files = agent_runner::prompt_check::load(&inputs).unwrap();
+                // Only the method files of this run are there, and run.md lists them.
+                for name in ["method_gtest.md", "method_libloading.md", "fuzztest.md"] {
+                    let on = method.contains(&name);
+                    assert_eq!(files.contains_key(&format!("verify/{name}")), on, "{name}");
+                    let listed = files["run.md"].contains(&format!("inputs/prompts/verify/{name}"));
+                    assert_eq!(listed, on, "{name}");
+                }
+            });
         }
     }
 
     #[test]
-    fn hypotheses_file_holds_the_invariants_and_the_prompt_has_no_template() {
-        for gtest in [false, true] {
-            let text = hypotheses_md(gtest);
-            assert!(text.contains("## Invariants") && text.contains("## Hypothesis log"));
-            assert_eq!(text.contains("verify_env/run_tests.sh"), gtest);
-            // Only shared placeholders are left: PreparedAgent::render fills them.
-            for placeholder in agent_runner::placeholders(&text) {
+    #[cfg_attr(miri, ignore)]
+    fn each_reader_must_read_the_files_of_its_rules() {
+        with_stage_files(&config(serde_json::json!({})), |case| {
+            let files = agent_runner::prompt_check::load(&case.inputs()).unwrap();
+            let subagent = [
+                "common.md",
+                "git_subagent.md",
+                "run.md",
+                "runtime.md",
+                "subagent.md",
+                "verify/verify_rules.md",
+            ];
+            assert_eq!(
+                must_read(&files, "verify/main.md"),
+                [
+                    "cargo_features.md",
+                    "common.md",
+                    "git_main.md",
+                    "main_agent.md",
+                    "run.md",
+                    "runtime.md",
+                    "verify/verify_rules.md"
+                ]
+            );
+            assert_eq!(must_read(&files, "verify/surface.md"), subagent);
+            assert_eq!(must_read(&files, "verify/reviewer.md"), subagent);
+            let mut fixer = vec!["cargo_features.md"];
+            fixer.extend(subagent);
+            assert_eq!(must_read(&files, "verify/fixer.md"), fixer);
+            // The generic boundaries have one copy, which the main agent and the method files name.
+            let boundaries = "generic boundaries of `inputs/prompts/verify/verify_rules.md`";
+            assert!(files["verify/verify_rules.md"].contains("## Generic boundaries"));
+            assert!(files["verify/main.md"].contains(boundaries));
+            assert!(files["verify/method_gtest.md"].contains("generic boundaries of"));
+            assert!(METHOD_LIBLOADING.1.contains("generic boundaries of"));
+            // The method files add to a role: they name no files to read first.
+            for part in ["verify/method_gtest.md", "verify/fuzztest.md"] {
+                assert_eq!(must_read(&files, part), [""; 0], "{part}");
+            }
+            // The main prompt names the role files.
+            for role in ["surface.md", "fixer.md", "reviewer.md"] {
                 assert!(
-                    [
-                        "{MODEL_LIMITS}",
-                        "{RUST_TOOLCHAIN_CONTEXT}",
-                        "{CASE_LAYOUT}",
-                        "{CARGO_FEATURES}",
-                        "{GIT_DISCIPLINE}",
-                    ]
-                    .contains(&placeholder),
-                    "{placeholder}"
+                    files["verify/main.md"].contains(&format!("inputs/prompts/verify/{role}")),
+                    "{role}"
                 );
             }
-        }
-        assert!(METHOD_GTEST.contains(GTEST_INVARIANT.trim_end()));
-        assert!(!PROMPT_VERIFY.contains("## Invariants ("));
-        assert!(PROMPT_VERIFY.contains("Read `HYPOTHESES.md` now"));
+        });
     }
 
     #[test]
-    fn every_prompt_has_the_tool_wishlist_placeholder() {
-        for prompt in [PROMPT_VERIFY, PROMPT_VERIFY_NO_PLAN] {
-            assert_eq!(prompt.matches("{TOOL_WISHLIST}").count(), 1);
-        }
-        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert!(!config.tool_wishlist);
+    #[cfg_attr(miri, ignore)]
+    fn hypotheses_file_holds_state_and_no_rules() {
+        with_stage_files(&config(serde_json::json!({})), |case| {
+            let path = case.workspace().join("HYPOTHESES.md");
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains("## Hypothesis log") && text.contains("### H<N>:"));
+            assert!(!text.contains("Invariants") && !text.contains("inputs/prompts"));
+            // A log of an earlier verification stays.
+            fs::write(&path, "earlier log").unwrap();
+            write_stage_files(case).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "earlier log");
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn no_plan_prompt_names_only_files_that_its_run_has() {
+        // The workflow hint is the one text that the tool puts into the prompt.
+        assert_eq!(
+            agent_runner::prompt_check::placeholders(PROMPT_VERIFY_NO_PLAN),
+            ["{WORKFLOW_HINT}"]
+        );
+        with_stage_files(&config(serde_json::json!({"no_plan": true})), |case| {
+            let inputs = case.inputs();
+            assert_eq!(
+                agent_runner::prompt_check::problems(&inputs).unwrap(),
+                [""; 0]
+            );
+            let files = agent_runner::prompt_check::load(&inputs).unwrap();
+            let named = agent_runner::prompt_check::references(PROMPT_VERIFY_NO_PLAN);
+            assert!(named.contains(&"common.md") && named.contains(&"git_main.md"));
+            for file in named {
+                assert!(files.contains_key(file), "{file}");
+            }
+            // No hypothesis log, no roles, and the method is in the prompt.
+            assert!(!files.keys().any(|name| name.starts_with("verify/")));
+            assert!(!case.workspace().join("HYPOTHESES.md").exists());
+        });
+    }
+
+    #[test]
+    fn main_prompt_only_names_the_prompt_file_of_the_stage() {
+        let prompt = agent_runner::main_prompt(AgentPhase::Verify);
+        assert_eq!(prompt.lines().count(), 2);
+        assert!(prompt.contains("inputs/prompts/verify/main.md"));
+    }
+
+    #[test]
+    fn tool_wishlist_is_off_by_default() {
+        assert!(!config(serde_json::json!({})).tool_wishlist);
     }
 
     #[test]
     fn fuzz_is_enabled_by_default() {
-        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        let config = config(serde_json::json!({}));
         assert!(config.fuzz);
-        assert!(build_method_section(&config).contains("FuzzTest"));
+        let files = additional_prompts(&config);
+        assert!(files.iter().any(|file| file.text.contains("FuzzTest")));
     }
 
     #[test]
-    fn disabled_fuzz_is_not_disclosed_in_builtin_prompts() {
+    #[cfg_attr(miri, ignore)]
+    fn disabled_fuzz_is_not_disclosed_to_the_agents() {
         for harness in ["gtest", "libloading"] {
-            for mode in ["standard", "no_plan"] {
-                let config: Config = serde_json::from_value(serde_json::json!({
-                    "fuzz": false, "verify_harness": harness,
-                    "no_plan": mode == "no_plan",
-                }))
-                .unwrap();
-                let prompt = load_verify_prompt(&config).to_ascii_lowercase();
-                for hint in ["fuzz", "coverage-guided", "property-based"] {
-                    assert!(!prompt.contains(hint), "{harness}/{mode} reveals {hint}");
-                }
+            for no_plan in [false, true] {
+                let config = config(serde_json::json!({
+                    "fuzz": false, "verify_harness": harness, "no_plan": no_plan,
+                }));
+                with_stage_files(&config, |case| {
+                    let mut texts = agent_runner::prompt_check::load(&case.inputs()).unwrap();
+                    texts.insert("the prompt".to_owned(), PROMPT_VERIFY_NO_PLAN.to_owned());
+                    texts.insert("HYPOTHESES.md".to_owned(), HYPOTHESES_MD.to_owned());
+                    for (name, text) in texts {
+                        let text = text.to_ascii_lowercase();
+                        for hint in ["fuzz", "coverage-guided", "property-based"] {
+                            assert!(
+                                !text.contains(hint),
+                                "{harness}/no_plan={no_plan}: {name} reveals {hint}"
+                            );
+                        }
+                    }
+                });
             }
         }
     }

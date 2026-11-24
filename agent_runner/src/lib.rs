@@ -11,6 +11,8 @@ pub mod case_dir;
 mod claude;
 mod opencode;
 mod prompt;
+#[cfg(any(test, feature = "test-support"))]
+pub mod prompt_check;
 mod skills;
 mod toolchain;
 
@@ -18,7 +20,7 @@ pub use case_dir::CaseDir;
 use claude::claude_uses_ccr;
 pub use claude::claude_uses_teamclaude;
 use prompt::RegistryLimits;
-pub use prompt::{SUBAGENT_RULES_FILE, fill_tool_wishlist, placeholders};
+pub use prompt::{AdditionalPrompt, PROMPTS_PATH, StageFact, main_prompt, tool_wishlist};
 pub use toolchain::{RustToolchainContext, detect_rust_toolchain_context, locate_test_corpus};
 
 #[derive(Debug, Clone, Copy)]
@@ -51,15 +53,34 @@ impl AgentPhase {
         }
     }
 
-    /// The persistent memory files the agent must re-read to recover after a
-    /// context compaction. Only meaningful when plan files are enabled.
-    fn recovery_files(self) -> &'static [&'static str] {
+    /// The directory of the stage's prompt files in `inputs/prompts/`.
+    pub fn prompt_dir(self) -> &'static str {
         match self {
+            AgentPhase::Translate => "translate",
+            AgentPhase::Verify => "verify",
+            AgentPhase::Quality => "quality",
+            AgentPhase::Conform => "conform",
+        }
+    }
+
+    /// The files that the main agent must read again after a context compaction: the rules of
+    /// every main agent, the prompt file of the stage, and the state files in the workspace.
+    /// Only meaningful when plan files are enabled.
+    fn recovery_files(self) -> Vec<String> {
+        let state: &[&str] = match self {
             AgentPhase::Translate => &["PLAN.md"],
             AgentPhase::Verify => &["PLAN.md", "HYPOTHESES.md"],
             AgentPhase::Quality => &["QUALITY.md"],
             AgentPhase::Conform => &["CONFORM.md"],
-        }
+        };
+        let rules = [
+            format!("{PROMPTS_PATH}/main_agent.md"),
+            format!("{PROMPTS_PATH}/{}/main.md", self.prompt_dir()),
+        ];
+        rules
+            .into_iter()
+            .chain(state.iter().map(|file| file.to_string()))
+            .collect()
     }
 }
 
@@ -70,9 +91,14 @@ pub struct AgentInvocation<'a> {
     pub agent: AgentKind,
     /// The run directory. The agent works in its workspace.
     pub case: &'a CaseDir,
-    /// The prompt template, with the placeholders of the tool filled in. [`PreparedAgent::run`]
-    /// fills the shared ones ([`PreparedAgent::render`]).
+    /// The prompt of the main agent: [`main_prompt`], or the whole task for a stage that runs
+    /// without plan files.
     pub prompt: &'a str,
+    /// The prompt files that the options of this run add for the main agent.
+    /// [`prepare_agent`] writes them, and `run.md` lists them.
+    pub additional_prompts: &'a [AdditionalPrompt],
+    /// The facts of the stage that `run.md` gives after the common ones.
+    pub stage_facts: &'a [StageFact<'a>],
     pub timeout_secs: u64,
     pub model: Option<&'a str>,
     pub subagent_model: Option<&'a str>,
@@ -84,10 +110,10 @@ pub struct AgentInvocation<'a> {
 }
 
 impl AgentInvocation<'_> {
-    /// Whether the prompt instructs the agent to maintain persistent plan
-    /// files (PLAN.md / HYPOTHESES.md). `no_plan` (no plan, no sub-agent push)
-    /// drops that instruction, so the per-turn "read PLAN.md after compaction"
-    /// system prompt must not be injected then.
+    /// Whether the main agent keeps a state file (PLAN.md, HYPOTHESES.md, QUALITY.md or
+    /// CONFORM.md). Without one (`no_plan`), nothing tells the agent what to read again after a
+    /// compaction, so the backends add no compaction-recovery text, and the run gets no
+    /// `main_agent.md`.
     fn plan_files_enabled(&self) -> bool {
         !self.no_plan
     }
@@ -117,10 +143,9 @@ pub fn effective_subagent_model<'a>(
     Ok(Some(sub))
 }
 
-/// An agent that is ready to run: its models are resolved and the rules file of the sub-agents
-/// is written. Between [`prepare_agent`] and [`PreparedAgent::run`], the tool writes its own
-/// files for the agents ([`PreparedAgent::render`] fills their shared placeholders) and locks the
-/// inputs ([`CaseDir::lock_inputs`]).
+/// An agent that is ready to run: its models are resolved and the prompt files that every stage
+/// gets are written. Before [`PreparedAgent::run`], the tool writes the prompt files of its stage
+/// ([`CaseDir::write_prompts`]) and locks the inputs ([`CaseDir::lock_inputs`]).
 pub struct PreparedAgent<'a> {
     invocation: AgentInvocation<'a>,
     limits: RegistryLimits,
@@ -128,9 +153,10 @@ pub struct PreparedAgent<'a> {
     routes: Vec<opencode::Route<'a>>,
 }
 
-/// Resolves the models of the stage and their registry limits, and writes
-/// `inputs/prompts/SUBAGENT_RULES.md` ([`SUBAGENT_RULES_FILE`]). Call it before
-/// [`CaseDir::lock_inputs`].
+/// Resolves the models of the stage and their registry limits, and writes the prompt files that
+/// every stage gets into `inputs/prompts/`: the shared rules, the additional prompt files of the
+/// run, and `run.md`, the facts of the run.
+/// Call it before [`CaseDir::lock_inputs`].
 pub fn prepare_agent(
     invocation: AgentInvocation<'_>,
 ) -> Result<PreparedAgent<'_>, Box<dyn std::error::Error>> {
@@ -160,12 +186,7 @@ pub fn prepare_agent(
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
         AgentKind::Claude => RegistryLimits::default(),
     };
-    let prompts = invocation.case.inputs().join("prompts");
-    fs::create_dir_all(&prompts)?;
-    fs::write(
-        prompts.join(SUBAGENT_RULES_FILE),
-        invocation.subagent_rules_file(&limits),
-    )?;
+    invocation.write_shared_prompts(&limits)?;
     Ok(PreparedAgent {
         invocation,
         limits,
@@ -174,18 +195,9 @@ pub fn prepare_agent(
 }
 
 impl PreparedAgent<'_> {
-    /// `text` with the shared placeholders filled in (see `AgentInvocation::render`): for the
-    /// task files and the plan files that the tool writes for the agents of this stage.
-    pub fn render(&self, text: &str) -> String {
-        self.invocation.render(text, &self.limits)
-    }
-
     /// Runs the agent on its prompt, to the end of the stage.
     pub fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        let prompt = self.render(self.invocation.prompt);
-        let mut invocation = self.invocation;
-        invocation.prompt = &prompt;
-        run_prepared(&invocation, &self.limits, &self.routes)
+        run_prepared(&self.invocation, &self.limits, &self.routes)
     }
 }
 
@@ -431,16 +443,22 @@ fn run_teed(
     child.wait()
 }
 
-/// The framework's `.gitignore` entries: build outputs, fuzz campaign data, scratch and worktrees
-/// stay untracked. A FuzzTest build installs its ANTLR runtime into `verify_env/dist`, outside
-/// its build directory. Of a fuzz campaign, git records only the `reproducers/`.
-const GITIGNORE_ENTRIES: [&str; 11] = [
+/// The framework's `.gitignore` entries: build outputs, scratch and worktrees stay untracked.
+const GITIGNORE_ENTRIES: [&str; 6] = [
     "target/",
     "build*/",
     "cbuild/",
     "scratch/",
     "wt/",
     ".opencode/",
+];
+
+/// More `.gitignore` entries, only for a workspace that has the FuzzTest scaffold of the verify
+/// stage ([`FUZZ_SCAFFOLD`]). A FuzzTest build installs its ANTLR runtime into `verify_env/dist`,
+/// outside its build directory. Of a fuzz campaign, git records only the `reproducers/`. A
+/// workspace without the scaffold does not get these entries: its `.gitignore` must not tell the
+/// agent about a mechanism that the run does not use.
+const FUZZ_GITIGNORE_ENTRIES: [&str; 5] = [
     "verify_env/dist/",
     "verify_env/clang-rt/",
     "verify_env/fuzz-artifacts/*/corpus/",
@@ -448,12 +466,24 @@ const GITIGNORE_ENTRIES: [&str; 11] = [
     "verify_env/fuzz-artifacts/*/exit_status",
 ];
 
+/// The file of the workspace that the FuzzTest scaffold always has.
+const FUZZ_SCAFFOLD: &str = "verify_env/run_fuzz.sh";
+
+/// The `.gitignore` entries that the workspace needs.
+fn gitignore_entries(work_dir: &Path) -> Vec<&'static str> {
+    let fuzz = work_dir.join(FUZZ_SCAFFOLD).exists();
+    GITIGNORE_ENTRIES
+        .into_iter()
+        .chain(FUZZ_GITIGNORE_ENTRIES.into_iter().filter(|_| fuzz))
+        .collect()
+}
+
 /// Adds the framework's `.gitignore` entries that an existing repository lacks: snapshots made
 /// before an entry was introduced (`scratch/`) would otherwise commit what it should hide.
 fn complete_gitignore(work_dir: &Path) -> std::io::Result<()> {
     let path = work_dir.join(".gitignore");
     let mut text = fs::read_to_string(&path).unwrap_or_default();
-    let missing: Vec<&str> = GITIGNORE_ENTRIES
+    let missing: Vec<&str> = gitignore_entries(work_dir)
         .into_iter()
         .filter(|entry| !text.lines().any(|line| line.trim() == *entry))
         .collect();
@@ -526,8 +556,8 @@ pub fn ensure_workdir_git(work_dir: &Path) {
         "config user.email",
     );
     let gitignore = format!(
-        "# Framework-written: build outputs, fuzz campaign data, scratch and worktrees stay untracked.\n{}\n",
-        GITIGNORE_ENTRIES.join("\n")
+        "# Framework-written: build outputs, scratch and worktrees stay untracked.\n{}\n",
+        gitignore_entries(work_dir).join("\n")
     );
     if let Err(e) = fs::write(work_dir.join(".gitignore"), gitignore) {
         warn!("failed to write .gitignore in {}: {e}", work_dir.display());
@@ -645,9 +675,7 @@ mod tests {
         let text = fs::read_to_string(dir.path().join(".gitignore")).expect("read");
         assert_eq!(
             text,
-            "# old\ntarget/\nwt/\nbuild*/\ncbuild/\nscratch/\n.opencode/\nverify_env/dist/\n\
-             verify_env/clang-rt/\nverify_env/fuzz-artifacts/*/corpus/\n\
-             verify_env/fuzz-artifacts/*/run.log\nverify_env/fuzz-artifacts/*/exit_status\n"
+            "# old\ntarget/\nwt/\nbuild*/\ncbuild/\nscratch/\n.opencode/\n"
         );
         ensure_workdir_git(dir.path());
         assert_eq!(
@@ -665,6 +693,7 @@ mod tests {
         // In the order of `git ls-files`.
         let recorded = [
             format!("{campaign}/reproducers/input"),
+            FUZZ_SCAFFOLD.to_owned(),
             "verify_env/verification_tests.cc".to_owned(),
         ];
         let products = [
@@ -678,6 +707,9 @@ mod tests {
         ];
         for old_gitignore in [None, Some("target/\nwt/\n")] {
             let dir = tempfile::tempdir().expect("tempdir");
+            // The workspace of a verify stage with FuzzTest: the scaffold is there first.
+            fs::create_dir_all(dir.path().join("verify_env")).expect("mkdir");
+            fs::write(dir.path().join(FUZZ_SCAFFOLD), "x").expect("write scaffold");
             ensure_workdir_git(dir.path());
             if let Some(text) = old_gitignore {
                 fs::write(dir.path().join(".gitignore"), text).expect("write gitignore");
