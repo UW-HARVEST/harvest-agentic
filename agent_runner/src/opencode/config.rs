@@ -5,7 +5,7 @@ use std::path::Path;
 use tracing::warn;
 
 use super::registry::{parse_opencode_model, run_opencode_models};
-use super::routing::Route;
+use super::routing::{self, Route};
 use crate::{AgentInvocation, CaseDir, agent_env, command_stdout};
 
 struct OpenCodeAgentConfig<'a> {
@@ -187,13 +187,15 @@ fn write_opencode_agent(
 /// has no model parameter, so the main agent cannot pick another one.
 fn opencode_project_config(case_root: &Path, options: &OpenCodeProjectOptions<'_>) -> String {
     let tempdir_pattern = format!("{}/**", case_root.display());
-    let provider_block = match opencode_provider_config(options.routes, options.staged_providers) {
-        Some(value) => format!(
-            ",\n  \"provider\": {}",
-            serde_json::to_string(&value).expect("provider block serializes to JSON"),
-        ),
-        None => String::new(),
-    };
+    let session_id = routing::session_id(case_root);
+    let provider_block =
+        match opencode_provider_config(options.routes, &session_id, options.staged_providers) {
+            Some(value) => format!(
+                ",\n  \"provider\": {}",
+                serde_json::to_string(&value).expect("provider block serializes to JSON"),
+            ),
+            None => String::new(),
+        };
     let agent_block = options
         .subagent_model
         .map(|sub| {
@@ -237,12 +239,12 @@ fn opencode_project_config(case_root: &Path, options: &OpenCodeProjectOptions<'_
 }
 
 /// The `provider` section for the run's models: the staged custom providers,
-/// then the OpenRouter routes. A route goes into the model options of a staged
-/// `openrouter` entry, so a user definition of the built-in provider stays in
-/// effect. A model without a route has no entry: OpenRouter's default routing
-/// applies.
+/// then the OpenRouter routes, with `session_id` as their sticky routing key.
+/// A route goes into the model options of a staged `openrouter` entry, so a
+/// user definition of the built-in provider stays in effect.
 fn opencode_provider_config(
     routes: &[Route<'_>],
+    session_id: &str,
     staged_providers: &[(String, serde_json::Value)],
 ) -> Option<serde_json::Value> {
     let mut providers: serde_json::Map<String, serde_json::Value> =
@@ -252,7 +254,10 @@ fn opencode_provider_config(
             .entry("openrouter")
             .or_insert_with(|| serde_json::json!({}));
         // Indexing a missing key adds it, as an object.
-        openrouter["models"][route.model_id]["options"]["provider"] = route.provider();
+        let options = &mut openrouter["models"][route.model_id]["options"];
+        for (key, value) in route.options(session_id) {
+            options[key.as_str()] = value;
+        }
     }
     (!providers.is_empty()).then_some(serde_json::Value::Object(providers))
 }
@@ -379,7 +384,7 @@ mod tests {
         );
         let routes = [Route {
             model_id: "xiaomi/mimo-v2.5-pro",
-            only: vec!["xiaomi"],
+            only: Some(vec!["xiaomi"]),
         }];
         for (routes, staged) in [
             (&[][..], &[][..]),
@@ -424,14 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn opencode_project_config_sets_openrouter_route() {
-        let case_root = Path::new("/tmp/.tmpAbc123");
-        let routes = [Route {
-            model_id: "deepseek/deepseek-v4-pro",
-            only: vec!["deepinfra/fp8", "fireworks"],
-        }];
+    fn opencode_project_config_sets_openrouter_routes() {
+        let routes = [
+            Route {
+                model_id: "deepseek/deepseek-v4-pro",
+                only: Some(vec!["deepinfra/fp8", "fireworks"]),
+            },
+            Route {
+                model_id: "z-ai/glm-5.3",
+                only: None,
+            },
+        ];
         let raw = opencode_project_config(
-            case_root,
+            Path::new("/tmp/.tmpAbc123"),
             &OpenCodeProjectOptions {
                 routes: &routes,
                 ..Default::default()
@@ -439,10 +449,16 @@ mod tests {
         );
         let config: serde_json::Value =
             serde_json::from_str(&raw).expect("project config must be valid JSON");
+        // Both models share the sticky routing key of the stage.
         assert_eq!(
-            config
-                .pointer("/provider/openrouter/models/deepseek~1deepseek-v4-pro/options/provider"),
-            Some(&serde_json::json!({ "only": ["deepinfra/fp8", "fireworks"] }))
+            config.pointer("/provider/openrouter/models"),
+            Some(&serde_json::json!({
+                "deepseek/deepseek-v4-pro": { "options": {
+                    "session_id": "harvest-tmpAbc123",
+                    "provider": { "only": ["deepinfra/fp8", "fireworks"] }
+                } },
+                "z-ai/glm-5.3": { "options": { "session_id": "harvest-tmpAbc123" } }
+            }))
         );
     }
 
@@ -474,7 +490,7 @@ mod tests {
     fn opencode_project_config_adds_route_to_staged_openrouter_entry() {
         let routes = [Route {
             model_id: "xiaomi/mimo-v2.5-pro",
-            only: vec!["xiaomi"],
+            only: Some(vec!["xiaomi"]),
         }];
         let raw = opencode_project_config(
             Path::new("/tmp/.tmpAbc123"),
@@ -497,7 +513,11 @@ mod tests {
         );
         assert_eq!(
             config.pointer("/provider/openrouter/models/xiaomi~1mimo-v2.5-pro/options"),
-            Some(&serde_json::json!({ "x": 1, "provider": { "only": ["xiaomi"] } }))
+            Some(&serde_json::json!({
+                "x": 1,
+                "session_id": "harvest-tmpAbc123",
+                "provider": { "only": ["xiaomi"] }
+            }))
         );
     }
 
@@ -519,7 +539,7 @@ mod tests {
                 Some(&serde_json::json!("openrouter/deepseek/deepseek-v4-flash"))
             );
         }
-        // No route: OpenRouter's default routing for both models.
+        // No route given: no provider block.
         assert!(config.get("provider").is_none());
         // Without a sub-agent model the sub-agents keep the main model.
         let raw = opencode_project_config(case_root, &Default::default());
@@ -531,7 +551,7 @@ mod tests {
     fn opencode_project_config_routes_openrouter_and_stages_custom_provider() {
         let routes = [Route {
             model_id: "xiaomi/mimo-v2.5-pro",
-            only: vec!["xiaomi"],
+            only: Some(vec!["xiaomi"]),
         }];
         let raw = opencode_project_config(
             Path::new("/tmp/.tmpAbc123"),

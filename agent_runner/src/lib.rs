@@ -147,11 +147,14 @@ pub fn prepare_agent(
         AgentKind::Claude => Vec::new(),
     };
     for route in &routes {
-        info!(
-            "OpenRouter route of {}: only {}",
-            route.model_id,
-            route.only.join(",")
-        );
+        match &route.only {
+            Some(only) => info!(
+                "OpenRouter route of {}: only {}",
+                route.model_id,
+                only.join(",")
+            ),
+            None => info!("OpenRouter route of {}: default routing", route.model_id),
+        }
     }
     let limits = match invocation.agent {
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,

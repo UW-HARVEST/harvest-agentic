@@ -100,7 +100,9 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   provider routing. To send its requests only to some providers, append
   `#<provider>[,<provider>...]` with the provider slugs from the model's
   provider list on OpenRouter, e.g.
-  `openrouter/deepseek/deepseek-v4-pro#deepinfra/fp8,fireworks`.
+  `openrouter/deepseek/deepseek-v4-pro#deepinfra/fp8,fireworks`. All requests
+  of a stage share one OpenRouter session, so each model stays on the
+  provider of its first request while that provider works.
 - The model's context/output limits are read from `opencode models --verbose`
   and injected into the prompt so the agent knows its real window.
 - After each run, all OpenCode sessions (including sub-agents) are exported
