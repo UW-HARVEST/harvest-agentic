@@ -40,6 +40,8 @@
 - Do NOT generate Rust from the C source with
   an external tool that these instructions do not name. This includes `c2rust`
   and other C-to-Rust transpilers.
+- The agents of this run write all of the Rust code. Do NOT copy Rust code
+  from outside your checkout, for example from another translation.
 - A `build.rs` is allowed for legitimate build-time needs (code generation,
   feature detection, etc.), but it must NOT reference, compile, or link any
   file under `inputs/c_src`.

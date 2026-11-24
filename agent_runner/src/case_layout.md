@@ -16,6 +16,10 @@ directory of the main agent, or the git worktree of a sub-agent.
 - `inputs` and `shared` are symbolic links that git tracks, so each git
   worktree has them. Do not delete, change or commit changes to them.
 - Build the C source out of tree: `cmake -S inputs/c_src -B scratch/<build name>`.
+- Read and write only in your checkout, `inputs/`, `shared/` and `scratch/`,
+  and the files that your tools use (compilers, system headers, the Rust
+  toolchain, the Cargo registry). Do not look elsewhere on the host for test
+  suites, graders, results or other translations.
 - `inputs/prompts/SUBAGENT_RULES.md` holds the rules that every sub-agent
   needs, with this section. Start the prompt of each sub-agent that you send
   with the line `Read inputs/prompts/SUBAGENT_RULES.md first.`, unless your
