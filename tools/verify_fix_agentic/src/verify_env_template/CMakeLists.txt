@@ -46,9 +46,14 @@ target_include_directories(c_under_test PUBLIC
 target_compile_definitions(c_under_test PRIVATE {C_COMPILE_DEFS})
 target_compile_options(c_under_test PRIVATE -w)
 
-add_executable(verification_tests verification_tests.cc)
+# The test files: verification_tests.cc and tests/*.cc of HARVEST_TEST_DIR
+# (see shared_build.sh).
+set(HARVEST_TEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "Directory of the test files")
+file(GLOB VERIFY_TEST_SOURCES CONFIGURE_DEPENDS "${HARVEST_TEST_DIR}/tests/*.cc")
+add_executable(verification_tests
+     "${HARVEST_TEST_DIR}/verification_tests.cc" ${VERIFY_TEST_SOURCES})
 target_include_directories(verification_tests PRIVATE
-     "${HARVEST_C_SRC}/include")
+     "${HARVEST_TEST_DIR}" "${HARVEST_C_SRC}/include")
 # The test framework links first, so its main() is the one the linker takes,
 # also when a C source file defines main() for the program's executable.
 {TEST_LINK}

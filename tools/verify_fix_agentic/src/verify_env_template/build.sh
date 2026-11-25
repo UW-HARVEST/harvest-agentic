@@ -8,11 +8,11 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$here"
+# shellcheck source=shared_build.sh
+source "$here/shared_build.sh"
 
-CC="${CC:-clang}" CXX="${CXX:-clang++}" cmake -S . -B build-test \
+CC="${CC:-clang}" CXX="${CXX:-clang++}" shared_build build-test \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build-test --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 
 echo
 echo "Built build-test/verification_tests"

@@ -26,13 +26,14 @@ const HYPOTHESES_MD: &str = include_str!("hypotheses_md.md");
 
 /// The prompt files of the stage, by their name in `inputs/prompts/verify/`: the main agent, the
 /// rules of the verification, and the sub-agent roles.
-const STAGE_FILES: [(&str, &str); 5] = [
+const STAGE_FILES: [(&str, &str); 6] = [
     ("main.md", include_str!("../prompts/main.md")),
     (
         "verify_rules.md",
         include_str!("../prompts/verify_rules.md"),
     ),
     ("surface.md", include_str!("../prompts/surface.md")),
+    ("tester.md", include_str!("../prompts/tester.md")),
     ("fixer.md", include_str!("../prompts/fixer.md")),
     ("reviewer.md", include_str!("../prompts/reviewer.md")),
 ];
@@ -67,6 +68,7 @@ const VE_RUN_FUZZ_SH: &str = include_str!("verify_env_template/run_fuzz.sh");
 const VE_RUN_FUZZ_ALL_PY: &str = include_str!("verify_env_template/run_fuzz_all.py");
 const VE_RUN_TESTS_SH: &str = include_str!("verify_env_template/run_tests.sh");
 const VE_MEMORY_SCOPE_SH: &str = include_str!("verify_env_template/memory_scope.sh");
+const VE_SHARED_BUILD_SH: &str = include_str!("verify_env_template/shared_build.sh");
 const VE_README: &str = include_str!("verify_env_template/README.md");
 
 /// The run scripts of verify_env (file name, text). They run the test binary and the fuzz
@@ -348,6 +350,7 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
         ("build.sh", VE_BUILD_SH, true),
         ("run_tests.sh", VE_RUN_TESTS_SH, true),
         ("memory_scope.sh", VE_MEMORY_SCOPE_SH, false),
+        ("shared_build.sh", VE_SHARED_BUILD_SH, false),
     ];
     if fuzz {
         files.push(("README_fuzz.md", VE_README_FUZZ, false));
@@ -581,7 +584,7 @@ exit 86
             assert!(output.status.success(), "{output:?}");
             assert_eq!(
                 fs::read_to_string(root.join("observed")).unwrap(),
-                "--fuzz=Suite.Property\n--fuzz_for=300s\n--rss_limit_mb=2048\n--time_limit_per_input=10s\n"
+                "--fuzz=Suite.Property\n--fuzz_for=120s\n--rss_limit_mb=2048\n--time_limit_per_input=10s\n"
             );
 
             fs::write(
@@ -665,7 +668,7 @@ exit 86
                 "MemoryMax=3072M",
                 "MemorySwapMax=0",
                 "--kill-after=5s",
-                "330s",
+                "150s",
             ] {
                 assert!(
                     args.lines().any(|arg| arg == expected),
@@ -1058,11 +1061,12 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
             );
             assert_eq!(must_read(&files, "verify/surface.md"), subagent);
             assert_eq!(must_read(&files, "verify/reviewer.md"), subagent);
+            assert_eq!(must_read(&files, "verify/tester.md"), subagent);
             let mut fixer = vec!["cargo_features.md"];
             fixer.extend(subagent);
             assert_eq!(must_read(&files, "verify/fixer.md"), fixer);
             // A role file names every file itself: a sub-agent does not follow a chain.
-            for role in ["surface.md", "fixer.md", "reviewer.md"] {
+            for role in ["surface.md", "tester.md", "fixer.md", "reviewer.md"] {
                 let not_listed =
                     agent_runner::prompt_check::not_listed(&files, &format!("verify/{role}"));
                 assert_eq!(not_listed, [""; 0], "{role}");
@@ -1078,7 +1082,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
                 assert_eq!(must_read(&files, part), [""; 0], "{part}");
             }
             // The main prompt names the role files.
-            for role in ["surface.md", "fixer.md", "reviewer.md"] {
+            for role in ["surface.md", "tester.md", "fixer.md", "reviewer.md"] {
                 assert!(
                     files["verify/main.md"].contains(&format!("inputs/prompts/verify/{role}")),
                     "{role}"

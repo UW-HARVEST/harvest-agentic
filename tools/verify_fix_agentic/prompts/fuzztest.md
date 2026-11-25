@@ -6,7 +6,8 @@ and each sub-agent whose task message names this file.
 This file adds to `inputs/prompts/verify/method_gtest.md`. Name it in the prompt of each sub-agent
 that writes or runs tests, and in the prompt of the reviewer. The fuzz coverage map and the item
 that this file adds to the completion gate are duties of the main agent. A sub-agent does only the
-part of this file that its task message gives.
+part of this file that its task message gives. A tester writes the `FUZZ_TEST`s of its part, and
+runs a campaign of each of them.
 
 `verify_env/` is also set up for FuzzTest,
 a property-based, coverage-guided fuzzing layer that runs on top of GoogleTest.
@@ -127,7 +128,8 @@ campaign:
 - Run one campaign with `verify_env/run_fuzz.sh Suite.Property`. Run two or more with
   `verify_env/run_fuzz_all.py` (see its `--help`), which runs them at the same time. Do not
   write your own loop of `run_fuzz.sh` calls.
-- `run_fuzz_all.py` chooses how many campaigns run at once. When that goes wrong (campaigns
+- `run_fuzz_all.py` chooses how many campaigns run at once. Start it without `--jobs`. When
+  that goes wrong (campaigns
   killed for memory, a very slow machine, or too few campaigns for the machine), set the number
   with `--jobs N` from the resources in `inputs/prompts/run.md` and in its output. Record N and
   the reason in HYPOTHESES.md.
@@ -149,9 +151,9 @@ campaign:
   Confirm it is a real campaign: the output must show `Corpus size` / `Edges covered` /
   `Total runs` climbing. If edges stay flat at the first value, the campaign is
   not making progress.
-- Let it run until coverage stops climbing meaningfully (edges plateau), not
-  just a token few seconds. A longer `FUZZ_DURATION_SECONDS` on the property covering the
-  most behavior is worth more than many one-second runs.
+- The standard duration of a campaign is the default of `run_fuzz.sh`. Give a property more
+  time when its edges still climb at the end, and record a shorter duration and its reason in
+  HYPOTHESES.md.
 - When a campaign finds a mismatch, save the printed reproducer as a fixed
   regression `TEST` when possible, and retain the file reproducer (printed
   values can be truncated). Fix the Rust. Then run that regression test, all unit tests, and

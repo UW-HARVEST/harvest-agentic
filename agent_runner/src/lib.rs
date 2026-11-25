@@ -472,10 +472,11 @@ const GITIGNORE_ENTRIES: [&str; 6] = [
 /// outside its build directory. Of a fuzz campaign, git records only the `reproducers/`. A
 /// workspace without the scaffold does not get these entries: its `.gitignore` must not tell the
 /// agent about a mechanism that the run does not use.
-const FUZZ_GITIGNORE_ENTRIES: [&str; 5] = [
+const FUZZ_GITIGNORE_ENTRIES: [&str; 6] = [
     "verify_env/dist/",
     "verify_env/clang-rt/",
     "verify_env/fuzz-artifacts/*/corpus/",
+    "verify_env/fuzz-artifacts/*/cwd/",
     "verify_env/fuzz-artifacts/*/run.log",
     "verify_env/fuzz-artifacts/*/exit_status",
 ];

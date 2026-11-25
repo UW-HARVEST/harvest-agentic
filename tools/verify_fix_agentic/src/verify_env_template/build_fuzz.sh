@@ -11,12 +11,12 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$here"
+# shellcheck source=shared_build.sh
+source "$here/shared_build.sh"
 
-CC=clang CXX=clang++ cmake -S . -B build-fuzz \
+CC=clang CXX=clang++ shared_build build-fuzz \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DFUZZTEST_FUZZING_MODE=ON
-cmake --build build-fuzz --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 
 echo
 echo "Built build-fuzz/verification_tests"

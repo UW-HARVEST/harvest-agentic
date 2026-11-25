@@ -17,8 +17,10 @@ RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
   ./verify_env/run_fuzz.sh Suite.Property
 ```
 
-The runner preserves your working directory and runs one property. Each campaign has its own
-memory budget. Adjust the defaults in the
+The runner runs one property. The campaign runs in a new directory that links every entry of
+your working directory, so project-relative paths work. A new file that the campaign creates at
+the top level stays out of the project; a write into an existing file or into a subdirectory
+reaches the project. Each campaign has its own memory budget. Adjust the defaults in the
 configuration block at the top of `verify_env/run_fuzz.sh`, or override them
 for one invocation:
 
@@ -31,7 +33,7 @@ FUZZ_DURATION_SECONDS=30 RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
 |---------|---------|---------|
 | `FUZZ_RSS_LIMIT_MB` | `2048` | FuzzTest's per-process RSS soft limit in MiB |
 | `FUZZ_HARD_LIMIT_MB` | `3072` | Campaign cgroup memory limit in MiB, with swap disabled |
-| `FUZZ_DURATION_SECONDS` | `300` | Time budget for this property |
+| `FUZZ_DURATION_SECONDS` | `120` | Time budget for this property |
 | `FUZZ_INPUT_TIMEOUT_SECONDS` | `10` | Time limit for each property invocation |
 
 FuzzTest detects an exceeded RSS limit and aborts; it can overshoot before the
@@ -84,5 +86,5 @@ rules of the automatic choice, and the output files.
 
 ```bash
 RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
-  ./verify_env/run_fuzz_all.py --seconds 120 Suite.PropA Suite.PropB=300
+  ./verify_env/run_fuzz_all.py Suite.PropA Suite.PropB=300
 ```

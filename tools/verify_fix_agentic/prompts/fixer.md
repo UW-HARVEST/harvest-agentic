@@ -39,7 +39,10 @@ Your task message gives:
    that claims behavior is worse than a missing entry.
 5. Build the crate (`cargo build --release`). When your task names the method prompt files, run
    the test that shows the problem, in the way that they tell, until it passes.
-6. When your task gives you a git worktree, commit your work on its branch.
+6. Compare C and Rust on more inputs of the same feature, not only the input of the problem:
+   other modes, options and edge values of the functions that you changed. A bug often has
+   neighbors. Fix the divergences that you find in the same way, and report them.
+7. When your task gives you a git worktree, commit your work on its branch.
 
 ## Reply
 
@@ -47,5 +50,6 @@ Reply with only these items:
 
 - the files and functions that you changed,
 - the cause of the problem, in one or two sentences,
+- the other inputs of the feature that you compared, and the divergences that you found,
 - the result of the build, and of each test that you ran,
 - the items that are not fixed, each with the reason ("none" when all are fixed).

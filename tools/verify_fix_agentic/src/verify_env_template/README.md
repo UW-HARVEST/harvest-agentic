@@ -17,13 +17,15 @@ against the translated Rust, for each kind of public surface the program has:
   `C_UNDER_TEST_SOURCES` if a C file (for example the one with `main()`) does
   not belong to the library.
 - `verification_tests.cc` — the test file you write. Declare the C functions in
-  the `extern "C"` block; resolve the Rust ones via `harvest::RustLib`.
+  the `extern "C"` block; resolve the Rust ones via `harvest::RustLib`. More test
+  files go in `tests/*.cc`; the build picks them up.
 - `harvest_diff.h` — differential-comparison helpers: buffer fill pattern and
   normalized observation struct for library calls; `Run` and `RunBoth` for
   executable runs.
 - `rust_lib.h` — loads the translated `.so` (path from `RUST_LIB_PATH`) with
   `RTLD_LOCAL` and resolves symbols.
-- `build.sh` — build in unit-test mode.
+- `build.sh` — build in unit-test mode, into `build-test/`. A git worktree
+  builds with the `CMakeLists.txt` of the main checkout (see `shared_build.sh`).
 - `run_tests.sh` — run the test binary with memory and time limits. Use it for
   every test run.
 - `memory_scope.sh` — the memory cgroup launcher that the run scripts share.

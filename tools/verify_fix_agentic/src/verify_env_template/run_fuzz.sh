@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Run one property with the budgets below. Preserve the caller's
-# working directory: some differential tests use project-relative paths.
+# Run one property with the budgets below, in a directory of links to the
+# caller's working directory (see README_fuzz.md).
 set -euo pipefail
 
 # Campaign defaults: edit here, or override in the environment for one run.
 # Record budget increases and their reason in HYPOTHESES.md.
 FUZZ_RSS_LIMIT_MB="${FUZZ_RSS_LIMIT_MB:-2048}"       # Per-process soft RSS, MiB.
 FUZZ_HARD_LIMIT_MB="${FUZZ_HARD_LIMIT_MB:-3072}"     # cgroup memory, MiB; no swap.
-FUZZ_DURATION_SECONDS="${FUZZ_DURATION_SECONDS:-300}"
+FUZZ_DURATION_SECONDS="${FUZZ_DURATION_SECONDS:-120}"
 FUZZ_INPUT_TIMEOUT_SECONDS="${FUZZ_INPUT_TIMEOUT_SECONDS:-10}"
 # The hard limit needs systemd-run --user/cgroup v2. Set it explicitly to 0
 # only when an external container/cgroup already bounds the campaign.
@@ -43,7 +43,10 @@ memory_scope_launcher "$FUZZ_HARD_LIMIT_MB" FUZZ_HARD_LIMIT_MB || exit 2
 
 mkdir -p "$here/fuzz-artifacts"
 artifacts="$(mktemp -d "$here/fuzz-artifacts/${property}.XXXXXX")"
-mkdir -p "$artifacts/reproducers" "$artifacts/corpus"
+mkdir -p "$artifacts/reproducers" "$artifacts/corpus" "$artifacts/cwd"
+trap 'rm -rf "$artifacts/cwd"' EXIT
+trap 'exit 143' TERM INT HUP
+find "$PWD" -mindepth 1 -maxdepth 1 -exec ln -s -t "$artifacts/cwd" {} +
 export RUST_LIB_PATH
 export FUZZTEST_REPRODUCERS_OUT_DIR="$artifacts/reproducers"
 export FUZZTEST_TESTSUITE_OUT_DIR="$artifacts/corpus"
@@ -57,7 +60,7 @@ command=("${MEMORY_SCOPE[@]}" timeout --kill-after=5s
 {
   echo "Budgets: RSS=${FUZZ_RSS_LIMIT_MB}MiB, cgroup=${FUZZ_HARD_LIMIT_MB}MiB, duration=${FUZZ_DURATION_SECONDS}s, input=${FUZZ_INPUT_TIMEOUT_SECONDS}s"
   echo "Adjust defaults at the top of: $here/run_fuzz.sh"
-  echo "Working directory: $PWD"
+  echo "Working directory: $artifacts/cwd (links to $PWD)"
   echo "Rust library: $RUST_LIB_PATH"
   echo "Artifacts: $artifacts"
   # Keep the recorded invocation readable; the memory guard above is fixed
@@ -66,7 +69,7 @@ command=("${MEMORY_SCOPE[@]}" timeout --kill-after=5s
 } | tee "$artifacts/run.log"
 
 set +e
-"${command[@]}" 2>&1 | tee -a "$artifacts/run.log"
+(cd "$artifacts/cwd" && "${command[@]}") 2>&1 | tee -a "$artifacts/run.log"
 statuses=("${PIPESTATUS[@]}")
 set -e
 status="${statuses[0]}"

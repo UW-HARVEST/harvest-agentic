@@ -18,4 +18,4 @@ Format per entry:
 ## Reviews
 
 One line for each final cross-review:
-- Review <N>: <B> blocking, <M> notes. Open notes: <the notes that you did not resolve, or none>
+- Review <N>: <B> blocking, <M> notes. Open: <the findings that you did not resolve, or none>

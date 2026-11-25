@@ -36,11 +36,9 @@ Then do the actual verification:
    Look at the C headers to identify the public API and function call hierarchy.
 4. For each function: create fixed test inputs, call both C and Rust versions,
    assert outputs match byte-for-byte.
-5. Cover every row of the surface files from Step 2. Each `CONFIGS.md` row
-   gets a differential test, and each `ERRORS.md` row gets a rejection test.
-   The rejection test asserts that both sides give the same error code,
-   sentinel value, or exit status and message, not only that both sides fail. Also test the
-   generic boundaries of `inputs/prompts/verify/verify_rules.md`.
+5. Cover every row of the surface files from Step 2 ("Surface rows" of
+   `inputs/prompts/verify/verify_rules.md`). Also test the generic boundaries of
+   `inputs/prompts/verify/verify_rules.md`.
 6. Run `cargo test` and investigate any mismatches. Every time a test exposes a
    divergence, append a hypothesis to `HYPOTHESES.md`.
 7. When you find a Rust function that produces different output than C, fix the

@@ -22,7 +22,8 @@ sides and compares the observable result with GoogleTest assertions:
 
 - `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `inputs/c_src` into the test
   binary, links everything, and registers the tests. You normally do not edit it.
-- `verification_tests.cc` — the test file you write and extend.
+- `verification_tests.cc` and `tests/*.cc` — the test files you write and extend. Each tester
+  writes its own file in `tests/`.
 - `harvest_diff.h` — helpers for differential comparison. For library calls:
   `FilledBuffer` (0xA5 pre-fill to expose short/uninitialized writes),
   `FirstDifference`/`HexDump`/`Explain` (attach `<< harvest::Explain(c, rust)`
@@ -34,7 +35,8 @@ sides and compares the observable result with GoogleTest assertions:
 - `rust_lib.h` — loads the translated Rust `.so` (path from `RUST_LIB_PATH`) with
   `dlopen(..., RTLD_LOCAL)` so its symbols never collide with the statically
   linked C reference of the same name, and resolves functions with `dlsym`.
-- `build.sh` — configures and builds the test binary.
+- `build.sh` — configures and builds the test binary. It uses the `CMakeLists.txt` of the main
+  checkout, also in a git worktree: change `CMakeLists.txt` in the main checkout.
 - `run_tests.sh` — runs the test binary with memory and time limits.
   GoogleTest flags such as `--gtest_filter` go after the script name.
 - `README.md` — exact build/run commands and pointers.
@@ -99,16 +101,13 @@ Then do the actual verification:
    against how `inputs/c_src` is actually built and fix it if it differs. Tell-tale
    symptoms of a misbuilt oracle: a symbol you expect is missing, or every test
    fails together in lock-step.
-2. Write GoogleTest cases in `verify_env/verification_tests.cc` that run the
-   C reference and the Rust translation on the same inputs and assert the results
+2. Write GoogleTest cases in `verify_env/verification_tests.cc` and `verify_env/tests/*.cc` that
+   run the C reference and the Rust translation on the same inputs and assert the results
    match byte-for-byte. A fixture (`TEST_F`) is the natural place to hold a
    library context across an `init -> configure -> call -> observe -> destroy`
    sequence, with a fresh context per test.
-3. Cover every row of the surface files from Step 2. Each `CONFIGS.md` row
-   gets a differential test, and each `ERRORS.md` row gets a rejection test.
-   The rejection test asserts that both sides give the same error code,
-   sentinel value, or exit status and message, not only that both sides
-   fail. Also test the generic boundaries of
+3. Cover every row of the surface files from Step 2 ("Surface rows" of
+   `inputs/prompts/verify/verify_rules.md`). Also test the generic boundaries of
    `inputs/prompts/verify/verify_rules.md`. Library code that only the
    executable registers (built-in commands or functions) is covered through
    the executable.

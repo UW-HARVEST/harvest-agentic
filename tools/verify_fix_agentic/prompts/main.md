@@ -43,6 +43,7 @@ whenever you are unsure — do not work from memory.
 | Role | Prompt file | When |
 |---|---|---|
 | surface | `inputs/prompts/verify/surface.md` | Step 2: writes one surface file, or does the cfg completeness check |
+| tester | `inputs/prompts/verify/tester.md` | Step 3: writes the tests of one part of the surface files |
 | fixer | `inputs/prompts/verify/fixer.md` | each fix of the Rust code: a divergence, or a missing entry of `SYMBOLS.md` |
 | reviewer | `inputs/prompts/verify/reviewer.md` | the completion gate: the final cross-review |
 
@@ -178,14 +179,9 @@ sub-agent (a fixer) to resolve it (add the export or the wiring, or translate th
 missing C source). Do not stub a missing entry to empty the diff. A stub
 that claims behavior is worse than a missing entry.
 
-Step 3 tells you how to test. Every `CONFIGS.md` row gets a differential test
-on valid inputs, and every `ERRORS.md` row gets a rejection test. Also test
-the generic boundaries of `inputs/prompts/verify/verify_rules.md`.
-
-A row you cannot test stays in the table, unchecked, with a note. The note
-carries evidence: an experiment that did not trigger the row, or a premise
-from `CONDITIONALS.md` that shows the branch is inactive. A judgment made
-from reading alone is not evidence.
+Step 3 tests the rows ("Surface rows" of `inputs/prompts/verify/verify_rules.md`) and the
+generic boundaries of `inputs/prompts/verify/verify_rules.md`. The notes of the rows that cannot
+be tested are yours: write them from the replies of the testers.
 
 ## Step 3: Test and fix
 
@@ -193,6 +189,22 @@ The method prompt file of this run tells how you build both sides, where you wri
 how you run them. `inputs/prompts/run.md` lists it with the additional prompt files for the main
 agent. Do what it tells. Name the method prompt files of this run in the prompt of each sub-agent
 that builds or runs tests.
+
+Give the writing of the tests to tester sub-agents. Split the rows of `CONFIGS.md` and
+`ERRORS.md` into parts, for example by entry point or by area, and send one tester for each part,
+in parallel, each in its own git worktree. Do not write the tests yourself: your context is for
+the hypotheses and the results. Send a tester with this prompt:
+
+```
+Read inputs/prompts/verify/tester.md and do the task in it.
+Checkout: <wt/<name> (branch <name>)>.
+Your part: <the rows of CONFIGS.md and ERRORS.md>.
+Test file: <a new file name for the tests of this part>.
+More prompt files: <the method prompt files of this run>.
+```
+
+Merge the branch of each tester. Log each divergence that a tester or a fixer reports as a
+hypothesis, and send it to a fixer.
 
 ## Completion gate
 
@@ -207,7 +219,8 @@ list after your last fix.
       test maps back to a row or a logged hypothesis, that every
       `confirmed` or `fixed` hypothesis has a passing test, and that every
       unchecked-row note carries evidence. The last review reported no
-      blocking finding.
+      blocking finding, or the third review is done and `Reviews` records its
+      open blocking findings.
 
 The reviewer marks each finding as blocking or as a note (`reviewer.md` tells which is which).
 After a review:
@@ -216,14 +229,17 @@ After a review:
   `HYPOTHESES.md`, under the heading `Reviews`. After a compaction, this tells which review
   comes next.
 - Fix each blocking finding, and send the reviewer again.
-- Resolve the note findings of the first two reviews. From the third review on, do not work on
-  note findings: write them under `Reviews` as open notes.
-- Finish when a review reports no blocking finding. Do not send the reviewer again only for
-  note findings.
+- Resolve the note findings of the first two reviews. Do not work on the note findings of the
+  third review: write them under `Reviews` as open notes.
+- Finish when a review reports no blocking finding, or after the third review. After the
+  third review, fix the blocking findings that you can, and write the others under `Reviews` as
+  open blocking findings, with the reason. Do not send the reviewer again only for note
+  findings.
 
 Send the reviewer with this prompt:
 
 ```
 Read inputs/prompts/verify/reviewer.md and do the task in it.
 More prompt files: <the method prompt files of this run>.
+Notes of the earlier reviews: <list, or "none">.
 ```
