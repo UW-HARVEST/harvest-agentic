@@ -39,10 +39,26 @@ Rules:
    premise in `CONDITIONALS.md`. Reading alone is not evidence.
 5. The items that the method prompt files add to the completion gate.
 
+## Blocking findings and notes
+
+Mark each finding as blocking or as a note.
+
+A finding is blocking when it shows that the Rust can be wrong, or that a fix is not proven:
+
+- a hypothesis with the status `confirmed` or `fixed` has no test, or its test fails;
+- a row of `CONFIGS.md` or `ERRORS.md` has no test and no unchecked-row note;
+- a test fails;
+- you ran an experiment, and C and Rust give different results;
+- an item that the method prompt files add to the completion gate is not done.
+
+All other findings are notes. Examples: a test that does not map back to a row, an
+unchecked-row note without enough evidence, a wrong reference in a surface file.
+
 ## Reply
 
 Reply with a list of findings. Give each finding:
 
+- `blocking` or `note`,
 - the check number,
 - the row, the test or the hypothesis,
 - what is wrong, in one or two sentences.

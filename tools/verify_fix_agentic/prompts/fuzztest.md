@@ -124,11 +124,18 @@ Two build modes (use separate build directories — do not toggle the flag in pl
 Running discipline — a `FUZZ_TEST` is not exercised until you run a real
 campaign:
 
-- Run fuzz campaigns through `verify_env/run_fuzz.sh Suite.Property`, one at a
-  time. Adjust budgets in the configuration block at the top of that script
+- Run one campaign with `verify_env/run_fuzz.sh Suite.Property`. Run two or more with
+  `verify_env/run_fuzz_all.py` (see its `--help`), which runs them at the same time. Do not
+  write your own loop of `run_fuzz.sh` calls.
+- `run_fuzz_all.py` chooses how many campaigns run at once. When that goes wrong (campaigns
+  killed for memory, a very slow machine, or too few campaigns for the machine), set the number
+  with `--jobs N` from the resources in `inputs/prompts/run.md` and in its output. Record N and
+  the reason in HYPOTHESES.md.
+- Adjust budgets in the configuration block at the top of `run_fuzz.sh`
   or through its environment variables. The main agent records the effective budgets, the
   changes and the reasons in HYPOTHESES.md. A sub-agent reports them in its reply. Do not bypass
-  resource limits to make an OOM disappear.
+  resource limits to make an OOM disappear. Set `FUZZ_HARD_LIMIT_MB=0` only in the case that
+  `verify_env/README_fuzz.md` gives: an outside container or cgroup already limits the memory.
 - OOM, timeout, signal termination, or a failed launcher is an incomplete
   campaign. Keep the log and file reproducer under
   `verify_env/fuzz-artifacts/`. See `verify_env/README_fuzz.md` for execution details.
@@ -138,7 +145,7 @@ campaign:
   structured or rare-shaped input. Do not treat "the test binary passed" as
   "the property was fuzzed".
 - For each property worth fuzzing, run at least one fuzzing-mode campaign
-  (`build_fuzz.sh`, then `run_fuzz.sh Suite.Prop`).
+  (`build_fuzz.sh`, then `run_fuzz.sh Suite.Prop` or `run_fuzz_all.py`).
   Confirm it is a real campaign: the output must show `Corpus size` / `Edges covered` /
   `Total runs` climbing. If edges stay flat at the first value, the campaign is
   not making progress.
@@ -147,8 +154,14 @@ campaign:
   most behavior is worth more than many one-second runs.
 - When a campaign finds a mismatch, save the printed reproducer as a fixed
   regression `TEST` when possible, and retain the file reproducer (printed
-  values can be truncated). Fix the Rust, then re-run BOTH that regression
-  test and the campaign.
+  values can be truncated). Fix the Rust. Then run that regression test, all unit tests, and
+  the campaign of that property again. Do not run all campaigns again after each fix.
+- When you have no more fixes to make, run the whole `fuzz` column once more, with one
+  `run_fuzz_all.py` run on the current build. This is the final full run. Do it one time only.
+  When it finds a mismatch, fix it as above: the campaign of that property runs again, and the
+  other properties do not.
+- A new or changed `FUZZ_TEST` (its property, domains or seeds) needs a campaign of its own. A
+  change that adds only a fixed `TEST` or a note does not need a campaign.
 
 Fuzz coverage map — add a `fuzz` column to `CONFIGS.md`. For each row that
 names a mode, flag, enum value, or route, write the `Suite.Property` that
@@ -160,6 +173,8 @@ In fuzzing mode, the completion gate has one more item:
 
 - [ ] Each property in the `fuzz` column ran a fuzzing-mode campaign. The
       review sub-agent read its code and confirmed that it covers its rows.
+- [ ] The final full run of the `fuzz` column was done. Each property that failed in it
+      passed in a campaign of its own after its fix.
 
 Coverage guidance comes from the C reference (it is the instrumented side); the
 Rust translation is executed as a black box on every input, so any normalized

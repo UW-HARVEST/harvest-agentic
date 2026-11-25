@@ -206,8 +206,20 @@ list after your last fix.
       four surface files. It checked that every row has a test, that every
       test maps back to a row or a logged hypothesis, that every
       `confirmed` or `fixed` hypothesis has a passing test, and that every
-      unchecked-row note carries evidence. You resolved what it reported
-      before finishing.
+      unchecked-row note carries evidence. The last review reported no
+      blocking finding.
+
+The reviewer marks each finding as blocking or as a note (`reviewer.md` tells which is which).
+After a review:
+
+- Write the number of the review and the number of its blocking and note findings in
+  `HYPOTHESES.md`, under the heading `Reviews`. After a compaction, this tells which review
+  comes next.
+- Fix each blocking finding, and send the reviewer again.
+- Resolve the note findings of the first two reviews. From the third review on, do not work on
+  note findings: write them under `Reviews` as open notes.
+- Finish when a review reports no blocking finding. Do not send the reviewer again only for
+  note findings.
 
 Send the reviewer with this prompt:
 

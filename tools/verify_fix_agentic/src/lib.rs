@@ -64,6 +64,7 @@ const VE_RUST_LIB_H: &str = include_str!("verify_env_template/rust_lib.h");
 const VE_BUILD_SH: &str = include_str!("verify_env_template/build.sh");
 const VE_BUILD_FUZZ_SH: &str = include_str!("verify_env_template/build_fuzz.sh");
 const VE_RUN_FUZZ_SH: &str = include_str!("verify_env_template/run_fuzz.sh");
+const VE_RUN_FUZZ_ALL_PY: &str = include_str!("verify_env_template/run_fuzz_all.py");
 const VE_RUN_TESTS_SH: &str = include_str!("verify_env_template/run_tests.sh");
 const VE_MEMORY_SCOPE_SH: &str = include_str!("verify_env_template/memory_scope.sh");
 const VE_README: &str = include_str!("verify_env_template/README.md");
@@ -352,6 +353,7 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
         files.push(("README_fuzz.md", VE_README_FUZZ, false));
         files.push(("build_fuzz.sh", VE_BUILD_FUZZ_SH, true));
         files.push(("run_fuzz.sh", VE_RUN_FUZZ_SH, true));
+        files.push(("run_fuzz_all.py", VE_RUN_FUZZ_ALL_PY, true));
     }
     for (name, text, executable) in files {
         if executable {
@@ -939,6 +941,7 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
         assert!(!cml.contains("GTest::gtest_main"));
         assert!(workspace.join("verify_env/build_fuzz.sh").exists());
         assert!(workspace.join("verify_env/run_fuzz.sh").exists());
+        assert!(workspace.join("verify_env/run_fuzz_all.py").exists());
         assert!(workspace.join("verify_env/run_tests.sh").exists());
         assert!(workspace.join("verify_env/memory_scope.sh").exists());
         case.finish();

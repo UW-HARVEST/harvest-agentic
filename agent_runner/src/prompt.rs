@@ -128,7 +128,11 @@ impl AgentInvocation<'_> {
     /// (with the rules of every main agent only when the run has a state file), the known
     /// problems of the agent runtime, the additional prompt files of the run, and `run.md`, which
     /// lists them.
-    pub(crate) fn write_shared_prompts(&self, limits: &RegistryLimits) -> io::Result<()> {
+    pub(crate) fn write_shared_prompts(
+        &self,
+        limits: &RegistryLimits,
+        shared_limit: bool,
+    ) -> io::Result<()> {
         let dir = self.case.prompts();
         fs::create_dir_all(&dir)?;
         let main_agent = self.plan_files_enabled().then_some(MAIN_AGENT_FILE);
@@ -141,13 +145,14 @@ impl AgentInvocation<'_> {
             fs::create_dir_all(path.parent().expect("a file has a parent"))?;
             fs::write(path, file.text)?;
         }
-        fs::write(dir.join(RUN_FILE), self.run_file(limits))
+        fs::write(dir.join(RUN_FILE), self.run_file(limits, shared_limit))
     }
 
     /// The text of `run.md`: the stage, the agent runtime, the models and their limits, the Rust
     /// toolchain, the additional prompt files of the run, and the facts of the stage. Facts only:
     /// the prompt files say how to use them.
-    pub(crate) fn run_file(&self, limits: &RegistryLimits) -> String {
+    /// `shared_limit`: the agent commands run under the shared memory limit of `agent_env`.
+    pub(crate) fn run_file(&self, limits: &RegistryLimits, shared_limit: bool) -> String {
         let runtime = match self.agent {
             AgentKind::Claude => "Claude Code",
             AgentKind::OpenCode => "OpenCode",
@@ -204,6 +209,10 @@ impl AgentInvocation<'_> {
             format!("- Detected rustc: `{}`", toolchain.rustc_version),
             format!("- Detected cargo: `{}`", toolchain.cargo_version),
             String::new(),
+            "## Machine resources".to_owned(),
+            String::new(),
+            machine_resources(shared_limit),
+            String::new(),
             "## Additional prompt files for the main agent".to_owned(),
             String::new(),
             "A sub-agent reads one of these files only when its task message names the file."
@@ -227,6 +236,41 @@ impl AgentInvocation<'_> {
         }
         lines.join("\n") + "\n"
     }
+}
+
+/// The `run.md` section on the CPUs and the memory of the machine, measured now.
+fn machine_resources(shared_limit: bool) -> String {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let gib = |key: &str| {
+        meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |kib| format!("{:.1} GiB", kib as f64 / (1024.0 * 1024.0)),
+            )
+    };
+    format!(
+        "These values were measured when the stage started. Other runs can use the same machine \
+         at the same time, so the free part changes during the stage.\n\n\
+         - CPUs available to the agent commands: {cpus}\n\
+         - Memory: {} in total, {} available at the start of the stage; swap: {}\n\
+         - {}",
+        gib("MemTotal"),
+        gib("MemAvailable"),
+        gib("SwapTotal"),
+        if shared_limit {
+            format!(
+                "All harvest agent commands on this machine share one limit: {}. The commands \
+                 of other runs count against it too.",
+                crate::agent_env::shared_limits()
+            )
+        } else {
+            "The agent commands run without a shared memory limit.".to_owned()
+        }
+    )
 }
 
 /// The two limit lines of a model in `run.md`: the registry values, or the defaults. With
@@ -322,7 +366,7 @@ mod tests {
         for agent in [AgentKind::Claude, AgentKind::OpenCode] {
             with_invocation(agent, None, true, |invocation| {
                 invocation
-                    .write_shared_prompts(&RegistryLimits::default())
+                    .write_shared_prompts(&RegistryLimits::default(), true)
                     .unwrap();
                 let inputs = invocation.case.inputs();
                 // The additional prompt files are written where run.md names them.
@@ -374,10 +418,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn a_run_without_options_lists_no_additional_file() {
         with_invocation(AgentKind::Claude, None, false, |off| {
-            off.write_shared_prompts(&RegistryLimits::default())
+            off.write_shared_prompts(&RegistryLimits::default(), true)
                 .unwrap();
             assert!(!off.case.prompts().join("tool_wishlist.md").exists());
-            let run = off.run_file(&RegistryLimits::default());
+            let run = off.run_file(&RegistryLimits::default(), true);
             assert!(run.contains("## Additional prompt files for the main agent"));
             assert!(run.contains("\nNone.\n"), "{run}");
         });
@@ -407,7 +451,7 @@ mod tests {
             stage_facts: &[],
         };
         invocation
-            .write_shared_prompts(&RegistryLimits::default())
+            .write_shared_prompts(&RegistryLimits::default(), true)
             .unwrap();
         let prompts = case.prompts();
         assert!(!prompts.join("main_agent.md").exists());
@@ -424,7 +468,7 @@ mod tests {
     fn run_file_gives_the_facts_of_the_run() {
         // Claude Code: no registry, so the default limits, and marked as such.
         with_invocation(AgentKind::Claude, None, true, |invocation| {
-            let run = invocation.run_file(&RegistryLimits::default());
+            let run = invocation.run_file(&RegistryLimits::default(), true);
             for line in [
                 "- Stage: verification\n",
                 "- Agent runtime: Claude Code\n",
@@ -433,6 +477,10 @@ mod tests {
                  \x20 - output limit of one response: 32000 tokens (default: the agent runtime gives no value)\n\
                  - Sub-agents: the same model and the same limits as the main agent\n",
                 "- Required Rust toolchain: `1.99.0`\n",
+                "\n## Machine resources\n\n",
+                "- CPUs available to the agent commands: ",
+                " in total, ",
+                "share one limit: 5 GiB of memory and 10 GiB of swap (`harvest.slice`).",
                 "- `inputs/prompts/verify/method.md`: the test method\n",
                 "- `inputs/prompts/tool_wishlist.md`: ",
                 "\n## External test suite\n\n- `inputs/suite/`\n",
@@ -440,6 +488,10 @@ mod tests {
                 assert!(run.contains(line), "{line:?} not in:\n{run}");
             }
             assert!(run.contains(&invocation.case.root().display().to_string()));
+            // Without the shared limit, run.md does not claim one.
+            let unlimited = invocation.run_file(&RegistryLimits::default(), false);
+            assert!(unlimited.contains("- The agent commands run without a shared memory limit."));
+            assert!(!unlimited.contains("harvest.slice"));
             assert_eq!(placeholders(&run), [""; 0]);
         });
         // OpenCode, both models with a registry output limit: the registry values hold.
@@ -458,7 +510,7 @@ mod tests {
                         output: Some(65_536),
                     }),
                 };
-                let run = invocation.run_file(&limits);
+                let run = invocation.run_file(&limits, true);
                 let models = "- Main agent: model `provider/main`\n\
                  \x20 - context window: 1048576 tokens\n\
                  \x20 - output limit of one response: 128000 tokens\n\
@@ -485,7 +537,7 @@ mod tests {
                         output: None,
                     }),
                 };
-                let run = invocation.run_file(&limits);
+                let run = invocation.run_file(&limits, true);
                 let models = "- Main agent: model `provider/main`\n\
                  \x20 - context window: 1048576 tokens\n\
                  \x20 - output limit of one response: 32000 tokens (the default cap of the agent \
@@ -503,7 +555,7 @@ mod tests {
     fn prompt_record_holds_the_prompt_and_the_prompt_files() {
         with_invocation(AgentKind::Claude, None, true, |invocation| {
             invocation
-                .write_shared_prompts(&RegistryLimits::default())
+                .write_shared_prompts(&RegistryLimits::default(), true)
                 .unwrap();
             let inputs = invocation.case.lock_inputs().unwrap();
             let out = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@ use tracing::warn;
 
 use super::registry::{parse_opencode_model, run_opencode_models};
 use super::routing::{self, Route};
-use crate::{AgentInvocation, CaseDir, agent_env, command_stdout};
+use crate::{AgentInvocation, CaseDir, command_stdout};
 
 struct OpenCodeAgentConfig<'a> {
     name: &'a str,
@@ -81,6 +81,7 @@ struct OpenCodeProjectOptions<'a> {
 pub(crate) fn write_project(
     invocation: &AgentInvocation<'_>,
     routes: &[Route<'_>],
+    shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_opencode_agent(
         invocation.case,
@@ -96,7 +97,7 @@ pub(crate) fn write_project(
         invocation.model,
         invocation.subagent_model,
         routes,
-        agent_env::install(invocation.case.root()).as_deref(),
+        shell,
     )
 }
 

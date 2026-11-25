@@ -189,7 +189,9 @@ pub fn prepare_agent(
         AgentKind::OpenCode => opencode::load_registry_limits(&invocation)?,
         AgentKind::Claude => RegistryLimits::default(),
     };
-    invocation.write_shared_prompts(&limits)?;
+    // Only a check here: the run sets the limit (`agent_env::install`), and a test of the
+    // prepared files must not change the host.
+    invocation.write_shared_prompts(&limits, agent_env::limit_available())?;
     Ok(PreparedAgent {
         invocation,
         limits,
@@ -217,7 +219,10 @@ fn run_prepared(
         warn!("Cannot keep the prompt files in {}: {e}", record.display());
     }
 
-    prepare_agent_env(invocation, routes)?;
+    // The shell that runs the agent commands under the shared memory limit.
+    let shell = agent_env::install(invocation.case.root());
+    let shell = shell.as_deref();
+    prepare_agent_env(invocation, routes, shell)?;
 
     let logs_dir = invocation.case.root().join("logs");
     fs::create_dir_all(&logs_dir)?;
@@ -244,7 +249,7 @@ fn run_prepared(
     );
 
     let status = match invocation.agent {
-        AgentKind::Claude => claude::invoke_claude(invocation, &log_path)?,
+        AgentKind::Claude => claude::invoke_claude(invocation, &log_path, shell)?,
         AgentKind::OpenCode => opencode::invoke_opencode(invocation, &log_path, limits)?,
     };
 
@@ -292,10 +297,11 @@ fn run_prepared(
 fn prepare_agent_env(
     invocation: &AgentInvocation<'_>,
     routes: &[opencode::Route<'_>],
+    shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match invocation.agent {
         AgentKind::Claude => claude::write_claude_sandbox(invocation.case.root()),
-        AgentKind::OpenCode => opencode::write_project(invocation, routes),
+        AgentKind::OpenCode => opencode::write_project(invocation, routes, shell),
     }
 }
 

@@ -46,8 +46,8 @@ input without a final newline.
 - Verification is complete only when `SYMBOLS.md` has no open missing entry
   (for the library, the `nm -D` symbol diff is empty), every row has a
   passing test under every configuration you test, every
-  `CONDITIONALS.md` region is settled, and the final cross-review finds no
-  gap. Green tests on inputs you picked yourself are not completion.
+  `CONDITIONALS.md` region is settled, and the last cross-review reports no
+  blocking finding. Green tests on inputs you picked yourself are not completion.
 
 ## Operational
 - The time limit of "Long commands" in `inputs/prompts/common.md` applies to

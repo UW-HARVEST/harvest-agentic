@@ -27,7 +27,22 @@ const HARVEST_SANDBOX: &str = include_str!("agent_env/harvest-sandbox");
 
 /// The slice `harvest-shell` puts every command in, and its limits.
 const SLICE: &str = "harvest.slice";
-const SLICE_LIMITS: [&str; 2] = ["MemoryMax=5G", "MemorySwapMax=10G"];
+const SLICE_MEMORY_GIB: u32 = 5;
+const SLICE_SWAP_GIB: u32 = 10;
+
+/// The shared limits of the agent commands, for `run.md`.
+pub(crate) fn shared_limits() -> String {
+    format!("{SLICE_MEMORY_GIB} GiB of memory and {SLICE_SWAP_GIB} GiB of swap (`{SLICE}`)")
+}
+
+/// Whether [`install`] can set the shared limit: the systemd user manager answers. Changes
+/// nothing on the host.
+pub(crate) fn limit_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "show", "--property=Version"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
 
 /// Writes the shell into `<case_dir>/agent_env/` and returns its path.
 /// `None` when the slice limits cannot be set: commands then run unlimited.
@@ -51,7 +66,8 @@ fn try_install(case_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> 
     }
     let output = Command::new("systemctl")
         .args(["--user", "set-property", "--runtime", SLICE])
-        .args(SLICE_LIMITS)
+        .arg(format!("MemoryMax={SLICE_MEMORY_GIB}G"))
+        .arg(format!("MemorySwapMax={SLICE_SWAP_GIB}G"))
         .output()?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().into());

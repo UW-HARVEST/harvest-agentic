@@ -14,3 +14,8 @@ Format per entry:
 - Files/lines suspected: <file path:line>
 - Action taken: <Edit/test/none yet>
 - Outcome: <what happened after the action>
+
+## Reviews
+
+One line for each final cross-review:
+- Review <N>: <B> blocking, <M> notes. Open notes: <the notes that you did not resolve, or none>

@@ -1,7 +1,8 @@
 # Bounded fuzz campaigns
 
 This file adds to `README.md`. Additional files: `build_fuzz.sh` builds the campaign binary; `run_fuzz.sh` runs
-it and sets campaign budgets. `run_fuzz.sh` uses the same `memory_scope.sh`
+it and sets campaign budgets; `run_fuzz_all.py` runs several campaigns at the same time, each
+through `run_fuzz.sh`. `run_fuzz.sh` uses the same `memory_scope.sh`
 cgroup launcher as `run_tests.sh`. `docs/` contains vendored official
 FuzzTest reference docs (Apache-2.0).
 
@@ -16,8 +17,8 @@ RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
   ./verify_env/run_fuzz.sh Suite.Property
 ```
 
-The runner preserves your working directory and runs one property. Run campaigns
-sequentially; each has its own memory budget. Adjust the defaults in the
+The runner preserves your working directory and runs one property. Each campaign has its own
+memory budget. Adjust the defaults in the
 configuration block at the top of `verify_env/run_fuzz.sh`, or override them
 for one invocation:
 
@@ -73,3 +74,15 @@ can prevent writing a reproducer, and a cumulative-memory OOM may need more than
 the last input to reproduce. OOM, timeout, signal termination, and launcher
 failure never count as passing campaigns. If you pipe the runner into another
 command, use `set -o pipefail` so the pipeline preserves failures.
+
+## Several campaigns at the same time
+
+`run_fuzz_all.py` runs several properties at the same time, each through `run_fuzz.sh` with the
+settings above. It chooses how many campaigns run at once from the CPUs and the free memory, and
+`--jobs N` sets the number by hand. `./verify_env/run_fuzz_all.py --help` tells the options, the
+rules of the automatic choice, and the output files.
+
+```bash
+RUST_LIB_PATH="$(pwd)/target/release/lib<crate>.so" \
+  ./verify_env/run_fuzz_all.py --seconds 120 Suite.PropA Suite.PropB=300
+```
