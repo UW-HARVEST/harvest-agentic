@@ -97,11 +97,10 @@ impl<T> SharedValue for *const T {
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 compile_error!("errno: add the errno location function of this target");
 
-unsafe extern "C" {
-    #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
-    #[cfg_attr(target_vendor = "apple", link_name = "__error")]
-    fn errno_location() -> *mut c_int;
-}
+#[cfg(target_os = "linux")]
+use libc::__errno_location as errno_location;
+#[cfg(target_vendor = "apple")]
+use libc::__error as errno_location;
 
 /// The C errno of this thread.
 pub fn errno() -> c_int {

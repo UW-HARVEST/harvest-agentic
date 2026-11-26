@@ -106,10 +106,11 @@ yourself: your context is for the plan and the build.
 your state. It is a plain markdown file that you maintain yourself, not the TODO list of a tool.
 
 When the scouts reply, immediately fill in its other sections: "Codebase
-summary" and "Translation subtasks" (from the scout replies and your own analysis), and later
-"Notes for future-me". Each section of `PLAN.md` shows the form of its entries. Merge the replies of
-all scouts, and number the subtasks T1, T2, .... You can split, merge or reorder subtasks for
-their size and their dependencies. All subtasks together must cover all of the C source.
+summary", "External dependencies" and "Translation subtasks" (from the scout replies and your own
+analysis), and later "Notes for future-me". Each section of `PLAN.md` shows the form of its
+entries. Merge the replies of all scouts, and number the subtasks T1, T2, .... You can split,
+merge or reorder subtasks for their size and their dependencies. All subtasks together must cover
+all of the C source.
 
 - **Fill it in BEFORE your context fills up.** Its sections must be complete before the first
   compaction.
@@ -178,6 +179,9 @@ Decide these yourself, from the scout reports, and record them in `PLAN.md`:
 2. ALL backends/variants, if the project has build-time configurability (source file selection,
    options, conditional compilation). Check a detail with a scoped grep
    (`grep -n 'option(' inputs/c_src/CMakeLists.txt`).
+3. For each external dependency that the scout reports list, the Rust crate to use, or the C
+   library to link when there is no crate (see "External dependencies" in
+   `inputs/prompts/translate/translation_rules.md`).
 
 Send each subtask to a translator. Its prompt has this form, and no rules:
 
@@ -188,6 +192,7 @@ Subtask <Tn>: <name>.
 C files and functions: <list; give each C file as a path that starts with inputs/c_src/>.
 Rust files to write: <list>.
 Dependencies: <types, constants and signatures of other subtasks, or where to find them>.
+External dependencies: <the decision of PLAN.md for each one that the subtask uses, or "none">.
 Scout report sections: <sections of scout/REPORT_<n>.md>.
 Renaming macros: <the macros that rename its functions, from the scout reports, or "none">.
 Feature names: <from `cargo_features.py names`, or "none">.

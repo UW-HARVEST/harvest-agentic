@@ -25,8 +25,8 @@ Your task message gives:
 - your subtask: its C files and functions, and the Rust files that you write,
 - its dependencies: the types, constants and function signatures of other subtasks that you use,
   and the sections of `scout/REPORT_<n>.md` to read,
-- the preprocessor macros that rename your functions, and the feature names of your build options,
-  when there are such,
+- the preprocessor macros that rename your functions, the feature names of your build options, and
+  the decisions for the external dependencies that your code uses, when there are such,
 - more prompt files, when the subtask needs them (for example for data tables). Read them too.
 
 ## Steps

@@ -20,6 +20,7 @@
 //! | [`Pod`], [`from_bytes`], [`from_bytes_mut`] | Plain data, and byte slices viewed as slices of it |
 //!
 //! `carray.rs`, `cbox.rs`, `cbuf.rs` and `cvec.rs` need `alloc.rs`. The other files stand alone.
+//! `alloc.rs` and `shared.rs` call the C library through the `libc` crate.
 
 // A translation does not use every item.
 #![allow(dead_code, unused_imports)]

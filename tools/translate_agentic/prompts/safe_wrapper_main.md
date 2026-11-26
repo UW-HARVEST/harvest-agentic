@@ -26,7 +26,8 @@ and replies with a boundary summary. The next section tells how the plan uses th
 - The crate has three modules: `api` (the C exports, with the C ABI rules of
   `inputs/prompts/translate/translation_rules.md`), `wrap` (the
   wrapper layer) and `internal` (`src/internal/mod.rs` starts with `#![forbid(unsafe_code)]`).
-  `src/wrap/rt/` holds the framework items that the design uses. Never change it.
+  `src/wrap/rt/` holds the framework items that the design uses. It needs the `libc` crate. Never
+  change it.
 - Make the subtasks from the scout proposals and the design together:
   - T1 copies the skeleton into `src/`, and makes `cargo build` pass with the `todo!()` bodies.
   - Wave 1: the wrapper types of `wrap` are their own subtasks. A C module that the design wraps

@@ -9,7 +9,8 @@ Before you start, read these files. They hold rules of this run that this prompt
 - `inputs/prompts/git_main.md`: the git discipline.
 - `inputs/prompts/cargo_features.md`: the Cargo features of the C build options.
 - `inputs/prompts/translate/completion_gate.md`: the completion gate.
-- `inputs/prompts/translate/translation_rules.md`: read its section "No stubs".
+- `inputs/prompts/translate/translation_rules.md`: read its sections "Translation fidelity",
+  "External dependencies" and "No stubs".
 - Each additional prompt file that `inputs/prompts/run.md` lists.
 
 When you send a sub-agent, start its prompt with the line `Read inputs/prompts/subagent.md first.`
@@ -17,26 +18,8 @@ When you send a sub-agent, start its prompt with the line `Read inputs/prompts/s
 {WORKFLOW_HINT}
 **CRITICAL CONSTRAINT: Pure Rust Translation Only**
 
-You MUST faithfully translate ALL C source files to **pure Rust**. Do NOT use
-the `cc` crate (or any equivalent) in `build.rs` to compile or link the original
-C source code. The C source files in `inputs/c_src` will NOT exist in the final test
-environment — the only code available at test time is the Rust you write. Any
-`extern "C"` FFI declarations must resolve to Rust implementations you provide,
-not to compiled C object files.
-
-Do NOT import or depend on any existing Rust crate that implements, wraps,
-re-exports, or compiles the same C library you are translating. If a function
-needs to call out to system libraries (e.g. POSIX APIs), use `libc` or
-equivalent thin FFI crates, not crates that compile the library you are meant
-to translate.
-
-Write all Rust code yourself. Do NOT generate Rust from the C source with an
-external tool that these instructions do not name. This includes `c2rust` and
-other C-to-Rust transpilers.
-
-A `build.rs` is allowed for legitimate build-time needs (code generation,
-feature detection, etc.), but it must NOT reference, compile, or link any
-file under `inputs/c_src`.
+You MUST faithfully translate ALL C source files to Rust, by the sections "Translation fidelity"
+and "External dependencies" of `inputs/prompts/translate/translation_rules.md`.
 
 If the codebase is large, you must still translate all of it, with no stubs (see the completion
 gate). Never refuse or abort a translation because the codebase seems too big. This
@@ -86,7 +69,6 @@ backend or variant, then wire up feature gates.
 - Preserve the exact order of error checks and validation
 - Match C's stdin reading behavior exactly (scanf reads across newlines, fgets does not)
 - Match C's exact printf format output including spacing and newlines
-- Do NOT use the `openssl` crate or any OpenSSL bindings — use pure-Rust crates instead
 - Use safe Rust internally where possible
 
 ## Step 4: Check the completion gate

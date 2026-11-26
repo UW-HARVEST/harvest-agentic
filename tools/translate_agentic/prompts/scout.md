@@ -44,6 +44,12 @@ Find these facts for the files of your group:
    become Cargo features (see `inputs/prompts/cargo_features.md`).
 5. Symbol renames: macros that change linker symbols, for example `#define foo NAMESPACE(foo)`.
 6. Call groups: functions that call each other, also across files. Find the call sites with `grep`.
+7. External dependencies: each library that the files use and whose source is not in
+   `inputs/c_src`, other than glibc (libc, libm, pthread, dl, rt). Find them from the included
+   headers and the link commands of the CMake files. For each one, give the functions that the
+   code calls, and the `file:line` of its CMake link command and of the build option that selects
+   it. If you built the C code for your task, also run `readelf -d` on the built library or
+   program, and copy the `NEEDED` lines of the output into your report.
 
 ## Propose subtasks
 
@@ -60,7 +66,7 @@ harness entry point in early subtasks.
 ## Report
 
 Write `scout/REPORT_<n>.md`. It contains the sections of your reply, and in full: the inventory, the
-public API, the build options, the renames, and the call groups.
+public API, the build options, the renames, the call groups, and the external dependencies.
 
 ## Reply
 
@@ -72,6 +78,7 @@ Reply with only these sections, in at most 80 lines.
 - Project type: bin / lib / both
 - Build configurability: <the options and their values; the features that `cargo_features.py names` prints>
 - Public API surface: <list of public functions/types>
+- External dependencies: <each library with the functions that the code calls, or "none">
 
 ### Proposed subtasks
 

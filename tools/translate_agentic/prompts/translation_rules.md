@@ -15,6 +15,7 @@ Reader: each agent of the translation stage that plans, writes or checks Rust co
   `nm -D` against the C build. Each export must be a real
   translation of its C function. An export whose body does not do what the C
   function does counts as missing, also when `nm -D` shows its name.
+- Prefer safe Rust internally; do not relax the C ABI on exports.
 
 ## Behavioral fidelity
 - Do NOT fix bugs in the original C. Reproduce behavior exactly.
@@ -22,31 +23,53 @@ Reader: each agent of the translation stage that plans, writes or checks Rust co
 - Match C's stdin reading semantics (scanf reads across newlines; fgets does not).
 - Match C's exact printf format including spacing and newlines.
 
-## Crate constraints
-- Do NOT use the `openssl` crate or any OpenSSL bindings. Use pure-Rust crates.
-- Prefer safe Rust internally; do not relax the C ABI on exports.
-
 ## Translation fidelity
-- You MUST faithfully translate ALL C source files to **pure Rust**. Do NOT use
-  the `cc` crate (or any equivalent) in `build.rs` to compile or link the
-  original C source code. The C source files in `inputs/c_src` will NOT exist in
-  the final test environment — the only code available at test time is the
-  Rust you write. Any attempt to wrap C via a compiled static archive or
-  object file will fail at test time because the C files simply won't be
-  there.
-- Do NOT import or depend on any existing Rust crate that implements, wraps,
-  re-exports, or compiles the same C library you are translating. If a
-  function needs to call out to system libraries (e.g. POSIX APIs), use `libc`
-  or equivalent thin FFI crates, not crates that compile the library you are
-  meant to translate.
+- This is a translation task: the result must be Rust. You MUST faithfully
+  translate ALL C source files, also the third-party code that the project
+  has in its source tree.
+- Do NOT depend on any Rust crate that implements, wraps, re-exports, or
+  compiles the C code that you translate, or a part of it.
+- The build of the crate must NOT compile C code, and must NOT link compiled
+  C code other than the libraries that "External dependencies" permits. This
+  applies to the files of `inputs/c_src`, to C code that an agent writes, and
+  to C code that a crate brings (for example a `-sys` crate that builds a C
+  library).
+- A `build.rs` is allowed for other build-time needs (code generation,
+  feature detection, link directives), but it must NOT reference any file
+  under `inputs/c_src`.
 - Do NOT generate Rust from the C source with
   an external tool that these instructions do not name. This includes `c2rust`
   and other C-to-Rust transpilers.
 - The agents of this run write all of the Rust code. Do NOT copy Rust code
   from outside your checkout, for example from another translation.
-- A `build.rs` is allowed for legitimate build-time needs (code generation,
-  feature detection, etc.), but it must NOT reference, compile, or link any
-  file under `inputs/c_src`.
+
+## External dependencies
+The external dependencies of the C code are the libraries that it uses and
+whose source is not in `inputs/c_src`. Before you add a crate to `Cargo.toml`,
+make sure that Cargo downloads and builds it.
+
+### glibc
+glibc is libc, libm, and the pthread, dl and rt libraries in it. The Rust
+code uses glibc as the C code does.
+- Call a glibc symbol through the `libc` crate. Write an `extern` declaration
+  yourself only for a symbol that the `libc` crate does not have.
+- When the implementation of glibc decides a result (for example the output
+  of `printf`), get the result from glibc. Do NOT write your own version. For
+  other operations, the Rust standard library is acceptable.
+
+### Other dependencies
+- Use a pure-Rust crate (no C code, no binding to a C library) that takes the
+  place of the dependency with no layer that imitates its interface.
+- When there is no such crate, link the C library of the system: write
+  `#[link(name = "...")]` and the `extern` declarations from its header.
+- Do NOT write your own version of a dependency or of a part of it. Where the
+  specification of a dependency leaves a result open, a crate can give a
+  different result than the C library, as long as the observable behavior of
+  the translated code stays the same as C. If it does not, do NOT use the
+  crate: link the C library.
+- The main agent decides for each dependency. A sub-agent follows the
+  decision in its task message, and reports a dependency that the message
+  does not name.
 
 ## No stubs
 Every function, struct, constant and macro of the C source has a Rust

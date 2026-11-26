@@ -642,6 +642,7 @@ mod tests {
             for section in [
                 "## Self-assessment",
                 "## Codebase summary",
+                "## External dependencies",
                 "## Translation subtasks",
                 "## Notes for future-me",
             ] {

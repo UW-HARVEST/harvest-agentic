@@ -1,7 +1,6 @@
 //! The library allocator: C malloc, or the allocation hooks that the user of the C library
 //! registers.
 
-use std::ffi::c_void;
 use std::ptr::NonNull;
 
 /// The alignment that C malloc gives on the supported targets (`alignof(max_align_t)`).
@@ -55,17 +54,6 @@ pub unsafe trait LibAlloc {
     }
 }
 
-unsafe extern "C" {
-    #[link_name = "malloc"]
-    fn c_malloc(n: usize) -> *mut c_void;
-    #[link_name = "calloc"]
-    fn c_calloc(n: usize, size: usize) -> *mut c_void;
-    #[link_name = "free"]
-    fn c_free(p: *mut c_void);
-    #[link_name = "realloc"]
-    fn c_realloc(p: *mut c_void, n: usize) -> *mut c_void;
-}
-
 /// The C malloc, calloc, free and realloc.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Malloc;
@@ -74,22 +62,22 @@ pub struct Malloc;
 unsafe impl LibAlloc for Malloc {
     fn malloc(&self, n: usize) -> *mut u8 {
         // SAFETY: malloc accepts any size.
-        unsafe { c_malloc(n).cast() }
+        unsafe { libc::malloc(n).cast() }
     }
 
     fn calloc(&self, n: usize) -> *mut u8 {
         // SAFETY: calloc accepts any size.
-        unsafe { c_calloc(n, 1).cast() }
+        unsafe { libc::calloc(n, 1).cast() }
     }
 
     unsafe fn free(&self, p: *mut u8) {
         // SAFETY: the caller gives null or a live block of malloc.
-        unsafe { c_free(p.cast()) }
+        unsafe { libc::free(p.cast()) }
     }
 
     unsafe fn realloc(&self, p: *mut u8, _old: usize, n: usize) -> *mut u8 {
         // SAFETY: the caller gives a live block of malloc, and n > 0.
-        unsafe { c_realloc(p.cast(), n).cast() }
+        unsafe { libc::realloc(p.cast(), n).cast() }
     }
 }
 

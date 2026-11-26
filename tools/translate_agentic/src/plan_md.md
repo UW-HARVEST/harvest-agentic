@@ -15,6 +15,12 @@ rules. The main agent fills in the sections and keeps them up to date.
 - Build configurability: <the options and their values; the features that `cargo_features.py names` prints>
 - Public API surface: <list of public functions/types>
 
+## External dependencies
+One line for each library that the C code uses and whose source is not in `inputs/c_src`, other
+than glibc ("none" when there is none):
+
+- <library> — functions used: <list> — decision: <Rust crate `name`, or link the C library> — reason: <why>
+
 ## Translation subtasks
 All subtasks together cover all of the C source. One line for each subtask:
 

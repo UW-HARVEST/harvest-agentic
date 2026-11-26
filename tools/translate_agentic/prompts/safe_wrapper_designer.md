@@ -1359,8 +1359,9 @@ Each case causes undefined behavior, or behavior that is different from C.
   signatures with `todo!()` bodies. `internal/mod.rs` starts with `#![forbid(unsafe_code)]`. Do not
   turn off lints for the crate.
 
-To check the skeleton, make a library crate in `scratch/` with an empty `[workspace]` table. Copy the
-skeleton into its `src/`. Run `cargo check`, and fix the errors. Warnings are permitted.
+To check the skeleton, make a library crate in `scratch/` with an empty `[workspace]` table and the
+`libc` dependency. Copy the skeleton into its `src/`. Run `cargo check`, and fix the errors.
+Warnings are permitted.
 
 ## Reply
 

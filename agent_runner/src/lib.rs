@@ -331,12 +331,10 @@ fn run_agent(
     prompt: &str,
     env: &BackendEnv,
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
-    let openssl_dir = std::env::var("OPENSSL_DIR").unwrap_or_else(|_| "/usr".into());
     let mut cmd = Command::new("timeout");
     cmd.arg(timeout_secs.to_string())
         .arg(program)
         .args(args)
-        .env("OPENSSL_DIR", openssl_dir)
         .current_dir(invocation.case.workspace())
         // OpenCode takes its project directory from $PWD before the real cwd,
         // and `current_dir` leaves the inherited $PWD pointing at ours.
