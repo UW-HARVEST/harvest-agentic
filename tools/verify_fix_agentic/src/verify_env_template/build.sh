@@ -12,7 +12,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/shared_build.sh"
 
 CC="${CC:-clang}" CXX="${CXX:-clang++}" shared_build build-test \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHARVEST_C_OPTIONS="${HARVEST_C_OPTIONS:-}"
 
 echo
 echo "Built build-test/verification_tests"

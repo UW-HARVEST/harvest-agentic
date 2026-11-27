@@ -90,17 +90,11 @@ Then do the actual verification:
    `verify_env/build.sh` for the test binary. Run the tests with
    `verify_env/run_tests.sh`.
 
-   Before you trust any comparison, confirm the C reference is built correctly:
-   the CMakeLists compiled `inputs/c_src` into the test binary with compile
-   definitions best-effort extracted from `inputs/c_src/CMakeLists.txt`, but that parse
-   can miss flags (namespace macros like `XXH_NAMESPACE=...`, behavior switches,
-   defs added via `add_definitions`/subdirectories). The C reference is your
-   ground truth — if it is misbuilt, every "mismatch" is a false one and you
-   will waste effort changing correct Rust. Cross-check the
-   `target_compile_definitions(c_under_test ...)` line in `verify_env/CMakeLists.txt`
-   against how `inputs/c_src` is actually built and fix it if it differs. Tell-tale
-   symptoms of a misbuilt oracle: a symbol you expect is missing, or every test
-   fails together in lock-step.
+   The test binary compiles the C code with the build settings of the C project's
+   own CMake build (`verify_env/import_c_build.py`). Build it for a configuration
+   with `HARVEST_C_OPTIONS="<-D flags>" ./verify_env/build.sh`. The C reference is
+   your ground truth: when a symbol you expect is missing, or every test fails
+   together, check the C reference before you change the Rust.
 2. Write GoogleTest cases in `verify_env/verification_tests.cc` and `verify_env/tests/*.cc` that
    run the C reference and the Rust translation on the same inputs and assert the results
    match byte-for-byte. A fixture (`TEST_F`) is the natural place to hold a

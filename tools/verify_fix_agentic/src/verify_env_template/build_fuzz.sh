@@ -16,7 +16,7 @@ source "$here/shared_build.sh"
 
 CC=clang CXX=clang++ shared_build build-fuzz \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DFUZZTEST_FUZZING_MODE=ON
+  -DFUZZTEST_FUZZING_MODE=ON -DHARVEST_C_OPTIONS="${HARVEST_C_OPTIONS:-}"
 
 echo
 echo "Built build-fuzz/verification_tests"

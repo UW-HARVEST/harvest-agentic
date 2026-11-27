@@ -73,9 +73,11 @@ the main agent, or the git worktree of a sub-agent.
 
   Repeat the second line until the log has the `EXIT` line. Without a 10-minute tool timeout, use
   `timeout 100` in place of `timeout 500`.
-- To wait for a process, wait for its PID (`while kill -0 <pid>`) or for a marker file, as
-  above. Do not wait with `pgrep -f <pattern>`: the shell that runs the wait has the pattern in
-  its own command line, so `pgrep` always finds it.
+- Find, wait for and stop a process only by its PID: when you start it in the background, write
+  `$!` to a file in `scratch/` (the next command runs in a new shell). Wait with
+  `while kill -0 <pid>` or for a marker file as above, and stop it with `kill <pid>`. Never use
+  `pgrep -f`, `pkill -f` or `killall`: a pattern also matches your own shell and the processes
+  of other agents on this machine, so it can stop their work.
 - Do not get stuck on one command. When a command does not end in its time limit, do not run it
   again unchanged. Find the cause first.
 

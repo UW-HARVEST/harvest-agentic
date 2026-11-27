@@ -34,16 +34,23 @@ include(GoogleTest)
 # here, so the two sides' same-named exports do not collide.
 # The C source: inputs/c_src of the checkout. To build elsewhere, pass
 # -DHARVEST_C_SRC=<directory> (for example a snapshot's .harvest/c_src).
+# import_c_build.py takes the sources, compile settings and libraries from the C
+# project's own CMake build, configured with HARVEST_C_OPTIONS (-D flags; build.sh
+# passes them).
 set(HARVEST_C_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../inputs/c_src" CACHE PATH "C source directory")
-file(GLOB C_UNDER_TEST_SOURCES CONFIGURE_DEPENDS
-     "${HARVEST_C_SRC}/src/*.c")
+set(HARVEST_C_OPTIONS "" CACHE STRING "Options of the C project, as -D flags")
+separate_arguments(HARVEST_C_OPTION_LIST UNIX_COMMAND "${HARVEST_C_OPTIONS}")
+execute_process(
+  COMMAND python3 "${CMAKE_CURRENT_SOURCE_DIR}/import_c_build.py" "${HARVEST_C_SRC}"
+          "${CMAKE_BINARY_DIR}/c-build" "${CMAKE_C_COMPILER}" ${HARVEST_C_OPTION_LIST}
+  RESULT_VARIABLE C_BUILD_IMPORT_RESULT)
+if(NOT C_BUILD_IMPORT_RESULT EQUAL 0)
+  message(FATAL_ERROR "import_c_build.py could not describe the C build (see above)")
+endif()
+include("${CMAKE_BINARY_DIR}/c-build/c_build.cmake")
 add_library(c_under_test STATIC ${C_UNDER_TEST_SOURCES})
-target_include_directories(c_under_test PUBLIC
-     "${HARVEST_C_SRC}/include")
-# Project-specific C build flags, pre-filled from the C CMakeLists.txt where it
-# could be parsed. If the C reference needs more (or these are wrong), check
-# ${HARVEST_C_SRC}/CMakeLists.txt `target_compile_definitions` and edit this line.
-target_compile_definitions(c_under_test PRIVATE {C_COMPILE_DEFS})
+target_include_directories(c_under_test PUBLIC ${C_UNDER_TEST_INCLUDE_DIRECTORIES})
+target_link_libraries(c_under_test PUBLIC ${C_UNDER_TEST_LIBRARIES})
 target_compile_options(c_under_test PRIVATE -w)
 
 # The test files: verification_tests.cc and tests/*.cc of HARVEST_TEST_DIR

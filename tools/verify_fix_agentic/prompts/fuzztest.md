@@ -184,9 +184,8 @@ mismatch is still caught and reported through the usual GoogleTest assertion.
 Because the campaign steers by the C reference and treats it as ground truth, a
 misbuilt C reference is especially damaging here: it will happily "find" a flood
 of failing inputs that are really the oracle's fault, not the translation's.
-Before starting a campaign, make sure the C side is compiled correctly (see the
-compile-definitions check in `inputs/prompts/verify/method_gtest.md`) — the instrumented, statically linked C in
-`c_under_test` must match how `inputs/c_src` is actually built.
+Build the fuzzing binary with the same `HARVEST_C_OPTIONS` as the configuration
+that you test.
 
 Crash handling: fuzzing runs in-process, so a segfault or abort on either side
 ends the run. Treat the cases distinctly — if the **C reference** itself crashes

@@ -69,6 +69,7 @@ const VE_RUN_FUZZ_ALL_PY: &str = include_str!("verify_env_template/run_fuzz_all.
 const VE_RUN_TESTS_SH: &str = include_str!("verify_env_template/run_tests.sh");
 const VE_MEMORY_SCOPE_SH: &str = include_str!("verify_env_template/memory_scope.sh");
 const VE_SHARED_BUILD_SH: &str = include_str!("verify_env_template/shared_build.sh");
+const VE_IMPORT_C_BUILD_PY: &str = include_str!("verify_env_template/import_c_build.py");
 const VE_README: &str = include_str!("verify_env_template/README.md");
 
 /// The run scripts of verify_env (file name, text). They run the test binary and the fuzz
@@ -260,60 +261,14 @@ fn write_stage_files(case: &CaseDir) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Best-effort extraction of C preprocessor definitions from a project's
-/// `c_src/CMakeLists.txt` `target_compile_definitions(...)` calls, so the
-/// verify_env C build matches the flags the library is normally compiled with
-/// (e.g. `XXH_NAMESPACE=LZ4_`). Returns a space-separated list for CMake, or an
-/// empty string if none are found. The agent can correct it if the parse misses
-/// something.
-fn parse_c_compile_defs(cmakelists: &str) -> String {
-    const MARKER: &str = "target_compile_definitions";
-    const KEYWORDS: [&str; 3] = ["PRIVATE", "PUBLIC", "INTERFACE"];
-    let mut defs: Vec<String> = Vec::new();
-    let mut rest = cmakelists;
-    while let Some(pos) = rest.find(MARKER) {
-        rest = &rest[pos + MARKER.len()..];
-        // Take the tokens inside this call's parentheses.
-        let Some(open) = rest.find('(') else { break };
-        let Some(close) = rest[open..].find(')') else {
-            break;
-        };
-        let inside = &rest[open + 1..open + close];
-        rest = &rest[open + close..];
-        // First token is the target name; skip it and the visibility keywords.
-        for tok in inside.split_whitespace().skip(1) {
-            if KEYWORDS.contains(&tok) {
-                continue;
-            }
-            let looks_like_def = tok
-                .chars()
-                .next()
-                .map(|c| c.is_ascii_alphabetic() || c == '_')
-                .unwrap_or(false)
-                && tok
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '=');
-            if looks_like_def && !defs.iter().any(|d| d == tok) {
-                defs.push(tok.to_string());
-            }
-        }
-    }
-    defs.join(" ")
-}
-
 /// Materializes the gtest/fuzztest verification environment into
 /// `workspace/verify_env/`, filling the CMake template for the requested mode
-/// and pre-seeding the C compile definitions parsed from the C `CMakeLists.txt`.
+/// (`import_c_build.py` takes the C build settings from the C project's own CMake build).
 /// The CMake variable `HARVEST_C_SRC` names the C source, by default `inputs/c_src` of the
 /// checkout. The scripts build in `verify_env/build-*`, which the freeze strips.
 fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std::error::Error>> {
     let env_dir = case.workspace().join(VERIFY_ENV_DIR);
     fs::create_dir_all(&env_dir)?;
-    let c_src_dir = case.c_src();
-
-    let c_defs = fs::read_to_string(c_src_dir.join("CMakeLists.txt"))
-        .map(|s| parse_c_compile_defs(&s))
-        .unwrap_or_default();
 
     let (declare, makeavail, setup_flags, test_link) = if fuzz {
         (
@@ -337,8 +292,7 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
         .replace("{FUZZTEST_DECLARE}", &declare)
         .replace("{FUZZTEST_MAKEAVAIL}", &makeavail)
         .replace("{FUZZTEST_SETUP_FLAGS}", &setup_flags)
-        .replace("{TEST_LINK}", &test_link)
-        .replace("{C_COMPILE_DEFS}", &c_defs);
+        .replace("{TEST_LINK}", &test_link);
 
     // (file name, content, executable)
     let mut files: Vec<(&str, &str, bool)> = vec![
@@ -351,6 +305,7 @@ fn materialize_verify_env(case: &CaseDir, fuzz: bool) -> Result<(), Box<dyn std:
         ("run_tests.sh", VE_RUN_TESTS_SH, true),
         ("memory_scope.sh", VE_MEMORY_SCOPE_SH, false),
         ("shared_build.sh", VE_SHARED_BUILD_SH, false),
+        ("import_c_build.py", VE_IMPORT_C_BUILD_PY, true),
     ];
     if fuzz {
         files.push(("README_fuzz.md", VE_README_FUZZ, false));
@@ -808,26 +763,6 @@ exit 86
         }
     }
 
-    #[test]
-    fn parses_lz4_style_compile_defs() {
-        let cmake = "\
-add_library(lz4 SHARED src/lz4.c)
-target_include_directories(lz4 PUBLIC include PRIVATE src)
-target_compile_definitions(lz4 PRIVATE XXH_NAMESPACE=LZ4_)
-target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
-";
-        assert_eq!(
-            parse_c_compile_defs(cmake),
-            "XXH_NAMESPACE=LZ4_ LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0"
-        );
-    }
-
-    #[test]
-    fn no_compile_defs_yields_empty() {
-        let cmake = "add_library(foo SHARED src/foo.c)\n";
-        assert_eq!(parse_c_compile_defs(cmake), "");
-    }
-
     // The two tests below call `materialize_verify_env`, which marks build.sh
     // executable. Miri has no shim for `chmod` — an unsupported foreign call, not
     // an isolation error, so `-Zmiri-disable-isolation` does not help. Skipped
@@ -840,22 +775,15 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     fn gtest_only_cmake_has_no_fuzztest() {
         let case = CaseDir::new().unwrap();
         let workspace = &case.workspace();
-        let c_src = case.c_src();
-        fs::create_dir_all(&c_src).unwrap();
-        fs::write(
-            c_src.join("CMakeLists.txt"),
-            "target_compile_definitions(x PRIVATE XXH_NAMESPACE=LZ4_)\n",
-        )
-        .unwrap();
-
         materialize_verify_env(&case, false).unwrap();
         let cml = fs::read_to_string(workspace.join("verify_env/CMakeLists.txt")).unwrap();
-        assert!(cml.contains("XXH_NAMESPACE=LZ4_"));
+        // The C build settings come from the C project's own build.
+        assert!(cml.contains("import_c_build.py"));
+        assert!(workspace.join("verify_env/import_c_build.py").exists());
         // The C source is inputs/c_src of the checkout, a default that -DHARVEST_C_SRC replaces.
         assert!(cml.contains(
             "set(HARVEST_C_SRC \"${CMAKE_CURRENT_SOURCE_DIR}/../inputs/c_src\" CACHE PATH"
         ));
-        assert!(cml.contains("\"${HARVEST_C_SRC}/src/*.c\""));
         assert!(cml.contains("GTest::gtest_main"));
         // GoogleTest's main() must win over a main() in the C sources.
         assert!(cml.find("GTest::gtest_main").unwrap() < cml.find("PRIVATE c_under_test").unwrap());
@@ -931,10 +859,6 @@ target_compile_definitions(lz4 PRIVATE LZ4_HEAPMODE=0 LZ4F_HEAPMODE=0)
     fn fuzz_cmake_wires_fuzztest() {
         let case = CaseDir::new().unwrap();
         let workspace = &case.workspace();
-        let c_src = case.c_src();
-        fs::create_dir_all(&c_src).unwrap();
-        fs::write(c_src.join("CMakeLists.txt"), "").unwrap();
-
         materialize_verify_env(&case, true).unwrap();
         let cml = fs::read_to_string(workspace.join("verify_env/CMakeLists.txt")).unwrap();
         assert!(cml.contains("link_fuzztest(verification_tests)"));

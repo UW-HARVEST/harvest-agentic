@@ -10,12 +10,13 @@ against the translated Rust, for each kind of public surface the program has:
 
 ## Files
 
-- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles `inputs/c_src/src/*.c`
-  into the test binary, links, and registers tests. Normally unedited; the
-  spots you may need to touch are the `target_compile_definitions(c_under_test ...)`
-  line if the C reference needs build flags this scaffold did not pick up, and
-  `C_UNDER_TEST_SOURCES` if a C file (for example the one with `main()`) does
-  not belong to the library.
+- `CMakeLists.txt` — fetches a pinned GoogleTest, compiles the C reference into
+  the test binary, links, and registers tests. Normally unedited.
+- `import_c_build.py` — imports the build settings of the C project from its own
+  CMake build: the sources of its library, their compile definitions, include
+  directories and options, and the libraries it links. Select a configuration
+  with `HARVEST_C_OPTIONS` (`-D` flags), for example
+  `HARVEST_C_OPTIONS="-DOPT=OFF" ./verify_env/build.sh`.
 - `verification_tests.cc` — the test file you write. Declare the C functions in
   the `extern "C"` block; resolve the Rust ones via `harvest::RustLib`. More test
   files go in `tests/*.cc`; the build picks them up.

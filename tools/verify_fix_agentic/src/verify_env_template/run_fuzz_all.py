@@ -24,8 +24,9 @@ again every 2 seconds while it runs:
     growth of the running campaigns up to that size, and for a reserve of 512 MiB. The free
     memory is the smallest of: the available memory of the machine, and the free part of each
     memory-limited cgroup above this command (cgroup v2 or v1). One campaign is expected to use
-    as much as the largest campaign so far (running or ended), at least 512 MiB and at most the
-    memory limit of one campaign. A campaign that ended for lack of memory does not count;
+    the 75th percentile of the peak memory of the campaigns that run or passed, at least 512 MiB
+    and at most the memory limit of one campaign. A failed campaign does not count, and one large
+    campaign does not set the estimate for the rest of the batch;
   - at most one new campaign starts at each check, so that the next check sees its load;
   - when no campaign runs, the next one starts in any case, so the batch always ends.
 The script writes each decision to wait into its output. It does not stop a running campaign.
@@ -154,10 +155,10 @@ def free_memory():
     return (best if best is not None else 1 << 62), where
 
 
-def memory_failure(code, log_text):
-    """Whether a campaign ended for lack of memory: killed, or over its RSS limit."""
-    return code in (-9, 137) or re.search(r"RSS limit|out of memory|\[harvest\] killed",
-                                          log_text, re.I) is not None
+def upper_quartile(values):
+    """The 75th percentile of a non-empty list (nearest rank)."""
+    values = sorted(values)
+    return values[-(-3 * len(values) // 4) - 1]
 
 
 def wait_reason(running, idle_cpus, free, where, expected, growth):
@@ -327,7 +328,7 @@ def main():
     # of one campaign.
     # The peaks of the ended campaigns that count, and the memory limit of one campaign, which
     # run_fuzz.sh writes into each log ("cgroup=<MiB>MiB"; 0 is no limit).
-    ended_peaks = []
+    passed_peaks = []
     cap = None
 
     def stop(signum, _frame):
@@ -378,8 +379,8 @@ def main():
                 continue
             del running[pid]
             job["log_file"].close()
-            if not memory_failure(code, read(job["log"]) or ""):
-                ended_peaks.append(job["peak"])
+            if code == 0:
+                passed_peaks.append(job["peak"])
             info = campaign_summary(job["log"])
             elapsed = int(time.time() - job["start"])
             results.append((job["prop"], code, elapsed, job["peak"], info))
@@ -390,8 +391,8 @@ def main():
 
         idle = meter.idle_cpus(machine_cpus)
         free, where = free_memory()
-        peak_campaign = max([MIN_CAMPAIGN_BYTES] + ended_peaks +
-                            [job["peak"] for job in running.values()])
+        peaks = passed_peaks + [job["peak"] for job in running.values()]
+        peak_campaign = max(MIN_CAMPAIGN_BYTES, upper_quartile(peaks) if peaks else 0)
         peak_campaign = min(peak_campaign, cap or 1 << 62)
         # The running campaigns can still grow to the expected size of a campaign.
         growth = sum(max(0, peak_campaign - job["rss"]) for job in running.values())
