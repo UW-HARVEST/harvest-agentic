@@ -14,7 +14,9 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     set_user_only_umask();
-    let args: Arc<_> = Args::parse().into();
+    let args: Arc<Args> = Args::parse().into();
+    harvest_translate::cli::check_profile_override(args.baseline, &args.config)?;
+    harvest_translate::cli::check_no_dry_run_key(&args.config)?;
     let Some(config) = initialize(args) else {
         return Ok(()); // An early-exit argument was passed.
     };

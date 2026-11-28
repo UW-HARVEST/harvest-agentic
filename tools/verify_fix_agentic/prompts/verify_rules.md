@@ -1,7 +1,5 @@
 # Rules of the verification
 
-Reader: the main agent of the verification stage, and each of its sub-agents.
-
 The sections "Ground truth", "Surface rows", "Generic boundaries", "Evidence" and "Operational"
 apply to every reader. The section "Duties of the main agent" is for the main agent only. A sub-agent does only
 the task that its task message gives.

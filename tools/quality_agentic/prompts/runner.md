@@ -1,11 +1,11 @@
 # Quality runner task
 
-Reader: a runner of the quality stage.
-
 Read these files first:
 
 - `inputs/prompts/subagent.md`
 - `inputs/prompts/common.md`
+- `inputs/prompts/environment.md`
+- `inputs/prompts/anti_cheating.md`
 - `inputs/prompts/git_subagent.md`
 - `inputs/prompts/run.md`
 - `inputs/prompts/runtime.md`

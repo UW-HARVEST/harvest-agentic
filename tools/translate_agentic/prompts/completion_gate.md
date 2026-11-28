@@ -1,7 +1,5 @@
 # Completion gate of the translation
 
-Reader: the main agent of the translation stage, and the reviewer.
-
 The translation is complete only when all of these are true:
 1. `cargo build --release` is green for the default features and for every
    configuration (see `inputs/prompts/cargo_features.md`).

@@ -1,7 +1,5 @@
 # Data tables in your subtask
 
-Reader: a translator of the translation stage, when its task message names this file.
-
 Your subtask owns C data tables. Use the tab2rust skill in `inputs/agent_skills/tab2rust/`.
 In its `SKILL.md`, obey the "Array classes" section and steps 4 to 9 of the "Recommended workflow".
 

@@ -104,7 +104,7 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   of a stage share one OpenRouter session, so each model stays on the
   provider of its first request while that provider works.
 - The model's context/output limits are read from `opencode models --verbose`
-  and written into its prompt files, so the agent knows its real window.
+  and written into the prompt files of the HARVEST pipeline, so the agent knows its real window.
 - After each run, all OpenCode sessions (including sub-agents) are exported
   and appended to the logs, so traces are complete.
 
@@ -126,18 +126,27 @@ The corresponding agent CLI must be installed and authenticated on your PATH.
   `provider,model` model is then an error. `--no-teamclaude` (config:
   `teamclaude = false`) starts `claude` directly, or through CCR, as above.
 
-## Prompt modes
+## Baseline arms
 
-- **Plan mode (default)**: the agent maintains a persistent state file
-  (`PLAN.md` for translation, `HYPOTHESES.md` for verification) on disk as an
-  anti-compaction mechanism. After any context compaction it re-reads its
-  rules and the state file. Recommended for large repositories.
-- **`--no-plan`**: the original minimal prompts. No state files, no sub-agent
-  guidance. For controlled experiments measuring the impact of the
-  anti-compaction mechanism.
-- **`--workflow`** (requires `--no-plan`, Claude only): injects a hint asking
-  Claude Code to orchestrate the run with its dynamic multi-agent workflow
-  feature.
+For an ablation study, `--baseline=<arm>` runs a baseline arm in place of the
+HARVEST pipeline. A baseline runs in the same framework as HARVEST, getting the same result format requirements. Only the method
+differs:
+
+- **`vanilla`**: the agent with its native ability. Its task is one sentence.
+  Translate stage only.
+- **`actor`**: the prompts of the ACTOR system (Benedikt Schesch and Michael D. Ernst,
+  "[Agentic C to Rust Translation](https://homes.cs.washington.edu/~mernst/pubs/c-to-rust-ieeesp2026-abstract.html)",
+  IEEE Security & Privacy, 2026,
+  [doi:10.1109/MSEC.2026.3715863](https://doi.org/10.1109/MSEC.2026.3715863);
+  [repository](https://github.com/UW-HARVEST/ACTOR), tag `IEEE-Privacy-and-Security`).
+  Translate and verify stages.
+- **`c2rust`**: the transpiler [c2rust](https://github.com/immunant/c2rust) 0.22.1. The agent runs
+  it and repairs its output. Translate stage only.
+
+A baseline takes no option of the HARVEST pipeline. A baseline verify stage resumes only from a snapshot
+that the same baseline translated. The stage manifest records the arm of each
+run. To see exactly what an arm gives its agent in a stage, render the stage with
+`--dry-run` (see "Benchmark CLI flags" below).
 
 ## Test cases
 
@@ -163,14 +172,14 @@ harness build would otherwise report every test as a failure.
 | `--agent <A>` | `opencode`/`oc` or `claude` |
 | `--model <M>` | Model for the agent CLI (see formats above); omit to use the CLI's default. Applies to every agentic stage of the run; use `-c tools.<tool>.model=...` for per-stage overrides. |
 | `--subagent-model <M>` | Default model of the sub-agents, same format as `--model`; omit to let the sub-agents use the main model. The main agent cannot pick another model per sub-agent. On Claude Code both models must use CCR or neither. |
+| `--baseline <ARM>` | Run a baseline arm in place of the HARVEST pipeline: `vanilla`, `actor` or `c2rust`. See "Baseline arms" above |
 | `--no-teamclaude` | Claude only: start `claude` directly (or through CCR) also when `teamclaude` is on PATH. See "Claude Code" above |
 | `--test-case <DIR>` | When the run starts at verify: override the bench test-case location instead of trusting the snapshot manifest |
 | `--verify-harness <H>` | Comparison environment given to the verify agent: `gtest` (default) or `libloading` |
-| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). Only the plan prompt uses tab2rust. The flag is an error with `--no-plan` |
-| `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default. Like `--no-tab2rust`, an error with `--no-plan` |
+| `--no-tab2rust` | Do not give the translate stage the tab2rust skill (`agent_skills/tab2rust/`). |
+| `--safe-wrapper` | In the translate stage, send a Safe API Wrapper Designer with the scouts. It designs the safe Rust boundary of the C library (API wrappers, wrapper types, an internal module under `#![forbid(unsafe_code)]`), and the translation follows the design. Off by default |
 | `--no-fuzz` | Turn off FuzzTest in the verify stage. By default the gtest verify harness also ships FuzzTest scaffolding and guidance |
-| `--no-plan` | Minimal prompts without plan files or sub-agent guidance |
-| `--workflow` | Hint Claude Code to use dynamic workflows (requires `--no-plan`) |
+| `--dry-run` | Render what the agent of one stage would receive, and start no agent. |
 | `--test[=PARTS]` | Re-grade an already-translated output (`INPUT_DIR`, no `OUTPUT_DIR`) without running any stage. PARTS is a comma list of `correctness`/`c` (the external test suites, `results.csv`) and `quality`/`q` (code quality, see "Code quality metrics"); bare `--test` means `correctness,quality`. The value form requires `=` (`--test=q`, not `--test q`). |
 | `--force` | Erase an output program directory that already holds results (otherwise a populated directory is an error) |
 | `-c, --config K=V` | Override any config value, e.g. `tools.translate_agentic.timeout_secs=7200` |
@@ -231,19 +240,12 @@ cargo run --bin=benchmark --release -- \
   ./harvest-bench/tests/mujs/ ./out_mujs_1_cds4f &> ./trace_mujs_1_cds4f.txt
 ```
 
-Prompt-mode ablations, including a large repo (zstd):
+A baseline arm of the ablation study (the vanilla agent, translate stage):
 
 ```bash
-# no-plan
 cargo run --bin=benchmark --release -- \
-  --agentic --agent claude --model opus --no-plan \
-  ./harvest-bench/tests/zstd/ ./out_zstd_1_co_np &> ./trace_zstd_1_co_np.txt
-
-# workflow mode
-cargo run --bin=benchmark --release -- \
-  --agentic --agent claude --model sonnet \
-  --no-plan --workflow \
-  ./harvest-bench/tests/lz4/ ./out_lz4_3_cs_np_wf &> ./trace_lz4_3_cs_np_wf.txt
+  --agentic=t --baseline=vanilla --agent claude --model sonnet \
+  ./harvest-bench/tests/lz4/ ./out_lz4_2_cs_t_vanilla &> ./trace_lz4_2_cs_t_vanilla.txt
 ```
 
 Re-grade an existing output without running any stage (`--test` alone
@@ -264,8 +266,10 @@ cargo run --bin=translate --release -- --agentic \
 ```
 
 The `out_*` / `trace_*` naming used above is just a convention:
-`<project>_<run#>_<model shorthand>[_np][_wf]`, plus a stage suffix
-(`_t`, `_tv`, `_tvc`) when a run freezes a partial-stage snapshot.
+`<project>_<run#>_<model shorthand>`, plus a stage suffix
+(`_t`, `_tv`, `_tvc`) when a run freezes a partial-stage snapshot, and the
+name of the baseline arm (`_vanilla`, `_actor`, `_c2rust`) when the run has
+one.
 
 ## Trace capture and visualization
 

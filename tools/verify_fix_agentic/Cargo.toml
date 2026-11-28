@@ -14,6 +14,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 agent_runner = { workspace = true, features = ["test-support"] }
+sha2 = "0.10"
 
 [lints]
 workspace = true

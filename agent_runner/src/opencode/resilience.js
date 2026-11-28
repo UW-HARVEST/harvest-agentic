@@ -5,8 +5,8 @@
 // OpenCode reports a `task` (sub-agent) call as `state="completed"` no matter
 // how the child session ended. When the child ends without final text, the
 // parent sees a successful tool call with an EMPTY `<task_result>`. This
-// plugin rewrites such a result into an explicit failure report, so the main
-// agent re-plans instead of trusting a phantom success.
+// plugin rewrites such a result into an explicit failure report, so that the
+// caller does not take it for a success.
 //
 // Appends to `resilience.log` in the work dir so a run can confirm the hook
 // actually fired.
@@ -35,9 +35,7 @@ const FAILURE_REPORT =
   "the provider stream stopped mid-response, or one response used up the " +
   "output token limit (thinking counts against it) before the sub-agent wrote anything.\n" +
   "\n" +
-  "Do not trust any file it claimed to create. Instead:\n" +
-  "1. See what actually exists.\n" +
-  "2. Split the subtask into smaller pieces.\n"
+  "Do not trust any file it claimed to create. {NEXT_STEPS}"
 
 export const HarvestResilience = async () => ({
   "tool.execute.after": async (input, output) => {

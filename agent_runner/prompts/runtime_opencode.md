@@ -1,6 +1,6 @@
 # Known problems of the agent runtime
 
-Reader: every agent of this run. The agent runtime of this run is OpenCode.
+The agent runtime of this run is OpenCode.
 
 ## Output limit
 

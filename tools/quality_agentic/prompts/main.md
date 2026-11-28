@@ -1,7 +1,5 @@
 # Quality stage: the main agent
 
-Reader: the main agent of the quality stage. Read this file again after each context compaction.
-
 Read these files first:
 
 - `inputs/prompts/main_agent.md`

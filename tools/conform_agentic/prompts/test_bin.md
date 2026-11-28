@@ -1,8 +1,5 @@
 # How to build and run the external tests
 
-Reader: the main agent of the conformance stage, and each sub-agent whose task message names this
-file.
-
 The external tests are **executable/stdout** vectors. Each
 `inputs/suite/test_vectors/<config>/` holds the vectors of one build configuration:
 `<name>.json`, or `<name>/cando_vector.json` with an optional `setup` script

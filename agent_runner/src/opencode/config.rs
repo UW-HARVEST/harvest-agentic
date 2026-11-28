@@ -6,15 +6,18 @@ use tracing::warn;
 
 use super::registry::{parse_opencode_model, run_opencode_models};
 use super::routing::{self, Route};
-use crate::{AgentInvocation, CaseDir, command_stdout};
+use crate::{AgentInvocation, Arm, CaseDir, command_stdout};
+
+/// The directory of the OpenCode project in the workspace.
+pub(crate) const PROJECT_DIR: &str = ".opencode";
 
 struct OpenCodeAgentConfig<'a> {
     name: &'a str,
     description: &'a str,
-    /// The `cat <file>` commands for post-compaction recovery (see
-    /// `recovery_commands`). None when plan files are disabled (nothing to
-    /// recover). Some → the compaction-recovery plugin is written next to the
-    /// agent definition.
+    /// HARVEST: the `cat <file>` commands for post-compaction recovery (see
+    /// `recovery_commands`), for the compaction-recovery plugin, and the advice of the
+    /// resilience plugin to split the subtask of a failed sub-agent. `None` for a baseline arm:
+    /// no compaction-recovery plugin and no advice.
     recovery_commands: Option<String>,
 }
 
@@ -27,9 +30,18 @@ const OPENCODE_COMPACTION_PLUGIN: &str = include_str!("compaction_recovery.js");
 
 /// Project-local OpenCode plugin that turns an empty sub-agent `task` result,
 /// which OpenCode reports as completed (opencode#27210), into an explicit
-/// failure report. Written for every OpenCode run. The agent can read the
-/// plugin, so keep its comments free of history.
+/// failure report. Written for every OpenCode run. `{NEXT_STEPS}` is replaced
+/// with what the report tells the agent to do next ([`RESILIENCE_NEXT_STEPS`]).
+/// The agent can read the plugin, so keep its comments free of history.
 const OPENCODE_RESILIENCE_PLUGIN: &str = include_str!("resilience.js");
+
+/// The end of the failure report of the resilience plugin, as text inside a JavaScript string:
+/// for a HARVEST stage, and for a baseline arm. The report is a fact of the runtime for every
+/// arm. The advice to split the subtask is method, so only HARVEST gets it.
+const RESILIENCE_NEXT_STEPS: (&str, &str) = (
+    "Instead:\\n1. See what actually exists.\\n2. Split the subtask into smaller pieces.\\n",
+    "Instead, see what actually exists.\\n",
+);
 
 const OPENCODE_LOCAL_PERMISSIONS: &[(&str, &str)] = &[
     ("bash", "allow"),
@@ -88,11 +100,10 @@ pub(crate) fn write_project(
         OpenCodeAgentConfig {
             name: invocation.phase.opencode_agent_name(),
             description: invocation.phase.opencode_description(),
-            // The recovery files (PLAN.md/HYPOTHESES.md/CONFORM.md) do
-            // not exist when plan files are disabled.
-            recovery_commands: invocation
-                .plan_files_enabled()
-                .then(|| recovery_commands(&invocation.phase.recovery_files())),
+            recovery_commands: match invocation.arm {
+                Arm::Harvest { .. } => Some(recovery_commands(&invocation.phase.recovery_files())),
+                Arm::Baseline(_) => None,
+            },
         },
         invocation.model,
         invocation.subagent_model,
@@ -118,13 +129,21 @@ fn write_opencode_agent(
     shell: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let work_dir = case.workspace();
-    let agents_dir = work_dir.join(".opencode/agents");
+    let project_dir = work_dir.join(PROJECT_DIR);
+    let agents_dir = project_dir.join("agents");
     fs::create_dir_all(&agents_dir)?;
 
     let models: Vec<&str> = model.into_iter().chain(subagent_model).collect();
-    let staged = custom_provider_stages(&models)?;
+    let mut staged = custom_provider_stages(&models)?;
+    // A run has the project in its temporary case directory. A dry-run keeps it in the output,
+    // which must not hold the key of a provider.
+    if case.dry_run().is_some() {
+        for (_, definition) in &mut staged {
+            mask_secrets(definition);
+        }
+    }
     fs::write(
-        work_dir.join(".opencode/opencode.json"),
+        project_dir.join("opencode.json"),
         opencode_project_config(
             case.root(),
             &OpenCodeProjectOptions {
@@ -159,11 +178,15 @@ fn write_opencode_agent(
         ),
     )?;
 
-    let plugin_dir = work_dir.join(".opencode/plugin");
+    let plugin_dir = project_dir.join("plugin");
     fs::create_dir_all(&plugin_dir)?;
+    let next_steps = match config.recovery_commands {
+        Some(_) => RESILIENCE_NEXT_STEPS.0,
+        None => RESILIENCE_NEXT_STEPS.1,
+    };
     fs::write(
         plugin_dir.join("harvest-resilience.js"),
-        OPENCODE_RESILIENCE_PLUGIN,
+        OPENCODE_RESILIENCE_PLUGIN.replace("{NEXT_STEPS}", next_steps),
     )?;
 
     if let Some(recovery_commands) = &config.recovery_commands {
@@ -317,6 +340,47 @@ fn custom_provider_stages(models: &[&str]) -> Result<Vec<(String, serde_json::Va
         }
     }
     Ok(staged)
+}
+
+/// What stands for a value that [`mask_secrets`] removed.
+pub(crate) const MASKED: &str = "<masked>";
+
+/// The parts of a key name that mark its value as a secret, in lower case. `auth` is also in
+/// `authorization`.
+const SECRET_NAME_PARTS: [&str; 5] = ["key", "token", "secret", "password", "auth"];
+
+/// Replaces each string of a provider definition that can be a secret with [`MASKED`]: every
+/// string below a key whose name has one of [`SECRET_NAME_PARTS`] (for example `apiKey`), and
+/// every string of a `headers` table. The keys of a `models` table are model ids, not names of
+/// settings, so they are not looked at.
+fn mask_secrets(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    fn mask_all(value: &mut Value) {
+        match value {
+            Value::String(text) => *text = MASKED.to_owned(),
+            Value::Array(items) => items.iter_mut().for_each(mask_all),
+            Value::Object(fields) => fields.values_mut().for_each(mask_all),
+            _ => {}
+        }
+    }
+    match value {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                let name = name.to_lowercase();
+                if name == "models" {
+                    if let Value::Object(models) = value {
+                        models.values_mut().for_each(mask_secrets);
+                    }
+                } else if name == "headers" || SECRET_NAME_PARTS.iter().any(|p| name.contains(p)) {
+                    mask_all(value);
+                } else {
+                    mask_secrets(value);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(mask_secrets),
+        _ => {}
+    }
 }
 
 /// The distinct providers of `provider/model` ids, in order.
@@ -587,6 +651,48 @@ mod tests {
     }
 
     #[test]
+    fn secrets_of_a_provider_definition_are_masked() {
+        let mut definition = serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+                "baseURL": "https://example.invalid/v1",
+                "apiKey": "sk-1",
+                "headers": {"X-Org": "org-1", "Authorization": "Bearer t"},
+                "timeout": 600000
+            },
+            "env": ["PROVIDER_API_KEY"],
+            "models": {
+                "token-model": {
+                    "name": "Token model",
+                    "limit": {"context": 1000, "output": 100},
+                    "options": {"maxTokens": 100, "access_token": ["a", {"b": "c"}]}
+                }
+            }
+        });
+        mask_secrets(&mut definition);
+        assert_eq!(
+            definition,
+            serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {
+                    "baseURL": "https://example.invalid/v1",
+                    "apiKey": MASKED,
+                    "headers": {"X-Org": MASKED, "Authorization": MASKED},
+                    "timeout": 600000
+                },
+                "env": ["PROVIDER_API_KEY"],
+                "models": {
+                    "token-model": {
+                        "name": "Token model",
+                        "limit": {"context": 1000, "output": 100},
+                        "options": {"maxTokens": 100, "access_token": [MASKED, {"b": MASKED}]}
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
     fn provider_ids_are_distinct_and_skip_malformed_models() {
         assert_eq!(
             provider_ids(&["harvest-hyak/a", "harvest-hyak/b", "opencode-go/c", "bare"]),
@@ -598,43 +704,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn write_opencode_agent_writes_project_config() {
-        let case = CaseDir::new().unwrap();
-        let dir = case.workspace();
-        write_opencode_agent(
-            &case,
-            OpenCodeAgentConfig {
-                name: "harvest-translate",
-                description: "test",
-                recovery_commands: None,
-            },
-            None,
-            None,
-            &[],
-            None,
-        )
-        .unwrap();
-        let config = fs::read_to_string(dir.join(".opencode/opencode.json")).unwrap();
-        assert_eq!(
-            config,
-            opencode_project_config(case.root(), &Default::default())
-        );
-        let agent_md =
-            fs::read_to_string(dir.join(".opencode/agents/harvest-translate.md")).unwrap();
-        // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
-        // official default provider system prompt applies. The compaction
-        // hint lives in the plugin, not here.
-        assert!(agent_md.ends_with("---\n"));
-        assert!(!agent_md.contains("compaction"));
-        assert!(agent_md.contains(&opencode_task_permission()));
-        // No recovery command -> no plugin.
-        assert!(!dir.join(".opencode/plugin/compaction-recovery.js").exists());
-        case.finish();
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn write_opencode_agent_writes_compaction_recovery_plugin() {
+    fn write_opencode_agent_writes_the_project() {
         let case = CaseDir::new().unwrap();
         let dir = case.workspace();
         write_opencode_agent(
@@ -653,6 +723,18 @@ mod tests {
             None,
         )
         .unwrap();
+        let config = fs::read_to_string(dir.join(".opencode/opencode.json")).unwrap();
+        assert_eq!(
+            config,
+            opencode_project_config(case.root(), &Default::default())
+        );
+        let agent_md = fs::read_to_string(dir.join(".opencode/agents/harvest-verify.md")).unwrap();
+        // The body must be EMPTY so `agent.prompt` stays falsy and OpenCode's
+        // official default provider system prompt applies. The compaction
+        // hint lives in the plugin, not here.
+        assert!(agent_md.ends_with("---\n"));
+        assert!(!agent_md.contains("compaction"));
+        assert!(agent_md.contains(&opencode_task_permission()));
         let plugin =
             fs::read_to_string(dir.join(".opencode/plugin/compaction-recovery.js")).unwrap();
         assert!(plugin.contains("memory: `cat inputs/prompts/main_agent.md`, `cat PLAN.md`. "));
@@ -669,6 +751,41 @@ mod tests {
         assert!(plugin.contains("experimental.session.compacting"));
         // Fallback predicate must not depend solely on the unstable metadata marker.
         assert!(plugin.contains("Continue if you have next steps"));
+        let resilience =
+            fs::read_to_string(dir.join(".opencode/plugin/harvest-resilience.js")).unwrap();
+        assert!(resilience.contains(
+            "  \"Do not trust any file it claimed to create. Instead:\\n1. See what actually \
+             exists.\\n2. Split the subtask into smaller pieces.\\n\"\n"
+        ));
+        case.finish();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_baseline_project_has_no_recovery_plugin_and_no_advice() {
+        let case = CaseDir::new().unwrap();
+        let dir = case.workspace();
+        write_opencode_agent(
+            &case,
+            OpenCodeAgentConfig {
+                name: "harvest-translate",
+                description: "test",
+                recovery_commands: None,
+            },
+            None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(!dir.join(".opencode/plugin/compaction-recovery.js").exists());
+        let resilience =
+            fs::read_to_string(dir.join(".opencode/plugin/harvest-resilience.js")).unwrap();
+        assert!(resilience.contains(
+            "  \"Do not trust any file it claimed to create. Instead, see what actually \
+             exists.\\n\"\n"
+        ));
+        assert!(!resilience.contains("Split") && !resilience.contains("{NEXT_STEPS}"));
         case.finish();
     }
 }

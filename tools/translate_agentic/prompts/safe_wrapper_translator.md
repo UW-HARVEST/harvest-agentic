@@ -1,7 +1,5 @@
 # Safe API wrappers in your subtask
 
-Reader: a translator of the translation stage, when its task message names this file.
-
 This run translates to a safe boundary design. The design document is
 `scout/safe_wrapper/DESIGN.md`. Your task names the sections of it for your subtask. Read these
 sections first. The terms of the design (containers, views, trusted methods, S1 to S11) are defined

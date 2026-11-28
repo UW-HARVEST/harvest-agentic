@@ -14,7 +14,8 @@ slice="${cg%/*}"
 trap 'echo 1 > "$cg/cgroup.kill"' TERM INT HUP
 # A background job reads /dev/null unless stdin is passed on explicitly.
 exec 3<&0
-python3 "$here/harvest-sandbox" "$1" <&3 3<&- &
+# -I: Python does not look for modules in the directory of the script, which the agent can write.
+python3 -I "$here/harvest-sandbox" "$1" <&3 3<&- &
 child=$!
 while :; do
   # The redirect drops bash's own "Killed" job report, not the command's stderr.

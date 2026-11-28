@@ -1,7 +1,5 @@
 # Safe API wrappers: the main agent
 
-Reader: the main agent of the translation stage, when `inputs/prompts/run.md` lists this file.
-
 This run translates to a safe boundary design: the C exports, a wrapper layer, and internal code
 without `unsafe`.
 

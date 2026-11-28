@@ -1,8 +1,5 @@
 # Rules for every main agent
 
-Reader: the main agent of each stage. The prompt file of your stage tells you to read this file
-first. Read it again after each context compaction.
-
 Read these files first:
 
 - `inputs/prompts/common.md`
@@ -28,8 +25,7 @@ more files, and how you tell them.
 - The size of the code base is not a problem. This framework has translated C code bases of more
   than a million lines, and the budget of this run is sufficient. Follow the steps of your stage
   to the end.
-- At the end, report what is done and what is not done. Do not report an item as done when it is
-  not.
+- At the end, report what is done and what is not done.
 
 ## The state file and context compaction
 

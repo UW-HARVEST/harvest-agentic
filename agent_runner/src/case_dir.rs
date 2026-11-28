@@ -18,12 +18,16 @@
 //! read-only before the agent starts, and any change to it is reported
 //! (`harvest_core::fs::ReferenceGuard`). The links are not frozen. The git record keeps them,
 //! and the next stage points them at its own case_dir.
+//!
+//! In a dry-run, case_dir is not temporary: it is [`DRY_RUN_CASE`] in the output of the run, and
+//! it stays there (see `dry_run`).
 
 use std::fs::{self, read_dir};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use harvest_core::config::Config;
 use harvest_core::fs::{
     RawDir, ReferenceGuard, collect_symlinks, remove_hidden_entries, remove_worktree_dir,
 };
@@ -39,6 +43,8 @@ pub const SHARED: &str = "shared";
 pub const SCRATCH: &str = "scratch";
 /// In case_dir.
 pub const TMP: &str = "tmp";
+/// case_dir of a dry-run, in the output of the run.
+pub(crate) const DRY_RUN_CASE: &str = "run_dir";
 
 /// The free space that [`large_temp_dir`] must have before a run starts. The C and test builds
 /// of a large project and the agent's temporary files take some GB, and the file system is
@@ -54,15 +60,15 @@ const MIN_FREE_BYTES: u64 = 4 << 30;
 pub struct CaseDir {
     temp: Option<tempfile::TempDir>,
     root: PathBuf,
+    /// A dry-run: the directory that keeps what the agent would receive. case_dir is its
+    /// [`DRY_RUN_CASE`].
+    dry_run: Option<PathBuf>,
 }
 
 impl CaseDir {
-    /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `shared/` and `tmp/`, and
-    /// `inputs/` with the skill that every stage gives (`agent_skills/cargo_features/`, which the
-    /// prompt file `cargo_features.md` describes). Fails when [`large_temp_dir`] has less than
-    /// [`MIN_FREE_BYTES`] free.
+    /// Creates case_dir in [`large_temp_dir`] with empty `workspace/`, `inputs/`, `shared/` and
+    /// `tmp/`. Fails when [`large_temp_dir`] has less than [`MIN_FREE_BYTES`] free.
     pub fn new() -> io::Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
         let base = large_temp_dir();
         let free = free_bytes(&base)?;
         if free < MIN_FREE_BYTES {
@@ -76,16 +82,37 @@ impl CaseDir {
         }
         let temp = tempfile::Builder::new().tempdir_in(base)?;
         let root = temp.path().to_path_buf();
-        for area in [WORKSPACE, INPUTS, SHARED] {
-            fs::create_dir(root.join(area))?;
-        }
-        fs::DirBuilder::new().mode(0o700).create(root.join(TMP))?;
-        let case = Self {
+        create_areas(&root)?;
+        Ok(Self {
             temp: Some(temp),
             root,
-        };
-        case.write_skill("cargo_features")?;
-        Ok(case)
+            dry_run: None,
+        })
+    }
+
+    /// case_dir of a stage of the run with `config`: [`CaseDir::new`], or for a dry-run the
+    /// directory [`DRY_RUN_CASE`] in the output of the run. That one is not removed.
+    pub fn for_run(config: &Config) -> io::Result<Self> {
+        if !config.dry_run {
+            return Self::new();
+        }
+        // The files of a run name case_dir by its absolute path.
+        let dir = std::path::absolute(&config.output)?;
+        let root = dir.join(DRY_RUN_CASE);
+        fs::create_dir_all(&dir)
+            .and_then(|()| fs::create_dir(&root))
+            .and_then(|()| create_areas(&root))
+            .map_err(|e| io::Error::other(format!("cannot create {}: {e}", root.display())))?;
+        Ok(Self {
+            temp: None,
+            root,
+            dry_run: Some(dir),
+        })
+    }
+
+    /// The directory of a dry-run that keeps what the agent would receive. `None` for a run.
+    pub(crate) fn dry_run(&self) -> Option<&Path> {
+        self.dry_run.as_deref()
     }
 
     pub fn root(&self) -> &Path {
@@ -244,8 +271,20 @@ impl Drop for CaseDir {
                 "[agent_runner] the run failed; its directory is kept for debugging: {}",
                 temp.keep().display()
             );
+        } else if self.dry_run.is_some() {
+            // The directory of a dry-run stays. Writable, so that it can be removed.
+            let _ = set_writable(&self.inputs(), true);
         }
     }
+}
+
+/// Creates the empty areas of the case_dir `root`.
+fn create_areas(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    for area in [WORKSPACE, INPUTS, SHARED] {
+        fs::create_dir(root.join(area))?;
+    }
+    fs::DirBuilder::new().mode(0o700).create(root.join(TMP))
 }
 
 /// The directory for large temporary files: `$TMPDIR` when it names a directory, else
@@ -306,6 +345,7 @@ fn set_writable(path: &Path, writable: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harvest_core::config::Profile;
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -331,10 +371,6 @@ mod tests {
         assert_eq!(
             fs::read_to_string(ws.join("inputs/c_src/src/a.c")).unwrap(),
             "int a;"
-        );
-        assert!(
-            ws.join("inputs/agent_skills/cargo_features/SKILL.md")
-                .is_file()
         );
         fs::write(ws.join("shared/build.o"), "").unwrap();
         assert!(case.shared().join("build.o").exists());
@@ -366,7 +402,7 @@ mod tests {
         fs::create_dir_all(first.c_src()).unwrap();
         fs::write(first.c_src().join("a.c"), "int a;").unwrap();
         first.lock_inputs().unwrap();
-        crate::ensure_workdir_git(&first.workspace());
+        crate::ensure_workdir_git(&first.workspace(), Profile::Harvest);
         first.commit_links(); // already in the baseline commit: nothing to do
         let ws = first.workspace();
         assert!(git(&ws, &["status", "--porcelain"]).is_empty());
@@ -393,7 +429,7 @@ mod tests {
         .unwrap();
         first.finish();
         second.lock_inputs().unwrap();
-        crate::ensure_workdir_git(&second.workspace());
+        crate::ensure_workdir_git(&second.workspace(), Profile::Harvest);
         second.commit_links();
         let ws = second.workspace();
         assert!(git(&ws, &["status", "--porcelain"]).is_empty());
@@ -414,6 +450,34 @@ mod tests {
         drop(case);
         assert!(root.join("inputs/f").exists());
         fs::remove_dir_all(&root).unwrap(); // writable again
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn the_directory_of_a_dry_run_stays_in_the_output() {
+        let out = tempfile::tempdir().unwrap();
+        let mut config = Config::mock();
+        config.dry_run = true;
+        config.output = out.path().join("program");
+        let case = CaseDir::for_run(&config).unwrap();
+        assert_eq!(case.dry_run(), Some(&*config.output));
+        assert_eq!(case.root(), config.output.join(DRY_RUN_CASE));
+        fs::write(case.inputs().join("f"), "").unwrap();
+        let _guard = case.lock_inputs().unwrap();
+        let input = case.inputs().join("f");
+        assert!(fs::write(&input, "x").is_err());
+        drop(case);
+        // The directory stays, and a person can remove it.
+        fs::write(&input, "x").unwrap();
+        // It is the directory of one dry-run.
+        let err = CaseDir::for_run(&config).err().unwrap().to_string();
+        assert!(err.starts_with("cannot create "), "{err}");
+        // A run has a temporary directory.
+        config.dry_run = false;
+        let case = CaseDir::for_run(&config).unwrap();
+        assert_eq!(case.dry_run(), None);
+        assert!(!case.root().starts_with(out.path()));
+        case.finish();
     }
 
     #[test]

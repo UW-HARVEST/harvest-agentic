@@ -1,7 +1,5 @@
 # Data tables (tab2rust): the main agent
 
-Reader: the main agent of the translation stage, when `inputs/prompts/run.md` lists this file.
-
 tab2rust finds large C data tables and writes them as Rust with the exact compiled values.
 
 - The prompt of scout 1 (step 0.2) also contains this line:

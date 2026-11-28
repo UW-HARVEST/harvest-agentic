@@ -1,7 +1,5 @@
 # Static analysis tool wishlist
 
-Reader: the main agent of the stage, when `inputs/prompts/run.md` lists this file.
-
 As you work, pay attention to moments where you think:
 - "If I had a tool that could tell me X, I could skip this lengthy file reading / reasoning."
 - "If I had a tool that could do Y, I would have much higher confidence in this step."

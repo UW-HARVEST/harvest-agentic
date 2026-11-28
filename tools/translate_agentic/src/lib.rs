@@ -4,12 +4,21 @@
 //! by invoking an external agent. After the agent finishes, the generated `Cargo.toml` is
 //! post-processed to satisfy downstream tool expectations.
 //! The translated project is stored in the IR as a [`CargoPackage`](full_source::CargoPackage).
+//!
+//! The profile of the run decides what the agent is given ([`Kit`]): the prompt files, the
+//! skills and the state file of the HARVEST pipeline, or what a baseline arm lists
+//! (`baseline`). Everything else is the same for every profile: the read-only inputs, the
+//! environment of the agent commands, the time limit, the Rust toolchain and the
+//! post-processing.
 
-use agent_runner::{AdditionalPrompt, AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{
+    AdditionalPrompt, AgentInvocation, AgentPhase, Arm, Baseline, CaseDir, PreparedAgent,
+    RustToolchainContext,
+};
 use build_project_spec::{ProjectKind, ProjectSpec};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::cargo_utils::{CargoToml, strip_for_lib};
-use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
+use harvest_core::config::{AgentKind, Profile, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use include_dir::{Dir, include_dir};
@@ -20,8 +29,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// The whole task of the main agent when the stage runs without a plan file and without scouts.
-const PROMPT_TRANSLATE_NO_PLAN: &str = include_str!("prompt_translate_no_plan.md");
+mod baseline;
+
+use baseline::Program;
 
 /// The state file of the main agent, which the framework writes into the workspace as `PLAN.md`
 /// before the agent starts: the sections that the agent fills in. It holds no rules.
@@ -41,7 +51,7 @@ const RULE_FILES: [(&str, &str); 2] = [
         include_str!("../prompts/completion_gate.md"),
     ),
 ];
-/// The main agent and the sub-agent roles of the plan prompt.
+/// The main agent and the sub-agent roles.
 const PLAN_FILES: [(&str, &str); 4] = [
     ("main.md", include_str!("../prompts/main.md")),
     ("scout.md", include_str!("../prompts/scout.md")),
@@ -106,66 +116,33 @@ impl Tool for TranslateAgentic {
             .ok_or("No ProjectSpec representation found in IR")?;
 
         let agent = context.config.agentic_agent;
-        let no_plan = config.no_plan;
-        if !config.tab2rust {
-            check_scout_option("tab2rust = false", no_plan)?;
-        }
-        if config.safe_wrapper {
-            check_scout_option("safe_wrapper = true", no_plan)?;
-        }
+        let program = Program::new(&project_spec.kind, &raw_source.dir);
+        let kit = Kit::new(&config, context.config.profile, &program)?;
 
-        // The agent works in case_dir/workspace/. The C source, the prompt files and, with the plan
-        // prompt, the tab2rust skill are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
-        let case = CaseDir::new()?;
+        // The agent works in case_dir/workspace/. The C source, the prompt files and the skills
+        // are inputs in case_dir/inputs/ (see agent_runner::CaseDir).
+        let case = CaseDir::for_run(&context.config)?;
         let workspace = case.workspace();
         raw_source.dir.materialize(case.c_src())?;
         info!("Working directory: {}", workspace.display());
-
-        // The plan prompt sends scouts; the no-plan prompt does not.
-        let scouts = !no_plan;
-        let tab2rust = scouts && config.tab2rust;
-        // check_scout_option has refused safe_wrapper with no_plan.
-        let safe_wrapper = config.safe_wrapper;
 
         let rust_toolchain_context = agent_runner::detect_rust_toolchain_context(
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-        let workflow_hint = if config.workflow && agent == AgentKind::Claude {
-            "You must use a workflow.\n\n"
-        } else {
-            ""
-        };
-        let translate_prompt = if no_plan {
-            PROMPT_TRANSLATE_NO_PLAN.replace("{WORKFLOW_HINT}", workflow_hint)
-        } else {
-            agent_runner::main_prompt(AgentPhase::Translate)
-        };
-
-        let additional = additional_prompts(tab2rust, safe_wrapper, config.tool_wishlist);
-        let prepared = agent_runner::prepare_agent(AgentInvocation {
-            phase: AgentPhase::Translate,
+        let prepared = kit.prepare(
+            &case,
+            &config,
             agent,
-            case: &case,
-            prompt: &translate_prompt,
-            timeout_secs: config.timeout_secs,
-            model: config.model.as_deref(),
-            subagent_model: config.subagent_model.as_deref(),
-            no_plan,
-            teamclaude: context.config.teamclaude,
-            extra_env: &config.env,
-            output_log_path: config.output_log_path.as_deref(),
-            prompt_record_dir: config.prompt_record_dir.as_deref(),
-            rust_toolchain: &rust_toolchain_context,
-            additional_prompts: &additional,
-            stage_facts: &[],
-        })?;
-        write_stage_files(&case, scouts, tab2rust, safe_wrapper)?;
+            context.config.teamclaude,
+            &rust_toolchain_context,
+        )?;
         let reference_guard = case.lock_inputs()?;
-        prepared.run()?;
+        if let Some(dry_run) = prepared.run()? {
+            return Ok(Box::new(dry_run));
+        }
 
-        // The framework wrote PLAN.md for the plan prompt; the no-plan prompt has none.
-        if !no_plan && !workspace.join("PLAN.md").exists() {
+        if matches!(kit, Kit::Harvest { .. }) && !workspace.join("PLAN.md").exists() {
             warn!("The agent removed PLAN.md, which the framework wrote");
         }
         if !workspace.join("Cargo.toml").exists() {
@@ -177,6 +154,86 @@ impl Tool for TranslateAgentic {
 
         let dir = case.freeze(&reference_guard, config.reference_audit_dir.as_deref())?;
         Ok(Box::new(CargoPackage { dir }))
+    }
+}
+
+/// The kit of the stage: what it gives its agent.
+enum Kit {
+    /// The HARVEST pipeline, with the options of its scout wave.
+    Harvest {
+        tab2rust: bool,
+        safe_wrapper: bool,
+        /// The prompt files that the options add for the main agent.
+        additional: Vec<AdditionalPrompt>,
+    },
+    /// A baseline arm: what its module in `baseline` lists.
+    Baseline(Baseline),
+}
+
+impl Kit {
+    /// What the stage gives its agent in a run with `profile`, for `program`. Fails for a
+    /// baseline when the config sets an option of the HARVEST pipeline, or when the arm cannot
+    /// run.
+    fn new(config: &Config, profile: Profile, program: &Program) -> Result<Self, String> {
+        let stage = match profile {
+            Profile::Harvest => {
+                return Ok(Kit::Harvest {
+                    tab2rust: config.tab2rust,
+                    safe_wrapper: config.safe_wrapper,
+                    additional: additional_prompts(
+                        config.tab2rust,
+                        config.safe_wrapper,
+                        config.tool_wishlist,
+                    ),
+                });
+            }
+            Profile::Vanilla => baseline::vanilla::stage,
+            Profile::Actor => baseline::actor::stage,
+            Profile::C2rust => baseline::c2rust::stage,
+        };
+        config.check_baseline(profile)?;
+        stage(program).map(Kit::Baseline)
+    }
+
+    /// Writes everything that the agent is given into `case`, which holds the C source, and
+    /// returns the agent. It is ready to run when the inputs are locked.
+    fn prepare<'a>(
+        &'a self,
+        case: &'a CaseDir,
+        config: &'a Config,
+        agent: AgentKind,
+        teamclaude: bool,
+        rust_toolchain: &'a RustToolchainContext,
+    ) -> Result<PreparedAgent<'a>, Box<dyn std::error::Error>> {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
+            phase: AgentPhase::Translate,
+            agent,
+            case,
+            arm: match self {
+                Kit::Harvest { additional, .. } => Arm::Harvest {
+                    additional_prompts: additional,
+                    stage_facts: &[],
+                },
+                Kit::Baseline(baseline) => Arm::Baseline(baseline),
+            },
+            timeout_secs: config.timeout_secs,
+            model: config.model.as_deref(),
+            subagent_model: config.subagent_model.as_deref(),
+            teamclaude,
+            extra_env: &config.env,
+            output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
+            rust_toolchain,
+        })?;
+        if let Kit::Harvest {
+            tab2rust,
+            safe_wrapper,
+            ..
+        } = self
+        {
+            write_stage_files(case, *tab2rust, *safe_wrapper)?;
+        }
+        Ok(prepared)
     }
 }
 
@@ -237,18 +294,6 @@ fn post_process(
     Ok(())
 }
 
-/// Refuses an option of the scout wave (`tab2rust = false`, `safe_wrapper = true`) where it has
-/// no effect: only the prompt that sends scouts (the plan prompt) uses tab2rust and the Safe API
-/// Wrapper Designer.
-fn check_scout_option(option: &str, no_plan: bool) -> Result<(), String> {
-    if no_plan {
-        return Err(format!(
-            "{option} has no effect with no_plan: only the plan prompt sends scouts"
-        ));
-    }
-    Ok(())
-}
-
 /// The prompt files that the options of the run add for the main agent. `agent_runner` writes
 /// them and lists them in `run.md`. Each file of an option names the files of the option for the
 /// sub-agents.
@@ -272,25 +317,16 @@ fn additional_prompts(
     files
 }
 
-/// Writes the files of the stage. Into `inputs/prompts/translate/`: the rules of the
-/// translation. With the plan prompt (`plan`) also: the prompt files of the main agent and of the
-/// roles; with tab2rust, its prompt files for the sub-agents and the skill
-/// (`agent_skills/tab2rust/`); with safe_wrapper, its prompt files for the sub-agents and the
-/// framework items (`safe_wrapper_rt/`), from which the designer copies the parts that its design
-/// uses. `agent_runner` writes the files of the options for the main agent
-/// ([`additional_prompts`]). Into the workspace: `PLAN.md`, the state file
-/// of the main agent, and `scout/`, where the scouts and the designer write their reports.
-fn write_stage_files(
-    case: &CaseDir,
-    plan: bool,
-    tab2rust: bool,
-    safe_wrapper: bool,
-) -> io::Result<()> {
+/// Writes the files of a HARVEST stage. Into `inputs/prompts/translate/`: the rules of the
+/// translation, and the prompt files of the main agent and of the roles; with tab2rust, its
+/// prompt files for the sub-agents and the skill (`agent_skills/tab2rust/`); with safe_wrapper,
+/// its prompt files for the sub-agents and the framework items (`safe_wrapper_rt/`), from which
+/// the designer copies the parts that its design uses. `agent_runner` writes the files of the
+/// options for the main agent ([`additional_prompts`]). Into the workspace: `PLAN.md`, the state
+/// file of the main agent, and `scout/`, where the scouts and the designer write their reports.
+fn write_stage_files(case: &CaseDir, tab2rust: bool, safe_wrapper: bool) -> io::Result<()> {
     let stage = AgentPhase::Translate.prompt_dir();
     case.write_prompts(stage, &RULE_FILES)?;
-    if !plan {
-        return Ok(());
-    }
     case.write_prompts(stage, &PLAN_FILES)?;
     if tab2rust {
         case.write_skill("tab2rust")?;
@@ -324,27 +360,16 @@ pub struct Config {
     /// same format as `model`. If absent, the sub-agents use the main model.
     pub subagent_model: Option<String>,
 
-    /// If true, use the minimal baseline prompt: no plan file, no scouts and no sub-agent
-    /// guidance. For controlled experiments that measure the effect of the plan prompt.
-    #[serde(default)]
-    pub no_plan: bool,
-
-    /// Inject a prompt hint encouraging the agent to use dynamic workflows
-    /// (Claude Code's multi-agent orchestration). Only meaningful with no_plan.
-    #[serde(default)]
-    pub workflow: bool,
-
     /// Give the scouts and the translation sub-agents the tab2rust skill
     /// (`agent_skills/tab2rust/`): scout 1 finds the C data tables, and the sub-agents generate
-    /// them as Rust. On by default; the benchmark flag `--no-tab2rust` turns it off. Only the
-    /// prompts that send scouts use it.
+    /// them as Rust. On by default; the benchmark flag `--no-tab2rust` turns it off.
     #[serde(default = "default_tab2rust")]
     pub tab2rust: bool,
 
     /// Send a Safe API Wrapper Designer with the scouts: it designs the safe Rust boundary of the C
     /// library (wrapper types, API wrappers, an internal module under `forbid(unsafe_code)`), and
     /// the translation sub-agents follow the design. Off by default; the benchmark flag
-    /// `--safe-wrapper` turns it on. Only the prompts that send scouts use it.
+    /// `--safe-wrapper` turns it on.
     #[serde(default)]
     pub safe_wrapper: bool,
 
@@ -372,8 +397,9 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
-    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
-    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent,
+    /// a copy of the prompt files, and the list of everything else
+    /// (`.harvest/prompts/<stage>/`). Injected by the benchmark.
     pub prompt_record_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
@@ -401,11 +427,31 @@ impl Config {
     fn validate(&self) {
         unknown_field_warning(&format!("tools.{}", Self::KEY), &self.unknown);
     }
+
+    /// Refuses, for a baseline, each option of the HARVEST pipeline that is not at its default:
+    /// a baseline has no tab2rust, no Safe API Wrapper Designer and no tool wishlist.
+    /// `agent_runner` refuses a sub-agent model.
+    fn check_baseline(&self, profile: Profile) -> Result<(), String> {
+        let options = [
+            (!self.tab2rust, "tab2rust = false"),
+            (self.safe_wrapper, "safe_wrapper = true"),
+            (self.tool_wishlist, "tool_wishlist = true"),
+        ];
+        match options.into_iter().find(|(set, _)| *set) {
+            Some((_, option)) => Err(format!(
+                "tools.{}: {option} is an option of the HARVEST pipeline: the {profile} baseline \
+                 does not take it",
+                Self::KEY
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use agent_runner::prompt_check::Received;
 
     /// A crate as an agent leaves it: `[package]` and the given source files.
     fn agent_crate(sources: &[&str]) -> tempfile::TempDir {
@@ -424,11 +470,12 @@ mod tests {
     }
 
     /// A harvest-bench program, from its `program` block.
-    fn harvest_bench(program: &str) -> ProjectKind {
+    pub(crate) fn harvest_bench(program: &str) -> ProjectKind {
         ProjectKind::HarvestBench(serde_json::from_str(program).unwrap())
     }
 
-    const LIB_AND_BIN: &str = r#"{"lib": {}, "bin": {"name": "toy"}}"#;
+    pub(crate) const LIB_ONLY: &str = r#"{"lib": {}}"#;
+    pub(crate) const LIB_AND_BIN: &str = r#"{"lib": {}, "bin": {"name": "toy"}}"#;
 
     fn post_processed(dir: &Path, kind: &ProjectKind) -> toml_edit::DocumentMut {
         post_process(dir, kind).unwrap();
@@ -469,49 +516,65 @@ mod tests {
         (fs::read_to_string(dir.join("Cargo.toml")).unwrap(), files)
     }
 
-    /// Runs `check` on a case directory that holds the files of a run with these options, as the
-    /// tool writes them.
+    /// Prepares the stage of a run with `profile` and the tool config `config`, with the code
+    /// of the tool, for `program`, in a new case directory with a small C source. Runs `check`
+    /// on the case directory, and returns what the agent receives.
+    pub(crate) fn prepared_stage(
+        profile: Profile,
+        agent: AgentKind,
+        program: &Program,
+        config: serde_json::Value,
+        check: impl Fn(&CaseDir),
+    ) -> Received {
+        let config: Config = serde_json::from_value(config).unwrap();
+        let kit = Kit::new(&config, profile, program).unwrap();
+        received_from(&kit, &config, agent, program, check)
+    }
+
+    /// What the agent receives from the stage of `kit`, as [`prepared_stage`] prepares it.
+    pub(crate) fn received_from(
+        kit: &Kit,
+        config: &Config,
+        agent: AgentKind,
+        program: &Program,
+        check: impl Fn(&CaseDir),
+    ) -> Received {
+        let case = CaseDir::new().unwrap();
+        fs::create_dir_all(case.c_src()).unwrap();
+        fs::write(case.c_src().join("toy.c"), "int toy;\n").unwrap();
+        if let Some(configuration) = program.configuration {
+            fs::write(
+                case.c_src().join(baseline::CONFIGURATION_FILE),
+                configuration,
+            )
+            .unwrap();
+        }
+        let toolchain = RustToolchainContext::for_version("1.99.0");
+        let prepared = kit.prepare(&case, config, agent, true, &toolchain).unwrap();
+        let guard = case.lock_inputs().unwrap();
+        let received = prepared.received().unwrap();
+        check(&case);
+        drop((prepared, guard));
+        case.finish();
+        received
+    }
+
+    /// Runs `check` on a case directory that holds the files of a HARVEST run with these
+    /// options, as the tool writes them.
     fn with_stage_files(
         agent: AgentKind,
-        no_plan: bool,
         tab2rust: bool,
         safe_wrapper: bool,
         check: impl Fn(&CaseDir),
     ) {
-        let case = CaseDir::new().unwrap();
-        let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
-        let env = HashMap::new();
-        agent_runner::prepare_agent(AgentInvocation {
-            phase: AgentPhase::Translate,
-            agent,
-            case: &case,
-            prompt: "",
-            timeout_secs: 1,
-            model: None,
-            subagent_model: None,
-            no_plan,
-            teamclaude: true,
-            extra_env: &env,
-            output_log_path: None,
-            prompt_record_dir: None,
-            rust_toolchain: &toolchain,
-            additional_prompts: &additional_prompts(tab2rust, safe_wrapper, true),
-            stage_facts: &[],
-        })
-        .unwrap();
-        write_stage_files(&case, !no_plan, tab2rust, safe_wrapper).unwrap();
-        let prompt = if no_plan {
-            PROMPT_TRANSLATE_NO_PLAN.to_owned()
-        } else {
-            agent_runner::main_prompt(AgentPhase::Translate)
+        let config = serde_json::json!({
+            "tab2rust": tab2rust, "safe_wrapper": safe_wrapper, "tool_wishlist": true,
+        });
+        let program = Program {
+            kind: &harvest_bench(LIB_ONLY),
+            configuration: None,
         };
-        let name = format!(
-            "translate-{agent:?}-plan_{}-tab2rust_{tab2rust}-safe_wrapper_{safe_wrapper}",
-            !no_plan
-        );
-        agent_runner::prompt_check::dump(&case, &name, &prompt, &["PLAN.md"]).unwrap();
-        check(&case);
-        case.finish();
+        prepared_stage(Profile::Harvest, agent, &program, config, check);
     }
 
     /// The files that the reader of `entry` must read, without `entry`.
@@ -523,7 +586,13 @@ mod tests {
     }
 
     /// What every agent reads, and what a main agent and a sub-agent add to it.
-    const EVERY_AGENT: [&str; 3] = ["common.md", "run.md", "runtime.md"];
+    const EVERY_AGENT: [&str; 5] = [
+        "anti_cheating.md",
+        "common.md",
+        "environment.md",
+        "run.md",
+        "runtime.md",
+    ];
     const MAIN_AGENT: [&str; 2] = ["git_main.md", "main_agent.md"];
     const SUBAGENT: [&str; 2] = ["git_subagent.md", "subagent.md"];
 
@@ -540,7 +609,7 @@ mod tests {
             for (tab2rust, safe_wrapper) in
                 [(false, false), (true, false), (false, true), (true, true)]
             {
-                with_stage_files(agent, false, tab2rust, safe_wrapper, |case| {
+                with_stage_files(agent, tab2rust, safe_wrapper, |case| {
                     let inputs = case.inputs();
                     assert_eq!(
                         agent_runner::prompt_check::problems(&inputs).unwrap(),
@@ -586,16 +655,18 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn each_reader_must_read_the_files_of_its_rules() {
-        with_stage_files(AgentKind::Claude, false, true, true, |case| {
+        with_stage_files(AgentKind::Claude, true, true, |case| {
             let files = agent_runner::prompt_check::load(&case.inputs()).unwrap();
             let rules = "translate/translation_rules.md";
             let gate = "translate/completion_gate.md";
             let features = "cargo_features.md";
+            // The shared file of the study that the rule files of the stage name.
+            let spec = "output_spec.md";
             for (entry, more) in [
-                ("translate/main.md", &[rules, gate, features][..]),
-                ("translate/scout.md", &[features][..]),
-                ("translate/translator.md", &[rules, features][..]),
-                ("translate/reviewer.md", &[rules, gate, features][..]),
+                ("translate/main.md", &[rules, gate, features, spec][..]),
+                ("translate/scout.md", &[features, spec][..]),
+                ("translate/translator.md", &[rules, features, spec][..]),
+                ("translate/reviewer.md", &[rules, gate, features, spec][..]),
                 ("translate/safe_wrapper_designer.md", &[][..]),
             ] {
                 let role: &[&str] = if entry == "translate/main.md" {
@@ -637,7 +708,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn plan_file_holds_state_and_no_rules() {
-        with_stage_files(AgentKind::Claude, false, true, true, |case| {
+        with_stage_files(AgentKind::Claude, true, true, |case| {
             let plan = fs::read_to_string(case.workspace().join("PLAN.md")).unwrap();
             for section in [
                 "## Self-assessment",
@@ -654,29 +725,38 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn no_plan_prompt_names_only_files_that_its_run_has() {
-        // The workflow hint is the one text that the tool puts into the prompt.
-        assert_eq!(
-            agent_runner::prompt_check::placeholders(PROMPT_TRANSLATE_NO_PLAN),
-            ["{WORKFLOW_HINT}"]
-        );
-        with_stage_files(AgentKind::Claude, true, false, false, |case| {
-            let inputs = case.inputs();
-            assert_eq!(
-                agent_runner::prompt_check::problems(&inputs).unwrap(),
-                [""; 0]
-            );
-            let files = agent_runner::prompt_check::load(&inputs).unwrap();
-            let named = agent_runner::prompt_check::references(PROMPT_TRANSLATE_NO_PLAN);
-            assert!(named.contains(&"common.md") && named.contains(&"git_main.md"));
-            for file in named {
-                assert!(files.contains_key(file), "{file}");
+    fn a_baseline_refuses_the_options_of_the_harvest_pipeline() {
+        let program = Program {
+            kind: &harvest_bench(LIB_ONLY),
+            configuration: None,
+        };
+        let kit = |profile, config: serde_json::Value| {
+            let config: Config = serde_json::from_value(config).unwrap();
+            Kit::new(&config, profile, &program).map(|_| ())
+        };
+        for (option, named) in [
+            (serde_json::json!({"tab2rust": false}), "tab2rust = false"),
+            (
+                serde_json::json!({"safe_wrapper": true}),
+                "safe_wrapper = true",
+            ),
+            (
+                serde_json::json!({"tool_wishlist": true}),
+                "tool_wishlist = true",
+            ),
+        ] {
+            kit(Profile::Harvest, option.clone()).unwrap();
+            for profile in Profile::BASELINES {
+                assert_eq!(
+                    kit(profile, option.clone()).unwrap_err(),
+                    format!(
+                        "tools.translate_agentic: {named} is an option of the HARVEST pipeline: \
+                         the {profile} baseline does not take it"
+                    )
+                );
             }
-            // No plan file, no scouts, no roles.
-            assert!(!files.contains_key("translate/main.md"));
-            assert!(!case.workspace().join("PLAN.md").exists());
-        });
+        }
+        kit(Profile::Vanilla, serde_json::json!({})).unwrap();
     }
 
     #[test]

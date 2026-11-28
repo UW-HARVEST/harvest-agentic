@@ -1,6 +1,6 @@
 # Known problems of the agent runtime
 
-Reader: every agent of this run. The agent runtime of this run is Claude Code.
+The agent runtime of this run is Claude Code.
 
 ## Asynchronous sub-agents
 

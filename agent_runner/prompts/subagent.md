@@ -1,11 +1,10 @@
 # Rules for every sub-agent
 
-Reader: every sub-agent of this run. Your task message, or the prompt file of your role, tells
-you to read this file first.
-
 Read these files first:
 
 - `inputs/prompts/common.md`
+- `inputs/prompts/environment.md`
+- `inputs/prompts/anti_cheating.md`
 - `inputs/prompts/git_subagent.md`
 - `inputs/prompts/run.md`
 - `inputs/prompts/runtime.md`

@@ -1,8 +1,5 @@
 # How to build and run the external tests
 
-Reader: the main agent of the conformance stage, and each sub-agent whose task message names this
-file.
-
 The external tests are a **GoogleTest suite** in `inputs/suite/gtest_suite/`. The
 grader builds your crate as a `cdylib`, then builds the suite against
 that `.so` and runs **each test in its own process** (a crash or

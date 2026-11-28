@@ -1,7 +1,5 @@
 # Rules of the quality stage
 
-Reader: the main agent of the quality stage, and each of its sub-agents.
-
 ## Rules for every change (not negotiable)
 
 1. **Behavior stays identical**: the same outputs, return codes and order of checks, the same

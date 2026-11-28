@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use harvest_core::config::{AgentKind, Stage};
+use harvest_core::config::{AgentKind, Profile, Stage};
 use std::path::PathBuf;
 
 /// Which validation harness to run translated projects against.
@@ -92,8 +92,8 @@ pub struct Args {
             "agent",
             "model",
             "subagent_model",
-            "no_plan",
-            "workflow",
+            "baseline",
+            "dry_run",
             "config",
             "test_case",
             "output_dir"
@@ -141,6 +141,25 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub subagent_model: Option<String>,
 
+    /// Run a baseline arm of the ablation study in place of the HARVEST
+    /// pipeline: `vanilla` (the agent alone; translate stage), `actor` (the
+    /// ACTOR prompts; translate and verify stages) or `c2rust` (the
+    /// transpiler, driven by the agent; translate stage). A baseline takes no
+    /// option of the HARVEST pipeline (--no-tab2rust, --safe-wrapper,
+    /// --no-fuzz, --verify-harness, --tool-wishlist, --subagent-model).
+    #[arg(long, requires = "agentic", value_name = "ARM", value_parser = Profile::parse_baseline)]
+    pub baseline: Option<Profile>,
+
+    /// Render what the agent of one stage would receive, and start no agent.
+    /// The stage does everything that a run does up to the moment when its
+    /// agent would start. Each OUTPUT_DIR/<program>/ then holds the prompt,
+    /// the command line of the agent and its run directory (see DRY_RUN.md
+    /// there). Takes one stage; a stage after translate reads snapshots from
+    /// INPUT_DIR, as a run does. Nothing is graded, and the output is not a
+    /// snapshot.
+    #[arg(long, requires = "agentic", conflicts_with = "timeout")]
+    pub dry_run: bool,
+
     /// Start Claude Code directly, or through CCR for a `provider,model`
     /// model, also when the `teamclaude` command is on PATH. Without this
     /// flag, Claude Code runs through TeamClaude (`teamclaude run -- ...`)
@@ -156,17 +175,6 @@ pub struct Args {
     #[arg(long, requires = "agentic")]
     pub test_case: Option<PathBuf>,
 
-    /// Use the minimal baseline prompts in the translate and verify stages of
-    /// this run. For controlled experiments.
-    #[arg(long, requires = "agentic")]
-    pub no_plan: bool,
-
-    /// Inject a prompt hint encouraging the agent to use dynamic workflows
-    /// (Claude Code's multi-agent orchestration feature). Only meaningful with
-    /// --no-plan; requires --agent claude.
-    #[arg(long, requires = "no_plan")]
-    pub workflow: bool,
-
     /// Comparison mechanism the in-loop verification agent is given
     /// (default: gtest). Requires the verify stage.
     #[arg(long, value_enum, requires = "agentic")]
@@ -174,16 +182,14 @@ pub struct Args {
 
     /// Do not give the translate stage the tab2rust skill. By default the
     /// scouts find the C data tables with tab2rust and the translation
-    /// sub-agents generate them. Requires the translate stage. Only the plan
-    /// prompt uses tab2rust, so the flag is an error with --no-plan.
-    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
+    /// sub-agents generate them. Requires the translate stage.
+    #[arg(long, requires = "agentic")]
     pub no_tab2rust: bool,
 
     /// Send a Safe API Wrapper Designer with the scouts of the translate
     /// stage. It designs the safe Rust boundary of the C library, and the
-    /// translation follows the design. Requires the translate stage. Only the
-    /// plan prompt sends scouts, so the flag is an error with --no-plan.
-    #[arg(long, requires = "agentic", conflicts_with = "no_plan")]
+    /// translation follows the design. Requires the translate stage.
+    #[arg(long, requires = "agentic")]
     pub safe_wrapper: bool,
 
     /// Turn off FuzzTest in the verify stage. By default the gtest verify
@@ -257,6 +263,31 @@ impl Args {
         if self.agentic.is_some() && stages.is_empty() {
             return Err("--agentic requires at least one stage".to_owned());
         }
+        // The pipeline checks this too, for the `translate` binary; this reports it before
+        // anything is written.
+        if self.dry_run {
+            Stage::check_dry_run(stages)?;
+        }
+        // The pipeline and the tools check the resolved config too (a profile or an option set
+        // in a config file); this reports a bad combination once, before the run.
+        harvest_translate::cli::check_profile_override(self.baseline, &self.config)?;
+        if let Some(baseline) = self.baseline {
+            baseline.check_stages(stages)?;
+            let harvest_options = [
+                (self.no_tab2rust, "--no-tab2rust"),
+                (self.safe_wrapper, "--safe-wrapper"),
+                (self.no_fuzz, "--no-fuzz"),
+                (self.verify_harness.is_some(), "--verify-harness"),
+                (self.tool_wishlist, "--tool-wishlist"),
+                (self.subagent_model.is_some(), "--subagent-model"),
+            ];
+            if let Some((_, flag)) = harvest_options.into_iter().find(|(set, _)| *set) {
+                return Err(format!(
+                    "{flag} is an option of the HARVEST pipeline: a baseline (--baseline={baseline}) \
+                     does not take it"
+                ));
+            }
+        }
         let translate_only_flags = [
             (self.no_tab2rust, "--no-tab2rust"),
             (self.safe_wrapper, "--safe-wrapper"),
@@ -297,18 +328,11 @@ impl Args {
                 ));
             }
         }
-        let translate_or_verify_flags = [
-            (self.no_plan, "--no-plan"),
-            (self.workflow, "--workflow"),
-            (self.tool_wishlist, "--tool-wishlist"),
-        ];
-        for (set, flag) in translate_or_verify_flags {
-            if set && !has(Stage::Translate) && !has(Stage::Verify) {
-                return Err(format!(
-                    "{flag} requires the translate or verify stage (got --agentic={})",
-                    stages_str()
-                ));
-            }
+        if self.tool_wishlist && !has(Stage::Translate) && !has(Stage::Verify) {
+            return Err(format!(
+                "--tool-wishlist requires the translate or verify stage (got --agentic={})",
+                stages_str()
+            ));
         }
         if self.test_case.is_some() && matches!(stages.first(), None | Some(Stage::Translate)) {
             return Err(format!(
@@ -449,10 +473,116 @@ mod tests {
     }
 
     #[test]
-    fn scout_flags_conflict_with_no_plan() {
-        for flag in ["--no-tab2rust", "--safe-wrapper"] {
-            assert!(parse(&["bench", "--agentic=t", flag, "--no-plan", "in", "out"]).is_err());
+    fn baseline_has_its_stages_and_no_harvest_option() {
+        let check = |argv: &[&str]| {
+            let args = parse(argv).unwrap();
+            args.validate_stages(&args.stages())
+        };
+        for (baseline, stages) in [("vanilla", "t"), ("c2rust", "t"), ("actor", "t,v")] {
+            let (baseline, stages) = (
+                format!("--baseline={baseline}"),
+                format!("--agentic={stages}"),
+            );
+            check(&["bench", &stages, &baseline, "in", "out"]).unwrap();
+            // Bare --agentic is translate,verify; no baseline has the later stages.
+            let all = check(&["bench", "--agentic=t,v,q,c", &baseline, "in", "out"]);
+            assert!(all.unwrap_err().contains("baseline has no"));
+            for option in [
+                &["--no-tab2rust"][..],
+                &["--safe-wrapper"],
+                &["--no-fuzz"],
+                &["--verify-harness", "gtest"],
+                &["--tool-wishlist"],
+                &["--subagent-model", "m"],
+            ] {
+                let mut argv = vec!["bench", &stages, &baseline];
+                argv.extend_from_slice(option);
+                argv.extend(["in", "out"]);
+                let err = check(&argv).unwrap_err();
+                assert!(
+                    err.starts_with(&format!("{} is an option of the HARVEST", option[0])),
+                    "{err}"
+                );
+            }
         }
+        let err = check(&["bench", "--agentic", "--baseline=vanilla", "in", "out"]).unwrap_err();
+        assert_eq!(
+            err,
+            "the vanilla baseline has no verify stage (its stages: translate). Name the stages: \
+             --agentic alone means translate,verify"
+        );
+        check(&["bench", "--agentic=v", "--baseline", "actor", "in", "out"]).unwrap();
+        let two = [
+            "bench",
+            "--agentic=t",
+            "--baseline=actor",
+            "-c",
+            "profile=vanilla",
+            "in",
+            "out",
+        ];
+        assert!(check(&two).unwrap_err().contains("name two profiles"));
+        // A baseline is an arm of the agentic pipeline, and HARVEST is not a baseline.
+        assert!(parse(&["bench", "--baseline=vanilla", "in", "out"]).is_err());
+        assert!(parse(&["bench", "--agentic=t", "--baseline=harvest", "in", "out"]).is_err());
+        assert!(parse(&["bench", "--test", "out", "--baseline=vanilla"]).is_err());
+    }
+
+    #[test]
+    fn a_dry_run_renders_one_agentic_stage_and_grades_nothing() {
+        let check = |argv: &[&str]| {
+            let args = parse(argv).unwrap();
+            args.validate_stages(&args.stages()).map(|()| args.dry_run)
+        };
+        assert_eq!(check(&["bench", "--agentic=t", "in", "out"]), Ok(false));
+        for stage in ["t", "v", "q", "c"] {
+            let stage = format!("--agentic={stage}");
+            assert_eq!(
+                check(&["bench", &stage, "--dry-run", "in", "out"]),
+                Ok(true)
+            );
+        }
+        let baseline = [
+            "bench",
+            "--agentic=v",
+            "--baseline=actor",
+            "--dry-run",
+            "in",
+            "out",
+        ];
+        assert_eq!(check(&baseline), Ok(true));
+        // Bare --agentic is translate,verify.
+        let err = check(&["bench", "--agentic", "--dry-run", "in", "out"]).unwrap_err();
+        assert!(err.starts_with("a dry-run renders one stage"), "{err}");
+        // A baseline keeps its stage rules in a dry-run.
+        let vanilla = [
+            "bench",
+            "--agentic=v",
+            "--baseline=vanilla",
+            "--dry-run",
+            "in",
+            "out",
+        ];
+        assert!(check(&vanilla).unwrap_err().contains("has no verify stage"));
+        // A dry-run is of an agentic stage, and it grades nothing.
+        assert!(parse(&["bench", "--dry-run", "in", "out"]).is_err());
+        let err = check(&["bench", "--modular", "--dry-run", "in", "out"]).unwrap_err();
+        assert!(
+            err.starts_with("a dry-run renders an agentic stage"),
+            "{err}"
+        );
+        assert!(parse(&["bench", "--test", "out", "--dry-run"]).is_err());
+        assert!(parse(&["bench", "--test", "--agentic=t", "--dry-run", "out"]).is_err());
+        let timeout = [
+            "bench",
+            "--agentic=t",
+            "--dry-run",
+            "--timeout",
+            "5",
+            "in",
+            "out",
+        ];
+        assert!(parse(&timeout).is_err());
     }
 
     #[test]

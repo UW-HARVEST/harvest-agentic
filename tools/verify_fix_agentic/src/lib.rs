@@ -5,10 +5,17 @@
 //! The agent compiles and runs both the C and Rust implementations against generated test inputs,
 //! compares their outputs, and iteratively fixes the Rust code until the two agree (or the agent
 //! gives up). This is dynamic, execution-based verification, not a static or formal analysis.
+//!
+//! The profile of the run decides what the agent is given ([`Kit`]): the prompt files, the
+//! test environment and the state file of the HARVEST pipeline, or what a baseline arm lists
+//! (`baseline`). Everything else is the same for every profile.
 
-use agent_runner::{AdditionalPrompt, AgentInvocation, AgentPhase, CaseDir};
+use agent_runner::{
+    AdditionalPrompt, AgentInvocation, AgentPhase, Arm, Baseline, CaseDir, PreparedAgent,
+    RustToolchainContext,
+};
 use full_source::{CargoPackage, RawSource};
-use harvest_core::config::{AgentKind, ToolConfig, unknown_field_warning};
+use harvest_core::config::{AgentKind, Profile, ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
 use harvest_core::{Id, Representation};
 use serde::{Deserialize, Serialize};
@@ -17,9 +24,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// The whole task of the main agent when the stage runs without a hypothesis log. It uses the
-/// libloading method.
-const PROMPT_VERIFY_NO_PLAN: &str = include_str!("prompt_verify_no_plan.md");
+mod baseline;
+
 /// The state file of the main agent, which the framework writes into the workspace as
 /// `HYPOTHESES.md` before the agent starts: the format of a log entry. It holds no rules.
 const HYPOTHESES_MD: &str = include_str!("hypotheses_md.md");
@@ -123,6 +129,7 @@ impl Tool for VerifyFixAgentic {
         config.validate();
 
         let agent = context.config.agentic_agent;
+        let kit = Kit::new(&config, context.config.profile)?;
         let cargo_package = context
             .ir_snapshot
             .get::<CargoPackage>(inputs[0])
@@ -134,7 +141,7 @@ impl Tool for VerifyFixAgentic {
 
         // The agent works in case_dir/workspace/, the materialized CargoPackage. The C source is
         // this stage's oracle, a read-only input in case_dir/inputs/ (see agent_runner::CaseDir).
-        let case = CaseDir::new()?;
+        let case = CaseDir::for_run(&context.config)?;
         let workspace = case.workspace();
         cargo_package.dir.materialize(&workspace)?;
         raw_source.dir.materialize(case.c_src())?;
@@ -144,56 +151,19 @@ impl Tool for VerifyFixAgentic {
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-
-        let workflow_hint = if config.workflow && agent == AgentKind::Claude {
-            "You must use a workflow.\n\n"
-        } else {
-            ""
-        };
-        let prompt = if config.no_plan {
-            PROMPT_VERIFY_NO_PLAN.replace("{WORKFLOW_HINT}", workflow_hint)
-        } else {
-            agent_runner::main_prompt(AgentPhase::Verify)
-        };
-
-        // Materialize the gtest/fuzztest verification environment when that
-        // harness is in effect. It matches the prompt the agent will see: the
-        // no-plan ablation prompt is libloading-only, so skip it there.
-        let gtest_harness_active = config.verify_harness == VerifyHarness::Gtest && !config.no_plan;
-        if gtest_harness_active {
-            materialize_verify_env(&case, config.fuzz)?;
-            info!(
-                "Materialized gtest verification environment (fuzz={})",
-                config.fuzz
-            );
-        }
-
-        let additional = additional_prompts(&config);
-        let prepared = agent_runner::prepare_agent(AgentInvocation {
-            phase: AgentPhase::Verify,
+        let prepared = kit.prepare(
+            &case,
+            &config,
             agent,
-            case: &case,
-            prompt: &prompt,
-            timeout_secs: config.timeout_secs,
-            model: config.model.as_deref(),
-            subagent_model: config.subagent_model.as_deref(),
-            no_plan: config.no_plan,
-            teamclaude: context.config.teamclaude,
-            extra_env: &config.env,
-            output_log_path: config.output_log_path.as_deref(),
-            prompt_record_dir: config.prompt_record_dir.as_deref(),
-            rust_toolchain: &rust_toolchain_context,
-            additional_prompts: &additional,
-            stage_facts: &[],
-        })?;
-        let hypotheses = workspace.join("HYPOTHESES.md");
-        if !config.no_plan {
-            write_stage_files(&case)?;
-        }
+            context.config.teamclaude,
+            &rust_toolchain_context,
+        )?;
         let reference_guard = case.lock_inputs()?;
-        prepared.run()?;
+        if let Some(dry_run) = prepared.run()? {
+            return Ok(Box::new(dry_run));
+        }
         info!("Verification complete");
-        if !config.no_plan && !hypotheses.exists() {
+        if matches!(kit, Kit::Harvest { .. }) && !workspace.join("HYPOTHESES.md").exists() {
             warn!("The agent removed HYPOTHESES.md, which the framework wrote");
         }
 
@@ -218,24 +188,95 @@ impl Tool for VerifyFixAgentic {
     }
 }
 
-/// The prompt files that the options of the run add for the main agent: the method files of a run
-/// with the hypothesis log, and the tool wishlist when it is on. `agent_runner` writes them and
-/// lists them in `run.md`. The harness selects the method, and fuzzing adds its part to the gtest
-/// one. The run without the log has its method in the prompt.
+/// The kit of the stage: what it gives its agent.
+enum Kit {
+    /// The HARVEST pipeline.
+    Harvest {
+        /// The prompt files that the options add for the main agent.
+        additional: Vec<AdditionalPrompt>,
+    },
+    /// A baseline arm: what its module in `baseline` lists.
+    Baseline(Baseline),
+}
+
+impl Kit {
+    /// What the stage gives its agent in a run with `profile`. Fails for a baseline that has
+    /// no verify stage, or when the config sets an option of the HARVEST pipeline.
+    fn new(config: &Config, profile: Profile) -> Result<Self, String> {
+        match profile {
+            Profile::Harvest => Ok(Kit::Harvest {
+                additional: additional_prompts(config),
+            }),
+            Profile::Actor => {
+                config.check_baseline(profile)?;
+                Ok(Kit::Baseline(baseline::actor::stage()))
+            }
+            Profile::Vanilla | Profile::C2rust => {
+                Err(format!("the {profile} baseline has no verify stage"))
+            }
+        }
+    }
+
+    /// Writes everything that the agent is given into `case`, which holds the crate and the C
+    /// source, and returns the agent. It is ready to run when the inputs are locked. HARVEST:
+    /// the gtest harness has its test environment in the workspace.
+    fn prepare<'a>(
+        &'a self,
+        case: &'a CaseDir,
+        config: &'a Config,
+        agent: AgentKind,
+        teamclaude: bool,
+        rust_toolchain: &'a RustToolchainContext,
+    ) -> Result<PreparedAgent<'a>, Box<dyn std::error::Error>> {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
+            phase: AgentPhase::Verify,
+            agent,
+            case,
+            arm: match self {
+                Kit::Harvest { additional } => Arm::Harvest {
+                    additional_prompts: additional,
+                    stage_facts: &[],
+                },
+                Kit::Baseline(baseline) => Arm::Baseline(baseline),
+            },
+            timeout_secs: config.timeout_secs,
+            model: config.model.as_deref(),
+            subagent_model: config.subagent_model.as_deref(),
+            teamclaude,
+            extra_env: &config.env,
+            output_log_path: config.output_log_path.as_deref(),
+            prompt_record_dir: config.prompt_record_dir.as_deref(),
+            rust_toolchain,
+        })?;
+        if matches!(self, Kit::Harvest { .. }) {
+            if config.verify_harness == VerifyHarness::Gtest {
+                materialize_verify_env(case, config.fuzz)?;
+                info!(
+                    "Materialized gtest verification environment (fuzz={})",
+                    config.fuzz
+                );
+            }
+            write_stage_files(case)?;
+        }
+        Ok(prepared)
+    }
+}
+
+/// The prompt files that the options of the run add for the main agent: the method files, and the
+/// tool wishlist when it is on. `agent_runner` writes them and lists them in `run.md`. The harness
+/// selects the method, and fuzzing adds its part to the gtest one.
 fn additional_prompts(config: &Config) -> Vec<AdditionalPrompt> {
     let stage = AgentPhase::Verify.prompt_dir();
     let method = "the test method of this run: how you build, write and run the tests";
     let mut files = Vec::new();
-    if !config.no_plan {
-        match config.verify_harness {
-            VerifyHarness::Gtest => {
-                files.push((METHOD_GTEST, method));
-                if config.fuzz {
-                    files.push((FUZZTEST, "property tests and their campaigns"));
-                }
+    match config.verify_harness {
+        VerifyHarness::Gtest => {
+            files.push((METHOD_GTEST, method));
+            if config.fuzz {
+                files.push((FUZZTEST, "property tests and their campaigns"));
             }
-            VerifyHarness::Libloading => files.push((METHOD_LIBLOADING, method)),
         }
+        VerifyHarness::Libloading => files.push((METHOD_LIBLOADING, method)),
     }
     let mut files: Vec<AdditionalPrompt> = files
         .into_iter()
@@ -249,7 +290,7 @@ fn additional_prompts(config: &Config) -> Vec<AdditionalPrompt> {
     files
 }
 
-/// Writes the files of a run with the hypothesis log. Into `inputs/prompts/verify/`: the prompt
+/// Writes the files of a HARVEST stage. Into `inputs/prompts/verify/`: the prompt
 /// files of the stage. Into the workspace: `HYPOTHESES.md`, the state file of the main agent. A
 /// log that an earlier verification left in the crate stays: the agent continues it.
 fn write_stage_files(case: &CaseDir) -> std::io::Result<()> {
@@ -391,16 +432,6 @@ pub struct Config {
     /// same format as `model`. If absent, the sub-agents use the main model.
     pub subagent_model: Option<String>,
 
-    /// If true, use the minimal baseline prompt: no hypothesis log, no surface files and no
-    /// sub-agent guidance. For controlled experiments that measure the effect of the plan prompt.
-    #[serde(default)]
-    pub no_plan: bool,
-
-    /// Inject a prompt hint encouraging the agent to use dynamic workflows.
-    /// Only meaningful with no_plan.
-    #[serde(default)]
-    pub workflow: bool,
-
     /// Which comparison mechanism the verification prompt describes.
     #[serde(default)]
     pub verify_harness: VerifyHarness,
@@ -432,8 +463,9 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
-    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
-    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent,
+    /// a copy of the prompt files, and the list of everything else
+    /// (`.harvest/prompts/<stage>/`). Injected by the benchmark.
     pub prompt_record_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
@@ -460,17 +492,35 @@ impl ToolConfig for Config {
 impl Config {
     fn validate(&self) {
         unknown_field_warning(&format!("tools.{}", Self::KEY), &self.unknown);
-        if self.verify_harness == VerifyHarness::Gtest && self.no_plan {
-            warn!(
-                "tools.verify_fix_agentic: verify_harness = gtest is not applied under no_plan (that prompt is libloading-only); using libloading"
-            );
+    }
+
+    /// Refuses, for a baseline, each option of the HARVEST pipeline that is not at its default:
+    /// a baseline has no choice of a test harness, no FuzzTest and no tool wishlist.
+    /// `agent_runner` refuses a sub-agent model.
+    fn check_baseline(&self, profile: Profile) -> Result<(), String> {
+        let options = [
+            (
+                self.verify_harness != VerifyHarness::default(),
+                "verify_harness",
+            ),
+            (!self.fuzz, "fuzz = false"),
+            (self.tool_wishlist, "tool_wishlist = true"),
+        ];
+        match options.into_iter().find(|(set, _)| *set) {
+            Some((_, option)) => Err(format!(
+                "tools.{}: {option} is an option of the HARVEST pipeline: the {profile} baseline \
+                 does not take it",
+                Self::KEY
+            )),
+            None => Ok(()),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use agent_runner::prompt_check::Received;
 
     // Exercise the Linux runner with small shell stand-ins, without FuzzTest,
     // Python, a systemd user manager, or large allocations. Miri cannot spawn.
@@ -878,46 +928,42 @@ exit 86
         serde_json::from_value(json).unwrap()
     }
 
-    /// Runs `check` on a case directory that holds the files of a run with `config`, as the tool
-    /// writes them.
-    fn with_stage_files(config: &Config, check: impl Fn(&CaseDir)) {
+    /// The crate of the earlier stage in the workspace of [`prepared_stage`], by its paths in
+    /// the run directory.
+    pub(crate) const CRATE: [&str; 2] = ["workspace/Cargo.toml", "workspace/src/lib.rs"];
+
+    /// Prepares the stage of a run with `profile` and the tool config `config`, with the code
+    /// of the tool, in a new case directory with a small crate ([`CRATE`]) and a small C
+    /// source. Runs `check` on the case directory, and returns what the agent receives.
+    pub(crate) fn prepared_stage(
+        profile: Profile,
+        agent: AgentKind,
+        config: &Config,
+        check: impl Fn(&CaseDir),
+    ) -> Received {
+        let kit = Kit::new(config, profile).unwrap();
         let case = CaseDir::new().unwrap();
-        let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
-        let env = HashMap::new();
-        let additional = additional_prompts(config);
-        agent_runner::prepare_agent(AgentInvocation {
-            phase: AgentPhase::Verify,
-            agent: AgentKind::Claude,
-            case: &case,
-            prompt: "",
-            timeout_secs: 1,
-            model: None,
-            subagent_model: None,
-            no_plan: config.no_plan,
-            teamclaude: true,
-            extra_env: &env,
-            output_log_path: None,
-            prompt_record_dir: None,
-            rust_toolchain: &toolchain,
-            additional_prompts: &additional,
-            stage_facts: &[],
-        })
-        .unwrap();
-        if !config.no_plan {
-            write_stage_files(&case).unwrap();
+        fs::create_dir_all(case.c_src()).unwrap();
+        fs::write(case.c_src().join("toy.c"), "int toy;\n").unwrap();
+        for file in CRATE {
+            let path = case.root().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "# the crate of the earlier stage\n").unwrap();
         }
-        let prompt = if config.no_plan {
-            PROMPT_VERIFY_NO_PLAN.to_owned()
-        } else {
-            agent_runner::main_prompt(AgentPhase::Verify)
-        };
-        let name = format!(
-            "verify-plan_{}-{:?}-fuzz_{}",
-            !config.no_plan, config.verify_harness, config.fuzz
-        );
-        agent_runner::prompt_check::dump(&case, &name, &prompt, &["HYPOTHESES.md"]).unwrap();
+        let toolchain = RustToolchainContext::for_version("1.99.0");
+        let prepared = kit.prepare(&case, config, agent, true, &toolchain).unwrap();
+        let guard = case.lock_inputs().unwrap();
+        let received = prepared.received().unwrap();
         check(&case);
+        drop((prepared, guard));
         case.finish();
+        received
+    }
+
+    /// Runs `check` on a case directory that holds the files of a HARVEST run with `config`, as
+    /// the tool writes them.
+    fn with_stage_files(config: &Config, check: impl Fn(&CaseDir)) {
+        prepared_stage(Profile::Harvest, AgentKind::Claude, config, check);
     }
 
     /// The files that the reader of `entry` must read, without `entry`.
@@ -964,8 +1010,11 @@ exit 86
         with_stage_files(&config(serde_json::json!({})), |case| {
             let files = agent_runner::prompt_check::load(&case.inputs()).unwrap();
             let subagent = [
+                "anti_cheating.md",
                 "common.md",
+                "environment.md",
                 "git_subagent.md",
+                "output_spec.md",
                 "run.md",
                 "runtime.md",
                 "subagent.md",
@@ -974,10 +1023,13 @@ exit 86
             assert_eq!(
                 must_read(&files, "verify/main.md"),
                 [
+                    "anti_cheating.md",
                     "cargo_features.md",
                     "common.md",
+                    "environment.md",
                     "git_main.md",
                     "main_agent.md",
+                    "output_spec.md",
                     "run.md",
                     "runtime.md",
                     "verify/verify_rules.md"
@@ -986,8 +1038,8 @@ exit 86
             assert_eq!(must_read(&files, "verify/surface.md"), subagent);
             assert_eq!(must_read(&files, "verify/reviewer.md"), subagent);
             assert_eq!(must_read(&files, "verify/tester.md"), subagent);
-            let mut fixer = vec!["cargo_features.md"];
-            fixer.extend(subagent);
+            let mut fixer = [&subagent[..], &["cargo_features.md"]].concat();
+            fixer.sort();
             assert_eq!(must_read(&files, "verify/fixer.md"), fixer);
             // A role file names every file itself: a sub-agent does not follow a chain.
             for role in ["surface.md", "tester.md", "fixer.md", "reviewer.md"] {
@@ -1019,41 +1071,51 @@ exit 86
     #[cfg_attr(miri, ignore)]
     fn hypotheses_file_holds_state_and_no_rules() {
         with_stage_files(&config(serde_json::json!({})), |case| {
-            let path = case.workspace().join("HYPOTHESES.md");
-            let text = fs::read_to_string(&path).unwrap();
+            let text = fs::read_to_string(case.workspace().join("HYPOTHESES.md")).unwrap();
             assert!(text.contains("## Hypothesis log") && text.contains("### H<N>:"));
             assert!(!text.contains("Invariants") && !text.contains("inputs/prompts"));
-            // A log of an earlier verification stays.
-            fs::write(&path, "earlier log").unwrap();
-            write_stage_files(case).unwrap();
-            assert_eq!(fs::read_to_string(&path).unwrap(), "earlier log");
         });
+        // A log of an earlier verification stays.
+        let case = CaseDir::new().unwrap();
+        let path = case.workspace().join("HYPOTHESES.md");
+        fs::write(&path, "earlier log").unwrap();
+        write_stage_files(&case).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "earlier log");
+        case.finish();
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn no_plan_prompt_names_only_files_that_its_run_has() {
-        // The workflow hint is the one text that the tool puts into the prompt.
-        assert_eq!(
-            agent_runner::prompt_check::placeholders(PROMPT_VERIFY_NO_PLAN),
-            ["{WORKFLOW_HINT}"]
-        );
-        with_stage_files(&config(serde_json::json!({"no_plan": true})), |case| {
-            let inputs = case.inputs();
+    fn a_baseline_refuses_the_options_of_the_harvest_pipeline() {
+        let kit = |profile, json: serde_json::Value| Kit::new(&config(json), profile).map(|_| ());
+        for (option, named) in [
+            (
+                serde_json::json!({"verify_harness": "libloading"}),
+                "verify_harness",
+            ),
+            (serde_json::json!({"fuzz": false}), "fuzz = false"),
+            (
+                serde_json::json!({"tool_wishlist": true}),
+                "tool_wishlist = true",
+            ),
+        ] {
+            kit(Profile::Harvest, option.clone()).unwrap();
             assert_eq!(
-                agent_runner::prompt_check::problems(&inputs).unwrap(),
-                [""; 0]
+                kit(Profile::Actor, option).unwrap_err(),
+                format!(
+                    "tools.verify_fix_agentic: {named} is an option of the HARVEST pipeline: the \
+                     actor baseline does not take it"
+                )
             );
-            let files = agent_runner::prompt_check::load(&inputs).unwrap();
-            let named = agent_runner::prompt_check::references(PROMPT_VERIFY_NO_PLAN);
-            assert!(named.contains(&"common.md") && named.contains(&"git_main.md"));
-            for file in named {
-                assert!(files.contains_key(file), "{file}");
-            }
-            // No hypothesis log, no roles, and the method is in the prompt.
-            assert!(!files.keys().any(|name| name.starts_with("verify/")));
-            assert!(!case.workspace().join("HYPOTHESES.md").exists());
-        });
+        }
+        // The default harness, as the benchmark gives it, is not a choice.
+        let default = serde_json::json!({"verify_harness": "gtest"});
+        kit(Profile::Actor, default).unwrap();
+        for profile in [Profile::Vanilla, Profile::C2rust] {
+            assert_eq!(
+                kit(profile, serde_json::json!({})).unwrap_err(),
+                format!("the {profile} baseline has no verify stage")
+            );
+        }
     }
 
     #[test]
@@ -1080,25 +1142,17 @@ exit 86
     #[cfg_attr(miri, ignore)]
     fn disabled_fuzz_is_not_disclosed_to_the_agents() {
         for harness in ["gtest", "libloading"] {
-            for no_plan in [false, true] {
-                let config = config(serde_json::json!({
-                    "fuzz": false, "verify_harness": harness, "no_plan": no_plan,
-                }));
-                with_stage_files(&config, |case| {
-                    let mut texts = agent_runner::prompt_check::load(&case.inputs()).unwrap();
-                    texts.insert("the prompt".to_owned(), PROMPT_VERIFY_NO_PLAN.to_owned());
-                    texts.insert("HYPOTHESES.md".to_owned(), HYPOTHESES_MD.to_owned());
-                    for (name, text) in texts {
-                        let text = text.to_ascii_lowercase();
-                        for hint in ["fuzz", "coverage-guided", "property-based"] {
-                            assert!(
-                                !text.contains(hint),
-                                "{harness}/no_plan={no_plan}: {name} reveals {hint}"
-                            );
-                        }
+            let config = config(serde_json::json!({"fuzz": false, "verify_harness": harness}));
+            with_stage_files(&config, |case| {
+                let mut texts = agent_runner::prompt_check::load(&case.inputs()).unwrap();
+                texts.insert("HYPOTHESES.md".to_owned(), HYPOTHESES_MD.to_owned());
+                for (name, text) in texts {
+                    let text = text.to_ascii_lowercase();
+                    for hint in ["fuzz", "coverage-guided", "property-based"] {
+                        assert!(!text.contains(hint), "{harness}: {name} reveals {hint}");
                     }
-                });
-            }
+                }
+            });
         }
     }
 }

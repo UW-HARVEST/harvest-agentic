@@ -4,7 +4,7 @@
 use clap::Parser;
 use config::FileFormat::Toml;
 use directories::ProjectDirs;
-use harvest_core::config::{Config, Stage};
+use harvest_core::config::{Config, Profile, Stage};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,18 @@ pub struct Args {
     #[arg(long = "agent", requires = "agentic", value_parser = |s: &str| s.parse::<harvest_core::config::AgentKind>())]
     pub agentic_agent: Option<harvest_core::config::AgentKind>,
 
+    /// Run a baseline arm of the ablation study in place of the HARVEST pipeline: vanilla (the
+    /// agent alone, translate stage), actor (the ACTOR prompts, translate and verify stages) or
+    /// c2rust (the transpiler, driven by the agent, translate stage).
+    #[arg(long, requires = "agentic", value_name = "ARM", value_parser = Profile::parse_baseline)]
+    pub baseline: Option<Profile>,
+
+    /// Do everything that the agentic stage does up to the moment when its agent would start,
+    /// keep what the agent would receive in the output directory, and start no agent. Takes
+    /// one stage, and makes no result.
+    #[arg(long, requires = "agentic")]
+    pub dry_run: bool,
+
     /// Path to the directory containing the C code to translate.
     // Should always be present unless using a subcommand like --print-config-path
     pub input: Option<PathBuf>,
@@ -61,6 +73,59 @@ pub struct Args {
     /// Path to output directory containing the translated Rust code.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+}
+
+/// Refuses `--baseline` together with a `--config profile=...` that names another profile: the
+/// flag would win without a word.
+pub fn check_profile_override(baseline: Option<Profile>, config: &[String]) -> Result<(), String> {
+    let Some(baseline) = baseline else {
+        return Ok(());
+    };
+    let other = config
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .find(|(name, value)| *name == "profile" && *value != baseline.to_string());
+    match other {
+        Some((_, value)) => Err(format!(
+            "--baseline={baseline} and --config profile={value} name two profiles: give one"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuses the key `dry_run` in the `--config` values (`overrides`) and in the config files.
+/// Only the flag `--dry-run` starts a dry-run: the benchmark knows by the flag that it grades
+/// nothing, so it would grade a dry-run that only the configuration asks for.
+pub fn check_no_dry_run_key(overrides: &[String]) -> Result<(), String> {
+    let dirs = ProjectDirs::from("", "", "harvest").expect("no home directory");
+    no_dry_run_key(overrides, dirs.config_dir())
+}
+
+fn no_dry_run_key(overrides: &[String], config_dir: &Path) -> Result<(), String> {
+    let refused = |place: String| {
+        Err(format!(
+            "{place} sets `dry_run`, which is not a configuration key: only the flag --dry-run \
+             starts a dry-run"
+        ))
+    };
+    let is_key = |entry: &&String| {
+        entry
+            .split_once('=')
+            .is_some_and(|(name, _)| name == "dry_run")
+    };
+    if let Some(entry) = overrides.iter().find(is_key) {
+        return refused(format!("--config {entry}"));
+    }
+    for file in [config_file(config_dir), PathBuf::from("config.toml")] {
+        // A file that cannot be read fails when the configuration is loaded.
+        let settings = config::Config::builder()
+            .add_source(config::File::from(file.clone()).required(false))
+            .build();
+        if settings.is_ok_and(|settings| settings.get::<config::Value>("dry_run").is_ok()) {
+            return refused(format!("the config file {}", file.display()));
+        }
+    }
+    Ok(())
 }
 
 /// Prints out a warning message for every field in `unknown`.
@@ -152,6 +217,12 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
             .expect("settings override failed");
     }
 
+    if let Some(baseline) = args.baseline {
+        settings = settings
+            .set_override("profile", baseline.to_string())
+            .expect("settings override failed");
+    }
+
     // We need to set an override so that deserializing the config does not error.
     // However, the config crate does not support providing a Path in an override.
     // We could convert to a string and back, but that can be lossy. Instead, this just sets a
@@ -188,6 +259,7 @@ fn load_config(args: &Args, config_dir: &Path) -> Config {
     if let Some(ref stage_input) = args.stage_input {
         config.stage_input = Some(stage_input.clone());
     }
+    config.dry_run = args.dry_run;
     config
 }
 
@@ -198,6 +270,65 @@ fn config_file(config_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(miri))]
+    #[test]
+    fn baseline_flag_sets_the_profile() {
+        use super::*;
+        let config_dir = harvest_core::test_util::tempdir().unwrap();
+        let profile =
+            |argv: &[&str]| load_config(&Args::parse_from(argv), config_dir.path()).profile;
+        let run = ["", "a", "--output=/tmp/out", "--agentic=t"];
+        assert_eq!(profile(&run), Profile::Harvest);
+        assert_eq!(
+            profile(&[&run[..], &["--baseline=c2rust"]].concat()),
+            Profile::C2rust
+        );
+        // A baseline is an arm of the agentic pipeline, and HARVEST is not a baseline.
+        assert!(Args::try_parse_from(["", "a", "--baseline=vanilla"]).is_err());
+        assert!(Args::try_parse_from([&run[..], &["--baseline=harvest"]].concat()).is_err());
+        // The flag and a config value must not name two profiles.
+        let config = |value: &str| vec![format!("profile={value}"), "force=true".to_owned()];
+        check_profile_override(Some(Profile::Actor), &config("actor")).unwrap();
+        check_profile_override(None, &config("vanilla")).unwrap();
+        assert_eq!(
+            check_profile_override(Some(Profile::Actor), &config("vanilla")).unwrap_err(),
+            "--baseline=actor and --config profile=vanilla name two profiles: give one"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn dry_run_flag_sets_the_config() {
+        use super::*;
+        let config_dir = harvest_core::test_util::tempdir().unwrap();
+        let dry_run =
+            |argv: &[&str]| load_config(&Args::parse_from(argv), config_dir.path()).dry_run;
+        let run = ["", "a", "--output=/tmp/out", "--agentic=t"];
+        assert!(!dry_run(&run));
+        assert!(dry_run(&[&run[..], &["--dry-run"]].concat()));
+        // A dry-run is of an agentic stage.
+        assert!(Args::try_parse_from(["", "a", "--dry-run"]).is_err());
+        // Only the flag starts a dry-run: the key is refused in --config and in a config file.
+        let key = ["force=true".to_owned(), "dry_run=true".to_owned()];
+        assert!(!dry_run(
+            &[&run[..], &["--config", "dry_run=true"]].concat()
+        ));
+        assert_eq!(
+            no_dry_run_key(&key, config_dir.path()).unwrap_err(),
+            "--config dry_run=true sets `dry_run`, which is not a configuration key: only the \
+             flag --dry-run starts a dry-run"
+        );
+        no_dry_run_key(&key[..1], config_dir.path()).unwrap();
+        let file = config_file(config_dir.path());
+        std::fs::write(&file, "dry_run = true\n").unwrap();
+        assert!(!dry_run(&run));
+        let err = no_dry_run_key(&[], config_dir.path()).unwrap_err();
+        assert!(
+            err.starts_with(&format!("the config file {} sets", file.display())),
+            "{err}"
+        );
+    }
+
     #[cfg(not(miri))]
     #[test]
     fn load_config_test() {

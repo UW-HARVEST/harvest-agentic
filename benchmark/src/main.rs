@@ -21,7 +21,7 @@ use crate::logger::TeeLogger;
 use crate::stats::{ProgramEvalStats, SummaryStats, TestResult, TestType};
 use clap::Parser;
 use harvest_benchmark::quality;
-use harvest_core::config::{AgentKind, Stage};
+use harvest_core::config::{AgentKind, Profile, Stage};
 use harvest_core::stage_manifest::{self, RunRecord, StageManifest};
 use harvest_core::utils::get_version;
 use harvest_core::HarvestIR;
@@ -39,11 +39,13 @@ pub struct TranspilationResult {
     /// The resolved settings of the run (see [`harvest_translate::effective_config`]), for the
     /// stage manifest.
     run_config: serde_json::Value,
+    /// The profile of the run, from its resolved configuration, for the stage manifest.
+    profile: Profile,
 }
 
 impl TranspilationResult {
     /// Extract relevant info from HarvestIR
-    pub fn from_ir(ir: &HarvestIR, run_config: serde_json::Value) -> Self {
+    pub fn from_ir(ir: &HarvestIR, run_config: serde_json::Value, profile: Profile) -> Self {
         let translation_success = raw_cargo_package(ir).is_ok();
         let (build_success, build_error) = match cargo_build_result(ir) {
             // Empty artifacts list indicates build succeeded but produced no output
@@ -60,41 +62,53 @@ impl TranspilationResult {
             build_success,
             build_error,
             run_config,
+            profile,
         }
     }
 }
 
-/// Translates a C source directory to a Rust Cargo project using harvest_translate
-#[allow(clippy::too_many_arguments)]
-pub fn translate_c_directory_to_rust_project(
-    input_dir: &Path,
+/// The configuration of the pipeline run for one program, whose output directory is
+/// `output_dir`.
+fn pipeline_config(
+    program_run: &ProgramRun,
     output_dir: &Path,
     config_overrides: &[String],
-    modular: bool,
-    stages: &[Stage],
-    stage_input: Option<&Path>,
-    agentic_agent: Option<AgentKind>,
-) -> TranspilationResult {
+    opts: &RunOptions,
+) -> harvest_core::config::Config {
     let args: Arc<harvest_translate::cli::Args> = harvest_translate::cli::Args {
-        input: Some(input_dir.to_path_buf()),
+        input: Some(program_run.c_source_dir.clone()),
         output: Some(output_dir.to_path_buf()),
         print_config_path: false,
         config: config_overrides.to_vec(),
         force: false,
-        modular,
-        agentic: (!stages.is_empty()).then(|| stages.to_vec()),
-        stage_input: stage_input.map(Path::to_path_buf),
-        agentic_agent,
+        modular: opts.modular,
+        agentic: (!opts.stages.is_empty()).then(|| opts.stages.clone()),
+        stage_input: program_run.stage_input.clone(),
+        agentic_agent: opts.agent,
+        baseline: opts.baseline,
+        dry_run: opts.dry_run,
     }
     .into();
     let mut config = harvest_translate::cli::initialize(args).expect("Failed to generate config");
+    if config.log_filter.is_empty() {
+        config.log_filter = "off".to_owned(); // Disable console logging in harvest_translate
+    }
+    config
+}
+
+/// Translates the C source of a program to a Rust Cargo project using harvest_translate
+pub fn translate_c_directory_to_rust_project(
+    program_run: &ProgramRun,
+    output_dir: &Path,
+    config_overrides: &[String],
+    opts: &RunOptions,
+) -> TranspilationResult {
+    let config = pipeline_config(program_run, output_dir, config_overrides, opts);
     let run_config = harvest_translate::effective_config(&config).unwrap_or_else(|e| {
         log::warn!("Cannot resolve the tool configuration for the stage manifest: {e}");
         serde_json::Value::Null
     });
-    if config.log_filter.is_empty() {
-        config.log_filter = "off".to_owned(); // Disable console logging in harvest_translate
-    }
+    let profile = config.profile;
     /*
     TODO: This isn't general anyway, only logs a single tool's parameters
 
@@ -110,7 +124,7 @@ pub fn translate_c_directory_to_rust_project(
             // Re-emit the read-only reference inputs, so this output stands on
             // its own as the next stage's (and the grader's) input.
             write_snapshot_references(output_dir, &ir);
-            TranspilationResult::from_ir(&ir, run_config)
+            TranspilationResult::from_ir(&ir, run_config, profile)
         }
         Err(e) => {
             log::error!("Failed to transpile (full error): {:#?}", e);
@@ -119,6 +133,7 @@ pub fn translate_c_directory_to_rust_project(
                 build_success: false,
                 build_error: Some(format!("Failed to transpile: {}", e)),
                 run_config,
+                profile,
             }
         }
     }
@@ -134,9 +149,9 @@ pub struct RunOptions {
     pub agent: Option<AgentKind>,
     pub model: Option<String>,
     pub subagent_model: Option<String>,
+    /// The baseline arm that the agentic stages run as. `None`: the HARVEST pipeline.
+    pub baseline: Option<Profile>,
     pub no_teamclaude: bool,
-    pub no_plan: bool,
-    pub workflow: bool,
     pub test_harness: TestHarness,
     pub verify_harness: crate::cli::VerifyHarness,
     pub no_tab2rust: bool,
@@ -144,6 +159,8 @@ pub struct RunOptions {
     pub no_fuzz: bool,
     pub tool_wishlist: bool,
     pub force: bool,
+    /// Render what the agent of the stage would receive, and start no agent.
+    pub dry_run: bool,
 }
 
 impl RunOptions {
@@ -306,6 +323,7 @@ fn write_stage_manifest(
     let mut runs = run.prior_runs.clone();
     runs.push(RunRecord {
         stages: opts.stages.clone(),
+        profile: translation.profile,
         argv: std::env::args().collect(),
         cwd: std::env::current_dir().unwrap_or_default(),
         harvest_version: get_version().to_owned(),
@@ -315,6 +333,7 @@ fn write_stage_manifest(
             .as_ref()
             .and_then(harvest_core::utils::git_revision),
         reference_modified,
+        arm_summary: stage_manifest::arm_summaries(output_dir, translation.profile, &opts.stages),
         created_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -494,6 +513,104 @@ fn run_test_validation(
     Ok((test_results, error_messages))
 }
 
+/// The config overrides of the pipeline run for one program, whose output directory is
+/// `output_dir`: those of the command line, and the per-stage tool config for the agentic
+/// stages that run in this invocation.
+fn pipeline_overrides(
+    program_run: &ProgramRun,
+    output_root_dir: &Path,
+    output_dir: &Path,
+    opts: &RunOptions,
+) -> Vec<String> {
+    // The output.log path lets each tool append the agent's full JSON trace
+    // to the same log file as benchmark messages.
+    let output_log_path = output_root_dir.join("output.log");
+    let meta_dir = stage_manifest::meta_dir(output_dir);
+    let reference_modified_dir = meta_dir.join(stage_manifest::REFERENCE_MODIFIED_DIR);
+    let prompts_dir = meta_dir.join(stage_manifest::PROMPTS_DIR);
+    let mut effective_overrides = opts.config_overrides.clone();
+    if opts.no_teamclaude {
+        effective_overrides.push("teamclaude=false".to_owned());
+    }
+    // Stage-uniform settings apply to every agentic stage running in this
+    // invocation; use -c tools.<tool>.<key>=... for per-stage overrides.
+    let stage_overrides = |overrides: &mut Vec<String>, tool: &str, stage: Stage| {
+        overrides.push(format!(
+            "tools.{tool}.output_log_path={}",
+            output_log_path.display()
+        ));
+        overrides.push(format!(
+            "tools.{tool}.reference_audit_dir={}",
+            reference_modified_dir.join(stage.to_string()).display()
+        ));
+        overrides.push(format!(
+            "tools.{tool}.prompt_record_dir={}",
+            prompts_dir.join(stage.to_string()).display()
+        ));
+        if let Some(root) = &program_run.test_corpus_root {
+            overrides.push(format!("tools.{tool}.test_corpus_root={}", root.display()));
+        }
+        if let Some(m) = &opts.model {
+            overrides.push(format!("tools.{tool}.model={m}"));
+        }
+        if let Some(m) = &opts.subagent_model {
+            overrides.push(format!("tools.{tool}.subagent_model={m}"));
+        }
+    };
+    // The suite is loaded on every run, whichever translator produces the
+    // crate, so the output can re-emit it and stand on its own; only the
+    // conform stage is given it as an input.
+    if let Some(suite_root) = &program_run.suite_root {
+        effective_overrides.push(format!(
+            "tools.load_test_suite.input_path={}",
+            suite_root.display()
+        ));
+        if let Some(kind) = opts.test_harness.suite_kind() {
+            effective_overrides.push(format!("tools.load_test_suite.harness={kind}"));
+        }
+    }
+    let tool_wishlist_override = |overrides: &mut Vec<String>, tool: &str| {
+        if opts.tool_wishlist {
+            overrides.push(format!("tools.{tool}.tool_wishlist=true"));
+        }
+    };
+    if opts.has(Stage::Translate) {
+        stage_overrides(
+            &mut effective_overrides,
+            "translate_agentic",
+            Stage::Translate,
+        );
+        tool_wishlist_override(&mut effective_overrides, "translate_agentic");
+        if opts.no_tab2rust {
+            effective_overrides.push("tools.translate_agentic.tab2rust=false".to_owned());
+        }
+        if opts.safe_wrapper {
+            effective_overrides.push("tools.translate_agentic.safe_wrapper=true".to_owned());
+        }
+    }
+    if opts.has(Stage::Verify) {
+        stage_overrides(
+            &mut effective_overrides,
+            "verify_fix_agentic",
+            Stage::Verify,
+        );
+        tool_wishlist_override(&mut effective_overrides, "verify_fix_agentic");
+        if opts.verify_harness == crate::cli::VerifyHarness::Gtest {
+            effective_overrides.push("tools.verify_fix_agentic.verify_harness=gtest".to_owned());
+        }
+        if opts.no_fuzz {
+            effective_overrides.push("tools.verify_fix_agentic.fuzz=false".to_owned());
+        }
+    }
+    if opts.has(Stage::Quality) {
+        stage_overrides(&mut effective_overrides, "quality_agentic", Stage::Quality);
+    }
+    if opts.has(Stage::Conform) {
+        stage_overrides(&mut effective_overrides, "conform_agentic", Stage::Conform);
+    }
+    effective_overrides
+}
+
 /// Run all benchmarks for a single program
 fn benchmark_single_program(
     program_run: &ProgramRun,
@@ -556,116 +673,15 @@ fn benchmark_single_program(
         return result;
     }
 
-    // Inject per-stage tool config for the agentic stages that actually run
-    // in this invocation. The agents' reports (PLAN.md, HYPOTHESES.md, ...)
-    // stay in the crate. The framework's own records live under the
-    // snapshot's meta directory.
-    let meta_dir = stage_manifest::meta_dir(&output_dir);
-    std::fs::create_dir_all(&meta_dir).ok();
-
-    // The output.log path lets each tool append the agent's full JSON trace
-    // to the same log file as benchmark messages.
-    let output_log_path = output_root_dir.join("output.log");
-    let reference_modified_dir = meta_dir.join(stage_manifest::REFERENCE_MODIFIED_DIR);
-    let prompts_dir = meta_dir.join(stage_manifest::PROMPTS_DIR);
-    let mut effective_overrides = opts.config_overrides.clone();
-    if opts.no_teamclaude {
-        effective_overrides.push("teamclaude=false".to_owned());
-    }
-    // Stage-uniform settings apply to every agentic stage running in this
-    // invocation; use -c tools.<tool>.<key>=... for per-stage overrides.
-    let stage_overrides = |overrides: &mut Vec<String>, tool: &str, stage: Stage| {
-        overrides.push(format!(
-            "tools.{tool}.output_log_path={}",
-            output_log_path.display()
-        ));
-        overrides.push(format!(
-            "tools.{tool}.reference_audit_dir={}",
-            reference_modified_dir.join(stage.to_string()).display()
-        ));
-        overrides.push(format!(
-            "tools.{tool}.prompt_record_dir={}",
-            prompts_dir.join(stage.to_string()).display()
-        ));
-        if let Some(root) = &program_run.test_corpus_root {
-            overrides.push(format!("tools.{tool}.test_corpus_root={}", root.display()));
-        }
-        if let Some(m) = &opts.model {
-            overrides.push(format!("tools.{tool}.model={m}"));
-        }
-        if let Some(m) = &opts.subagent_model {
-            overrides.push(format!("tools.{tool}.subagent_model={m}"));
-        }
-    };
-    // The suite is loaded on every run, whichever translator produces the
-    // crate, so the output can re-emit it and stand on its own; only the
-    // conform stage is given it as an input.
-    if let Some(suite_root) = &program_run.suite_root {
-        effective_overrides.push(format!(
-            "tools.load_test_suite.input_path={}",
-            suite_root.display()
-        ));
-        if let Some(kind) = opts.test_harness.suite_kind() {
-            effective_overrides.push(format!("tools.load_test_suite.harness={kind}"));
-        }
-    }
-    let prompt_mode_overrides = |overrides: &mut Vec<String>, tool: &str| {
-        if opts.no_plan {
-            overrides.push(format!("tools.{tool}.no_plan=true"));
-        }
-        if opts.workflow {
-            overrides.push(format!("tools.{tool}.workflow=true"));
-        }
-        if opts.tool_wishlist {
-            overrides.push(format!("tools.{tool}.tool_wishlist=true"));
-        }
-    };
-    if opts.has(Stage::Translate) {
-        stage_overrides(
-            &mut effective_overrides,
-            "translate_agentic",
-            Stage::Translate,
-        );
-        prompt_mode_overrides(&mut effective_overrides, "translate_agentic");
-        if opts.no_tab2rust {
-            effective_overrides.push("tools.translate_agentic.tab2rust=false".to_owned());
-        }
-        if opts.safe_wrapper {
-            effective_overrides.push("tools.translate_agentic.safe_wrapper=true".to_owned());
-        }
-    }
-    if opts.has(Stage::Verify) {
-        stage_overrides(
-            &mut effective_overrides,
-            "verify_fix_agentic",
-            Stage::Verify,
-        );
-        prompt_mode_overrides(&mut effective_overrides, "verify_fix_agentic");
-        if opts.verify_harness == crate::cli::VerifyHarness::Gtest {
-            effective_overrides.push("tools.verify_fix_agentic.verify_harness=gtest".to_owned());
-        }
-        if opts.no_fuzz {
-            effective_overrides.push("tools.verify_fix_agentic.fuzz=false".to_owned());
-        }
-    }
-    if opts.has(Stage::Quality) {
-        stage_overrides(&mut effective_overrides, "quality_agentic", Stage::Quality);
-    }
-    if opts.has(Stage::Conform) {
-        stage_overrides(&mut effective_overrides, "conform_agentic", Stage::Conform);
-    }
+    // The agents' reports (PLAN.md, HYPOTHESES.md, ...) stay in the crate. The framework's own
+    // records live under the snapshot's meta directory.
+    std::fs::create_dir_all(stage_manifest::meta_dir(&output_dir)).ok();
+    let effective_overrides = pipeline_overrides(program_run, output_root_dir, &output_dir, opts);
 
     // Run the stage pipeline (translate/verify/quality/conform, or the non-agentic
     // translators), starting from the C source or the snapshot.
-    let translation_result = translate_c_directory_to_rust_project(
-        &test_case_dir,
-        &output_dir,
-        &effective_overrides,
-        opts.modular,
-        &opts.stages,
-        stage_input,
-        opts.agent,
-    );
+    let translation_result =
+        translate_c_directory_to_rust_project(program_run, &output_dir, &effective_overrides, opts);
 
     result.translation_success = translation_result.translation_success;
     result.rust_build_success = translation_result.build_success;
@@ -806,12 +822,48 @@ fn benchmark_single_program(
     result
 }
 
+/// A dry-run for each program: the stage of the run renders what its agent would receive
+/// into the output directory of the program, and starts no agent. Nothing is graded, and no
+/// stage manifest is written: the output is not a snapshot. Fails when a program could not be
+/// rendered, after the other programs.
+fn dry_run_all(
+    program_runs: &[ProgramRun],
+    output_root_dir: &Path,
+    opts: &RunOptions,
+) -> HarvestResult<()> {
+    let mut failed = Vec::new();
+    for program_run in program_runs {
+        let output_dir = output_root_dir.join(&program_run.name);
+        let rendered = prepare_output_dir(&output_dir, opts.force).and_then(|()| {
+            let overrides = pipeline_overrides(program_run, output_root_dir, &output_dir, opts);
+            let config = pipeline_config(program_run, &output_dir, &overrides, opts);
+            let ir = transpile(config.into())?;
+            let dry_run = ir.get_by_representation::<agent_runner::DryRun>().next();
+            let (_, dry_run) = dry_run.ok_or("the stage did not return its dry-run")?;
+            Ok(dry_run.to_string())
+        });
+        match rendered {
+            Ok(dry_run) => log::info!("{}: {dry_run}", program_run.name),
+            Err(e) => {
+                log::error!("The dry-run of {} failed: {e}", program_run.name);
+                failed.push(program_run.name.as_str());
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("the dry-run failed for: {}", failed.join(", ")).into())
+    }
+}
+
 fn main() -> HarvestResult<()> {
     set_user_only_umask();
     let args = Args::parse();
     // Check the arguments before anything is created on disk: an invalid command leaves no
     // output directory and no output.log behind.
     args.validate_stages(&args.stages())?;
+    harvest_translate::cli::check_no_dry_run_key(&args.config)?;
 
     // `--test` grades INPUT_DIR in place, so its log goes there.
     let log_root = match args.test {
@@ -1101,6 +1153,7 @@ fn resume_from(
     snapshot_dir: &Path,
     name: String,
     suite_override: Option<&Path>,
+    baseline: Option<Profile>,
 ) -> HarvestResult<ProgramRun> {
     let manifest = StageManifest::read_from_dir(snapshot_dir).map_err(|e| {
         format!(
@@ -1109,6 +1162,20 @@ fn resume_from(
             snapshot_dir.display()
         )
     })?;
+    // The pipeline checks this too, for each program; here a wrong snapshot stops the run
+    // before any stage starts.
+    manifest
+        .check_resume(baseline.unwrap_or_default())
+        .map_err(|e| format!("snapshot {}: {e}", snapshot_dir.display()))?;
+    if let (None, Some(origin)) = (baseline, manifest.translated_by()) {
+        if origin.is_baseline() {
+            log::warn!(
+                "The {origin} baseline translated snapshot {}; this run continues it with the \
+                 HARVEST pipeline",
+                snapshot_dir.display()
+            );
+        }
+    }
     let c_source_dir = stage_manifest::c_source_dir(snapshot_dir);
     if !c_source_dir.is_dir() {
         return Err(format!(
@@ -1228,12 +1295,16 @@ fn run(args: Args) -> HarvestResult<()> {
             "Modular".to_owned()
         } else if !stages.is_empty() {
             format!(
-                "Agentic ({})",
+                "Agentic ({}{}{})",
                 stages
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
+                args.baseline
+                    .map(|baseline| format!("; baseline {baseline}"))
+                    .unwrap_or_default(),
+                if args.dry_run { "; dry-run" } else { "" }
             )
         } else {
             "All-at-once".to_owned()
@@ -1275,7 +1346,7 @@ fn run(args: Args) -> HarvestResult<()> {
             .to_string_lossy()
             .to_string();
         program_runs.push(if resume_from_snapshot {
-            resume_from(dir, name, args.test_case.as_deref())?
+            resume_from(dir, name, args.test_case.as_deref(), args.baseline)?
         } else {
             start_from_bench(dir, name)?
         });
@@ -1293,9 +1364,8 @@ fn run(args: Args) -> HarvestResult<()> {
             .subagent_model
             .clone()
             .filter(|sub| Some(sub) != args.model.as_ref()),
+        baseline: args.baseline,
         no_teamclaude: args.no_teamclaude,
-        no_plan: args.no_plan,
-        workflow: args.workflow,
         test_harness: args.test_harness,
         verify_harness: args.verify_harness.unwrap_or_default(),
         no_tab2rust: args.no_tab2rust,
@@ -1303,7 +1373,23 @@ fn run(args: Args) -> HarvestResult<()> {
         no_fuzz: args.no_fuzz,
         tool_wishlist: args.tool_wishlist,
         force: args.force,
+        dry_run: args.dry_run,
     };
+    if opts.dry_run {
+        if program_runs.is_empty() {
+            return Err(format!(
+                "nothing to render: {} holds no {}",
+                input_dir.display(),
+                if resume_from_snapshot {
+                    "snapshot of an earlier run, which a stage after translate starts from"
+                } else {
+                    "bench test case"
+                }
+            )
+            .into());
+        }
+        return dry_run_all(&program_runs, output_dir, &opts);
+    }
     let (results, quality_reports) = run_all_benchmarks(&program_runs, output_dir, &opts)?;
     let csv_output_path = output_dir.join("results.csv");
     write_csv_results(&csv_output_path, &results)?;

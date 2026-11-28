@@ -9,7 +9,8 @@ use tracing::{info, warn};
 
 use crate::prompt::RegistryLimits;
 use crate::{
-    AgentInvocation, AgentPhase, BackendEnv, TIMEOUT_EXIT_CODE, append_output_log_line, run_agent,
+    AgentInvocation, AgentPhase, Arm, BackendEnv, EnvVar, TIMEOUT_EXIT_CODE,
+    append_output_log_line, run_agent,
 };
 
 mod config;
@@ -17,7 +18,7 @@ mod export;
 mod registry;
 mod routing;
 
-pub(crate) use config::write_project;
+pub(crate) use config::{MASKED, PROJECT_DIR, write_project};
 pub(crate) use export::export_opencode_sessions;
 pub(crate) use registry::{load_registry_limits, output_cap};
 pub(crate) use routing::{Route, take_routes};
@@ -44,43 +45,19 @@ impl AgentPhase {
 
 pub(crate) fn invoke_opencode(
     invocation: &AgentInvocation<'_>,
+    prompt: &str,
     log_path: &Path,
-    limits: &RegistryLimits,
+    env: &[EnvVar],
 ) -> Result<ExitStatus, Box<dyn std::error::Error>> {
     info!(
-        "Invoking OpenCode {} agent (model={}, subagent_model={}, timeout={}s, extra_env={} vars)",
+        "Invoking OpenCode {} agent (profile={}, model={}, subagent_model={}, timeout={}s, extra_env={} vars)",
         invocation.phase.label(),
+        invocation.arm.profile(),
         invocation.model.unwrap_or("(cli default)"),
         invocation.subagent_model.unwrap_or("(main model)"),
         invocation.timeout_secs,
         invocation.extra_env.len()
     );
-
-    let mut env = BackendEnv::default();
-    // Hide the user-global OpenCode config from the run. OpenCode resolves
-    // its global config dir via xdg-basedir (XDG_CONFIG_HOME/opencode), so a
-    // run-private empty directory makes global plugins, global
-    // opencode.json{,c}, and global AGENTS.md instructions unreachable. Auth
-    // (XDG data dir) and the models cache (XDG cache dir) are unaffected.
-    // This replaces `--pure`, whose single effect (verified in the opencode
-    // source) is to clear the external-plugin list: that would also disable
-    // the project-local compaction-recovery plugin written by
-    // `write_opencode_agent`, while project-local `.opencode/` still loads
-    // here.
-    let xdg_config = invocation.case.root().join("xdg-config");
-    env.defaults
-        .push(("XDG_CONFIG_HOME", xdg_config.display().to_string()));
-    // Temporary workaround for an OpenCode bug (upstream issue #29363).
-    match registry::output_cap(limits) {
-        Some(cap) => env
-            .defaults
-            .push(("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", cap.to_string())),
-        None if invocation.model.is_some() => warn!(
-            "A model of this run has no registry output limit, so every model keeps \
-             OpenCode's 32k output cap (opencode#29363)"
-        ),
-        None => {}
-    }
 
     // One deadline covers the first run and every resume, so resumes cannot
     // stretch the stage past `timeout_secs`.
@@ -91,8 +68,8 @@ pub(crate) fn invoke_opencode(
         invocation.timeout_secs,
         "opencode",
         &opencode_run_args(invocation, None),
-        invocation.prompt,
-        &env,
+        prompt,
+        env,
     )?;
 
     // OpenCode ends the process with success when a provider stream dies
@@ -192,8 +169,8 @@ pub(crate) fn invoke_opencode(
                     remaining_secs,
                     "opencode",
                     &opencode_run_args(invocation, Some(&session_id)),
-                    OPENCODE_RESUME_PROMPT,
-                    &env,
+                    &resume_prompt(invocation),
+                    env,
                 )?;
             }
         }
@@ -202,15 +179,60 @@ pub(crate) fn invoke_opencode(
     Ok(status)
 }
 
-/// Sent when resuming a session whose stream died. It names the failure so the
-/// model does not mistake the gap for a compaction, and points it at the plan
-/// file, which is the only state that survived intact.
-const OPENCODE_RESUME_PROMPT: &str = "\
-Your previous response was cut off by a provider failure. \
-Re-read your plan file to see where you were. \
-Check the filesystem to see which files actually exist before you trust any \
-earlier claim that one was written. \
-Then continue the work from the first unfinished step.";
+/// The environment variables that the backend sets on the agent process.
+pub(crate) fn backend_env(invocation: &AgentInvocation<'_>, limits: &RegistryLimits) -> BackendEnv {
+    let mut env = BackendEnv::default();
+    // Hide the user-global OpenCode config from the run. OpenCode resolves
+    // its global config dir via xdg-basedir (XDG_CONFIG_HOME/opencode), so a
+    // run-private empty directory makes global plugins, global
+    // opencode.json{,c}, and global AGENTS.md instructions unreachable. Auth
+    // (XDG data dir) and the models cache (XDG cache dir) are unaffected.
+    // This replaces `--pure`, whose single effect (verified in the opencode
+    // source) is to clear the external-plugin list: that would also disable
+    // the project-local compaction-recovery plugin written by
+    // `write_opencode_agent`, while project-local `.opencode/` still loads
+    // here.
+    let xdg_config = invocation.case.root().join("xdg-config");
+    env.defaults
+        .push(("XDG_CONFIG_HOME", xdg_config.display().to_string()));
+    // Temporary workaround for an OpenCode bug (upstream issue #29363).
+    match registry::output_cap(limits) {
+        Some(cap) => env
+            .defaults
+            .push(("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", cap.to_string())),
+        None if invocation.model.is_some() => warn!(
+            "A model of this run has no registry output limit, so every model keeps \
+             OpenCode's 32k output cap (opencode#29363)"
+        ),
+        None => {}
+    }
+    env
+}
+
+/// The prompt of a resume of a session whose stream died. It names the failure so the model
+/// does not mistake the gap for a compaction. A HARVEST stage is also pointed at its plan file,
+/// the state that survived intact. A baseline arm has no such file.
+pub(crate) fn resume_prompt(invocation: &AgentInvocation<'_>) -> String {
+    let plan = match invocation.arm {
+        Arm::Harvest { .. } => "Re-read your plan file to see where you were. ",
+        Arm::Baseline(_) => "",
+    };
+    format!(
+        "Your previous response was cut off by a provider failure. {plan}\
+         Check the filesystem to see which files actually exist before you trust any \
+         earlier claim that one was written. \
+         Then continue the work from the first unfinished step."
+    )
+}
+
+/// The command line of the first run of the agent: the program and its arguments. The prompt is
+/// not in it: it goes on stdin.
+pub(crate) fn argv(invocation: &AgentInvocation<'_>) -> Vec<String> {
+    std::iter::once("opencode")
+        .chain(opencode_run_args(invocation, None))
+        .map(str::to_owned)
+        .collect()
+}
 
 fn opencode_run_args<'a>(
     invocation: &AgentInvocation<'a>,

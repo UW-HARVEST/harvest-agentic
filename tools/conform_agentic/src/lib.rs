@@ -23,7 +23,7 @@
 //!   it leaves a trace in the snapshot.
 
 use agent_runner::case_dir::INPUTS;
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir, StageFact};
+use agent_runner::{AgentInvocation, AgentPhase, Arm, CaseDir, StageFact};
 use full_source::{CargoPackage, ExternalTestSuite, RawSource, TestSuiteKind};
 use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::stage_manifest::SUITE_DIR;
@@ -91,8 +91,9 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
-    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
-    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent,
+    /// a copy of the prompt files, and the list of everything else
+    /// (`.harvest/prompts/<stage>/`). Injected by the benchmark.
     pub prompt_record_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract.
@@ -148,7 +149,7 @@ impl Tool for ConformAgentic {
 
         // The agent refines case_dir/workspace/, the materialized CargoPackage. The C source and
         // the external suite are read-only inputs in case_dir/inputs/ (see agent_runner::CaseDir).
-        let case = CaseDir::new()?;
+        let case = CaseDir::for_run(&context.config)?;
         let workspace = case.workspace();
         cargo_package.dir.materialize(&workspace)?;
         raw_source.dir.materialize(case.c_src())?;
@@ -164,25 +165,24 @@ impl Tool for ConformAgentic {
             &context.config.input,
             config.test_corpus_root.as_deref(),
         )?;
-        let prompt = agent_runner::main_prompt(AgentPhase::Conform);
         let facts = [suite_fact(suite.kind)];
 
         let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Conform,
             agent,
             case: &case,
-            prompt: &prompt,
+            arm: Arm::Harvest {
+                additional_prompts: &[],
+                stage_facts: &facts,
+            },
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             subagent_model: config.subagent_model.as_deref(),
-            no_plan: false,
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
-            additional_prompts: &[],
-            stage_facts: &facts,
         })?;
         write_stage_files(
             &case,
@@ -191,7 +191,9 @@ impl Tool for ConformAgentic {
         // Guarding the suite is what keeps this stage honest: an agent that "passes" by editing
         // the tests is reported. The grade runs a pristine copy of the suite in any case.
         let reference_guard = case.lock_inputs()?;
-        prepared.run()?;
+        if let Some(dry_run) = prepared.run()? {
+            return Ok(Box::new(dry_run));
+        }
         info!("Conformance refinement complete");
 
         if !workspace.join(CONFORM_REPORT).is_file() {
@@ -255,29 +257,26 @@ mod tests {
             let toolchain = agent_runner::RustToolchainContext::for_version("1.99.0");
             let env = HashMap::new();
             let facts = [suite_fact(kind)];
-            agent_runner::prepare_agent(AgentInvocation {
+            let prepared = agent_runner::prepare_agent(AgentInvocation {
                 phase: AgentPhase::Conform,
                 agent: harvest_core::config::AgentKind::OpenCode,
                 case: &case,
-                prompt: "",
+                arm: Arm::Harvest {
+                    additional_prompts: &[],
+                    stage_facts: &facts,
+                },
                 timeout_secs: 1,
                 model: None,
                 subagent_model: None,
-                no_plan: false,
                 teamclaude: true,
                 extra_env: &env,
                 output_log_path: None,
                 prompt_record_dir: None,
                 rust_toolchain: &toolchain,
-                additional_prompts: &[],
-                stage_facts: &facts,
             })
             .unwrap();
             write_stage_files(&case, &test_instructions(kind, "1.99.0")).unwrap();
-            let prompt = agent_runner::main_prompt(AgentPhase::Conform);
-            let name = format!("conform-{kind}");
-            agent_runner::prompt_check::dump(&case, &name, &prompt, &[CONFORM_LOG]).unwrap();
-
+            let guard = case.lock_inputs().unwrap();
             let inputs = case.inputs();
             assert_eq!(
                 agent_runner::prompt_check::problems(&inputs).unwrap(),
@@ -292,13 +291,16 @@ mod tests {
             assert_eq!(
                 read,
                 [
+                    "anti_cheating.md",
                     "cargo_features.md",
                     "common.md",
                     "conform/conform_rules.md",
                     "conform/main.md",
                     "conform/tests.md",
+                    "environment.md",
                     "git_main.md",
                     "main_agent.md",
+                    "output_spec.md",
                     "run.md",
                     "runtime.md"
                 ],
@@ -325,6 +327,7 @@ mod tests {
             let log = fs::read_to_string(case.workspace().join(CONFORM_LOG)).unwrap();
             assert!(log.contains("## Log") && log.contains("### C<N>:"));
             assert!(!log.contains("Invariants") && !log.contains("inputs/prompts"));
+            drop((prepared, guard));
             case.finish();
         }
     }

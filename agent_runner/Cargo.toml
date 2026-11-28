@@ -8,6 +8,7 @@ harvest_core.workspace = true
 include_dir = "0.7.4"
 libc.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 tempfile.workspace = true
 tracing.workspace = true
 

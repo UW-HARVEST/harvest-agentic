@@ -1,7 +1,5 @@
 # Git rules for a main agent
 
-Reader: the main agent of each stage.
-
 - The working directory is a git repository. The `main` branch records the
   current state of the work.
 - Only you commit on the `main` branch. Leave one commit with a short message

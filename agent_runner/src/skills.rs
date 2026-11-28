@@ -11,8 +11,10 @@ static SKILLS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../agent_skills");
 /// Directories of a skill that agents do not need: the skill's own tests and Python caches.
 const SKIPPED_DIRS: &[&str] = &["tests", "__pycache__"];
 
-/// Writes the skill `name` (a directory of `agent_skills/`) into `dest`.
-pub(crate) fn materialize(name: &str, dest: &Path) -> io::Result<()> {
+/// Writes the skill `name` (a directory of `agent_skills/`) into `dest`, from the copy that the
+/// binary embeds. A hook of a baseline arm uses it when it needs the files of its skill as the
+/// framework gave them: the copy in `inputs/` of a run is in the hands of the agent.
+pub fn materialize(name: &str, dest: &Path) -> io::Result<()> {
     let skill = SKILLS.get_dir(name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

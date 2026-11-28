@@ -1,14 +1,12 @@
 # Conformance stage: the main agent
 
-Reader: the main agent of the conformance stage. Read this file again after each context
-compaction.
-
 Read these files first:
 
 - `inputs/prompts/main_agent.md`
 - `inputs/prompts/conform/conform_rules.md`
 - `inputs/prompts/conform/tests.md`
 - `inputs/prompts/cargo_features.md`
+- `inputs/prompts/output_spec.md`
 
 ## Task
 

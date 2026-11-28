@@ -1,8 +1,5 @@
 # Property-based fuzzing with FuzzTest
 
-Reader: the main agent of the verification stage, when `inputs/prompts/run.md` lists this file,
-and each sub-agent whose task message names this file.
-
 This file adds to `inputs/prompts/verify/method_gtest.md`. Name it in the prompt of each sub-agent
 that writes or runs tests, and in the prompt of the reviewer. The fuzz coverage map and the item
 that this file adds to the completion gate are duties of the main agent. A sub-agent does only the

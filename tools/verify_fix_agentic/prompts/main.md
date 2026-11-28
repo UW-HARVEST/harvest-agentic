@@ -1,12 +1,10 @@
 # Verification stage: the main agent
 
-Reader: the main agent of the verification stage. Read this file again after each context
-compaction.
-
 Read these files first:
 
 - `inputs/prompts/main_agent.md`
 - `inputs/prompts/verify/verify_rules.md`
+- `inputs/prompts/output_spec.md`
 - `inputs/prompts/cargo_features.md`
 
 ## Task

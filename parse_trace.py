@@ -1778,7 +1778,7 @@ _ISO_TS_RE = re.compile(r"(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
 
 # agent_runner logs one of these per agent process, e.g.
 #   Invoking OpenCode verification agent (model=..., timeout=...)
-#   Invoking Claude Code translation agent (model=..., no_plan=...)
+#   Invoking Claude Code translation agent (model=..., timeout=...)
 # The phase word is whatever AgentPhase::label() returns, so a stage added on
 # the Rust side shows up here without this script being taught about it.
 _RUNNER_INVOKE_RE = re.compile(r"Invoking .+? (\w+) agent\b")

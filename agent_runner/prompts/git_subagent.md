@@ -1,7 +1,5 @@
 # Git rules for a sub-agent
 
-Reader: every sub-agent.
-
 - The work is in a git repository. When your task gives you a git worktree
   (`wt/<name>`), work only inside it. Commit your steps there with short
   messages, on its branch.

@@ -1,15 +1,16 @@
 # Scout task
 
-Reader: a scout of the translation stage.
-
 Read these files first:
 
 - `inputs/prompts/subagent.md`
 - `inputs/prompts/common.md`
+- `inputs/prompts/environment.md`
+- `inputs/prompts/anti_cheating.md`
 - `inputs/prompts/git_subagent.md`
 - `inputs/prompts/run.md`
 - `inputs/prompts/runtime.md`
 - `inputs/prompts/cargo_features.md`
+- `inputs/prompts/output_spec.md`
 
 Read each of these files completely, before you start your task. Do not cut
 a file with `head`, and do not skip a file.

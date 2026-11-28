@@ -1,8 +1,5 @@
 # Verification method: libloading
 
-Reader: the main agent of the verification stage, when `inputs/prompts/run.md` lists this file,
-and each sub-agent whose task message names this file.
-
 Name this file in the prompt of each sub-agent that builds or runs tests. A sub-agent uses this
 file to build both sides, and to write and run the tests of its task. The section "The procedure
 of the main agent" holds the procedure and the duties of the main agent. A sub-agent does only the

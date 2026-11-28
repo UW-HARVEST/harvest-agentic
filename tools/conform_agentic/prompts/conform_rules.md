@@ -1,8 +1,5 @@
 # Rules of the conformance stage
 
-Reader: the main agent of the conformance stage, and each sub-agent whose task message names this
-file.
-
 ## Ground truth
 - The EXTERNAL test suite in `inputs/suite/` defines success. The goal is
   zero external-test failures.

@@ -6,6 +6,7 @@ modular = false
 stages = []
 agentic_agent = "opencode"
 teamclaude = true
+profile = "harvest"
 
 [tools.raw_source_to_cargo_llm]
 address = "http://localhost:11434"

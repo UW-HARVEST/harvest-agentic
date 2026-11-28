@@ -44,15 +44,67 @@ pub(crate) fn limit_available() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// What [`install`] does about the shared limits.
+pub(crate) enum Limits {
+    /// A run: sets them on the host.
+    Set,
+    /// A dry-run: changes nothing on the host. The value tells whether the host can set them
+    /// ([`limit_available`]).
+    Available(bool),
+}
+
 /// Writes the shell into `<case_dir>/agent_env/` and returns its path.
 /// `None` when the slice limits cannot be set: commands then run unlimited.
-pub(crate) fn install(case_root: &Path) -> Option<PathBuf> {
-    try_install(case_root)
+pub(crate) fn install(case_root: &Path, limits: Limits) -> Option<PathBuf> {
+    try_install(case_root, limits)
         .inspect_err(|e| warn!("Agent commands run without memory limits: {e}"))
         .ok()
 }
 
-fn try_install(case_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn try_install(case_root: &Path, limits: Limits) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let shell = write_scripts(case_root)?;
+    let dir = case_root.join("agent_env");
+    match limits {
+        Limits::Set => {
+            let output = Command::new("systemctl")
+                .args(["--user", "set-property", "--runtime", SLICE])
+                .arg(format!("MemoryMax={SLICE_MEMORY_GIB}G"))
+                .arg(format!("MemorySwapMax={SLICE_SWAP_GIB}G"))
+                .output()?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().into());
+            }
+        }
+        Limits::Available(true) => {}
+        Limits::Available(false) => {
+            return Err("the systemd user manager does not answer".into());
+        }
+    }
+    log_sandbox(&dir.join("harvest-sandbox"));
+    Ok(shell)
+}
+
+/// The command that runs `script` as an agent command of the run in `case_root` runs: under the
+/// shared memory limit and the file allowlist of the case directory. It writes the scripts of
+/// `agent_env/` again, so a change that the agent made to them has no effect. A hook of a
+/// baseline arm uses it for a program that works on files of the agent. Without the systemd
+/// user manager the command has the allowlist and no memory limit.
+pub fn agent_command(case_root: &Path, script: &str) -> std::io::Result<Command> {
+    let shell = write_scripts(case_root)?;
+    let mut command = if limit_available() {
+        let mut command = Command::new(&shell);
+        command.arg("-c");
+        command
+    } else {
+        sandbox(&shell.with_file_name("harvest-sandbox"))
+    };
+    command.arg(script);
+    Ok(command)
+}
+
+/// Writes the scripts into `<case_dir>/agent_env/` and returns the path of the shell. Changes
+/// nothing on the host.
+pub(crate) fn write_scripts(case_root: &Path) -> std::io::Result<PathBuf> {
     let dir = case_root.join("agent_env");
     fs::create_dir_all(&dir)?;
     for (name, script) in [
@@ -64,22 +116,21 @@ fn try_install(case_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> 
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
     }
-    let output = Command::new("systemctl")
-        .args(["--user", "set-property", "--runtime", SLICE])
-        .arg(format!("MemoryMax={SLICE_MEMORY_GIB}G"))
-        .arg(format!("MemorySwapMax={SLICE_SWAP_GIB}G"))
-        .output()?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().into());
-    }
-    log_sandbox(&dir.join("harvest-sandbox"));
     Ok(dir.join("harvest-shell"))
 }
 
+/// The start of the script `harvest-sandbox` at `script`. Python runs it in isolated mode: it
+/// then takes no module from the directory of the script, which is in the case directory and
+/// which the agent can write. A module from there would run before the allowlist applies.
+fn sandbox(script: &Path) -> Command {
+    let mut command = Command::new("python3");
+    command.arg("-I").arg(script);
+    command
+}
+
 /// Logs whether the commands get the Landlock allowlist on this host.
-fn log_sandbox(sandbox: &Path) {
-    let abi = Command::new("python3")
-        .arg(sandbox)
+fn log_sandbox(script: &Path) {
+    let abi = sandbox(script)
         .arg("--probe")
         .output()
         .ok()
@@ -101,13 +152,33 @@ mod tests {
     fn sandboxed(case: &Path, command: &str) -> std::process::Output {
         let dir = case.join("agent_env");
         fs::create_dir_all(&dir).unwrap();
-        let sandbox = dir.join("harvest-sandbox");
-        fs::write(&sandbox, HARVEST_SANDBOX).unwrap();
-        Command::new("python3")
-            .arg(&sandbox)
-            .arg(command)
-            .output()
-            .unwrap()
+        let script = dir.join("harvest-sandbox");
+        fs::write(&script, HARVEST_SANDBOX).unwrap();
+        sandbox(&script).arg(command).output().unwrap()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_module_beside_the_sandbox_script_does_not_run() {
+        let root = crate::case_dir::large_temp_dir();
+        let case = tempfile::tempdir_in(&root).unwrap();
+        let other = tempfile::tempdir_in(&root).unwrap();
+        // The script imports ctypes. This one would run with the rights of the framework.
+        let planted = case.path().join("agent_env/ctypes");
+        fs::create_dir_all(&planted).unwrap();
+        fs::write(
+            planted.join("__init__.py"),
+            format!(
+                "open({:?}, 'w').write('escaped')\n",
+                other.path().join("marker")
+            ),
+        )
+        .unwrap();
+        let out = sandboxed(case.path(), "echo ok");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n", "{out:?}");
+        assert!(!other.path().join("marker").exists());
+        // The shell of the agent commands starts the script in the same way.
+        assert!(HARVEST_SHELL_INNER.contains("python3 -I \"$here/harvest-sandbox\""));
     }
 
     #[test]

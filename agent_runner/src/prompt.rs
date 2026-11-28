@@ -1,6 +1,9 @@
-//! The prompt files that every stage gets in `inputs/prompts/`: the rules that all agents, all
-//! main agents and all sub-agents read, and `run.md`, the facts of the run. A prompt file names
-//! another one by its path. The framework does not put the text of one file into another.
+//! The files that the arm of a stage gives its agents (see [`Arm`]). Every stage gets the shared
+//! files of the study (see `shared`). A HARVEST stage also gets the rules that all agents, all
+//! main agents and all sub-agents read, the known problems of the agent runtime, and `run.md`,
+//! the facts of the run. A baseline stage also gets the files that its
+//! [`Baseline`](crate::Baseline) lists. A prompt file names another one by its path. The
+//! framework does not put the text of one file into another.
 
 use std::fs;
 use std::io;
@@ -8,14 +11,18 @@ use std::path::Path;
 
 use harvest_core::config::AgentKind;
 
-use crate::{AgentInvocation, AgentPhase, CaseDir};
+use crate::{AgentInvocation, AgentPhase, Arm};
 
 /// The directory of the prompt files, as the agents name it: relative to the root of a checkout.
 pub const PROMPTS_PATH: &str = "inputs/prompts";
 
-/// The prompt files that are the same in every run, by their name in `inputs/prompts/`.
-const SHARED_FILES: [(&str, &str); 5] = [
+/// The line that starts the list of the files that the reader of a prompt file reads first.
+pub const READ_FIRST: &str = "Read these files first:";
+
+/// The prompt files of every HARVEST stage, by their name in `inputs/prompts/`.
+const HARVEST_FILES: [(&str, &str); 6] = [
     ("common.md", include_str!("../prompts/common.md")),
+    ("main_agent.md", include_str!("../prompts/main_agent.md")),
     ("subagent.md", include_str!("../prompts/subagent.md")),
     ("git_main.md", include_str!("../prompts/git_main.md")),
     (
@@ -27,10 +34,6 @@ const SHARED_FILES: [(&str, &str); 5] = [
         include_str!("../prompts/cargo_features.md"),
     ),
 ];
-
-/// The rules of every main agent. Only a run with a state file gets them: nothing names this file
-/// in a run without one.
-const MAIN_AGENT_FILE: (&str, &str) = ("main_agent.md", include_str!("../prompts/main_agent.md"));
 
 /// The known problems of the agent runtime of the run. Each backend has its text in
 /// `prompts/runtime_<agent>.md`: the upstream bug and the behavior that avoids it. Add an item
@@ -65,8 +68,8 @@ fn runtime_problems(agent: AgentKind) -> &'static str {
     }
 }
 
-/// The prompt of the main agent of a stage: it names the prompt file of the stage, which holds
-/// the task.
+/// The prompt of the main agent of a HARVEST stage: it names the prompt file of the stage, which
+/// holds the task.
 pub fn main_prompt(phase: AgentPhase) -> String {
     format!(
         "You are the main agent of the {} stage of a C-to-Rust translation run.\n\
@@ -76,44 +79,15 @@ pub fn main_prompt(phase: AgentPhase) -> String {
     )
 }
 
-/// The file of a prompt record that holds the prompt of the main agent.
-const RECORDED_PROMPT_FILE: &str = "PROMPT.md";
-
-/// Keeps what the agents of the stage are given in `record`, a directory of the output: the
-/// prompt of the main agent ([`RECORDED_PROMPT_FILE`]) and a copy of `inputs/prompts/`. The
-/// case directory does not outlive the stage, and `run.md` exists nowhere else. A record of an
-/// earlier run of the stage is replaced.
-pub(crate) fn record_prompts(case: &CaseDir, prompt: &str, record: &Path) -> io::Result<()> {
-    fn copy(from: &Path, to: &Path) -> io::Result<()> {
-        fs::create_dir_all(to)?;
-        for entry in fs::read_dir(from)? {
-            let entry = entry?;
-            let target = to.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                copy(&entry.path(), &target)?;
-            } else {
-                // Not `fs::copy`: the inputs are read-only, and the record must not be.
-                fs::write(target, fs::read(entry.path())?)?;
-            }
-        }
-        Ok(())
-    }
-    if record.exists() {
-        fs::remove_dir_all(record)?;
-    }
-    copy(&case.prompts(), record)?;
-    fs::write(record.join(RECORDED_PROMPT_FILE), prompt)
-}
-
 /// A fact of the stage for `run.md`: a section with its heading.
 pub struct StageFact<'a> {
     pub heading: &'a str,
     pub text: String,
 }
 
-/// A prompt file that the run adds for an option of the stage. [`prepare_agent`](crate::prepare_agent)
-/// writes it and `run.md` lists it for the main agent, which reads it and names the files of the
-/// sub-agents in their prompts.
+/// A prompt file that the run adds for an option of the stage.
+/// [`prepare_agent`](crate::prepare_agent) writes it and `run.md` lists it for the main agent,
+/// which reads it and names the files of the sub-agents in their prompts.
 pub struct AdditionalPrompt {
     /// Relative to `inputs/prompts/`.
     pub path: String,
@@ -124,33 +98,73 @@ pub struct AdditionalPrompt {
 }
 
 impl AgentInvocation<'_> {
-    /// Writes the prompt files that every stage gets into `inputs/prompts/`: the shared rules
-    /// (with the rules of every main agent only when the run has a state file), the known
-    /// problems of the agent runtime, the additional prompt files of the run, and `run.md`, which
-    /// lists them.
-    pub(crate) fn write_shared_prompts(
+    /// The prompt of the main agent.
+    pub(crate) fn prompt(&self) -> String {
+        match self.arm {
+            Arm::Harvest { .. } => main_prompt(self.phase),
+            Arm::Baseline(baseline) => baseline.prompt.clone(),
+        }
+    }
+
+    /// Writes what the arm gives every stage. Every arm: into `inputs/prompts/`, the shared
+    /// files of the study. HARVEST: the rules of every stage, the known problems of the agent
+    /// runtime, the additional prompt files of the run and `run.md`, and the skill that
+    /// `cargo_features.md` describes. A baseline: the prompt files, the skills and the workspace
+    /// files that the [`Baseline`](crate::Baseline) lists.
+    pub(crate) fn write_files(
         &self,
         limits: &RegistryLimits,
         shared_limit: bool,
     ) -> io::Result<()> {
-        let dir = self.case.prompts();
-        fs::create_dir_all(&dir)?;
-        let main_agent = self.plan_files_enabled().then_some(MAIN_AGENT_FILE);
-        for (name, text) in SHARED_FILES.into_iter().chain(main_agent) {
-            fs::write(dir.join(name), text)?;
-        }
-        fs::write(dir.join(RUNTIME_FILE), runtime_problems(self.agent))?;
-        for file in self.additional_prompts {
-            let path = dir.join(&file.path);
+        let write = |dir: &Path, path: &str, text: &str| {
+            let path = dir.join(path);
             fs::create_dir_all(path.parent().expect("a file has a parent"))?;
-            fs::write(path, file.text)?;
+            fs::write(path, text)
+        };
+        let prompts = self.case.prompts();
+        for (name, text) in crate::shared::FILES {
+            write(&prompts, name, text)?;
         }
-        fs::write(dir.join(RUN_FILE), self.run_file(limits, shared_limit))
+        match self.arm {
+            Arm::Harvest {
+                additional_prompts, ..
+            } => {
+                for (name, text) in HARVEST_FILES {
+                    write(&prompts, name, text)?;
+                }
+                write(&prompts, RUNTIME_FILE, runtime_problems(self.agent))?;
+                for file in additional_prompts {
+                    write(&prompts, &file.path, file.text)?;
+                }
+                write(&prompts, RUN_FILE, &self.run_file(limits, shared_limit))?;
+                self.case.write_skill("cargo_features")?;
+            }
+            Arm::Baseline(baseline) => {
+                for (path, text) in &baseline.prompt_files {
+                    // A file of an arm must not take the place of a shared file: every arm
+                    // gets the same text.
+                    if crate::shared::FILES.iter().any(|(name, _)| name == path) {
+                        return Err(io::Error::other(format!(
+                            "the {} arm gives the prompt file {path}, which is a shared file",
+                            baseline.profile
+                        )));
+                    }
+                    write(&prompts, path, text)?;
+                }
+                for skill in &baseline.skills {
+                    self.case.write_skill(skill)?;
+                }
+                for (path, text) in &baseline.workspace_files {
+                    write(&self.case.workspace(), path, text)?;
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// The text of `run.md`: the stage, the agent runtime, the models and their limits, the Rust
-    /// toolchain, the additional prompt files of the run, and the facts of the stage. Facts only:
-    /// the prompt files say how to use them.
+    /// The text of `run.md`, which a HARVEST stage gets: the stage, the agent runtime, the models
+    /// and their limits, the Rust toolchain, the machine resources, the additional prompt files
+    /// of the run, and the facts of the stage. Facts only: the prompt files say how to use them.
     /// `shared_limit`: the agent commands run under the shared memory limit of `agent_env`.
     pub(crate) fn run_file(&self, limits: &RegistryLimits, shared_limit: bool) -> String {
         let runtime = match self.agent {
@@ -177,9 +191,9 @@ impl AgentInvocation<'_> {
         let mut lines = vec![
             "# Facts of this run".to_owned(),
             String::new(),
-            "Reader: every agent of this run. The framework wrote this file for this run. It holds"
+            "The framework wrote this file for this run. It holds facts, not rules. The other prompt"
                 .to_owned(),
-            "facts, not rules. The other prompt files tell how to use them.".to_owned(),
+            "files tell how to use them.".to_owned(),
             String::new(),
             "## Stage".to_owned(),
             String::new(),
@@ -212,27 +226,35 @@ impl AgentInvocation<'_> {
             "## Machine resources".to_owned(),
             String::new(),
             machine_resources(shared_limit),
-            String::new(),
-            "## Additional prompt files for the main agent".to_owned(),
-            String::new(),
-            "A sub-agent reads one of these files only when its task message names the file."
-                .to_owned(),
-            String::new(),
         ];
-        if self.additional_prompts.is_empty() {
-            lines.push("None.".to_owned());
-        }
-        for file in self.additional_prompts {
-            lines.push(format!(
-                "- `{PROMPTS_PATH}/{}`: {}",
-                file.path, file.purpose
-            ));
-        }
-        for fact in self.stage_facts {
-            lines.push(String::new());
-            lines.push(format!("## {}", fact.heading));
-            lines.push(String::new());
-            lines.push(fact.text.trim_end().to_owned());
+        if let Arm::Harvest {
+            additional_prompts,
+            stage_facts,
+        } = self.arm
+        {
+            lines.extend([
+                String::new(),
+                "## Additional prompt files for the main agent".to_owned(),
+                String::new(),
+                "A sub-agent reads one of these files only when its task message names the file."
+                    .to_owned(),
+                String::new(),
+            ]);
+            if additional_prompts.is_empty() {
+                lines.push("None.".to_owned());
+            }
+            for file in additional_prompts {
+                lines.push(format!(
+                    "- `{PROMPTS_PATH}/{}`: {}",
+                    file.path, file.purpose
+                ));
+            }
+            for fact in stage_facts {
+                lines.push(String::new());
+                lines.push(format!("## {}", fact.heading));
+                lines.push(String::new());
+                lines.push(fact.text.trim_end().to_owned());
+            }
         }
         lines.join("\n") + "\n"
     }
@@ -311,23 +333,21 @@ pub(crate) struct RegistryLimits {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::prompt_check::placeholders;
     use crate::{AgentPhase, CaseDir, RustToolchainContext};
     use std::collections::HashMap;
 
-    /// An invocation in a new case directory, for a check of what it writes. With `options`, the
-    /// run has an additional prompt file of the stage and the tool wishlist.
-    fn with_invocation(
+    /// A HARVEST invocation of the verify stage in a new case directory, for a check of what it
+    /// writes. With `options`, the run has an additional prompt file of the stage and the tool
+    /// wishlist.
+    pub(crate) fn with_invocation(
         agent: AgentKind,
         subagent_model: Option<&str>,
         options: bool,
         check: impl Fn(&AgentInvocation<'_>),
     ) {
-        let case = CaseDir::new().unwrap();
-        let toolchain = RustToolchainContext::for_version("1.99.0");
-        let env = HashMap::new();
         let additional = [
             AdditionalPrompt {
                 path: "verify/method.md".to_owned(),
@@ -340,33 +360,36 @@ mod tests {
             heading: "External test suite",
             text: "- `inputs/suite/`\n".to_owned(),
         }];
+        let case = CaseDir::new().unwrap();
+        let toolchain = RustToolchainContext::for_version("1.99.0");
+        let env = HashMap::new();
         check(&AgentInvocation {
             phase: AgentPhase::Verify,
             agent,
             case: &case,
-            prompt: "",
+            arm: Arm::Harvest {
+                additional_prompts: if options { &additional } else { &[] },
+                stage_facts: &facts,
+            },
             timeout_secs: 1,
             model: Some("provider/main"),
             subagent_model,
-            no_plan: false,
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
             prompt_record_dir: None,
             rust_toolchain: &toolchain,
-            additional_prompts: if options { &additional } else { &[] },
-            stage_facts: &facts,
         });
         case.finish();
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn shared_prompt_files_are_consistent() {
+    fn harvest_prompt_files_are_consistent() {
         for agent in [AgentKind::Claude, AgentKind::OpenCode] {
             with_invocation(agent, None, true, |invocation| {
                 invocation
-                    .write_shared_prompts(&RegistryLimits::default(), true)
+                    .write_files(&RegistryLimits::default(), true)
                     .unwrap();
                 let inputs = invocation.case.inputs();
                 // The additional prompt files are written where run.md names them.
@@ -377,32 +400,34 @@ mod tests {
                         .into_iter()
                         .collect()
                 };
+                // Every agent reads the facts of the environment and the anti-cheating rules,
+                // which are shared files of the study.
+                let every_agent = ["anti_cheating.md", "environment.md", "run.md", "runtime.md"];
+                let with = |own: [&'static str; 3]| -> Vec<&'static str> {
+                    let mut all = [&own[..], &every_agent].concat();
+                    all.sort();
+                    all
+                };
                 assert_eq!(
                     read("main_agent.md"),
-                    [
-                        "common.md",
-                        "git_main.md",
-                        "main_agent.md",
-                        "run.md",
-                        "runtime.md"
-                    ]
+                    with(["common.md", "git_main.md", "main_agent.md"])
                 );
                 assert_eq!(
                     read("subagent.md"),
-                    [
-                        "common.md",
-                        "git_subagent.md",
-                        "run.md",
-                        "runtime.md",
-                        "subagent.md"
-                    ]
+                    with(["common.md", "git_subagent.md", "subagent.md"])
                 );
                 // A sub-agent without a role file starts at subagent.md, which lists all.
                 assert_eq!(
                     crate::prompt_check::not_listed(&files, "subagent.md"),
                     [""; 0]
                 );
+                // The skill comes with the prompt file that describes it.
                 assert!(files.contains_key("cargo_features.md"));
+                assert!(
+                    inputs
+                        .join("agent_skills/cargo_features/SKILL.md")
+                        .is_file()
+                );
                 assert_eq!(files["verify/method.md"], "# Method\n");
                 assert!(files["tool_wishlist.md"].contains("tool_wishlist.json"));
                 let runtime = match agent {
@@ -410,6 +435,13 @@ mod tests {
                     AgentKind::OpenCode => "OpenCode",
                 };
                 assert!(files["runtime.md"].contains(runtime));
+                // A stage reads the output specification where its own files name it.
+                assert!(files.contains_key("output_spec.md"));
+                assert_eq!(
+                    invocation.prompt(),
+                    "You are the main agent of the verification stage of a C-to-Rust translation \
+                     run.\nRead inputs/prompts/verify/main.md now, and do the task in it.\n"
+                );
             });
         }
     }
@@ -418,49 +450,12 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn a_run_without_options_lists_no_additional_file() {
         with_invocation(AgentKind::Claude, None, false, |off| {
-            off.write_shared_prompts(&RegistryLimits::default(), true)
-                .unwrap();
+            off.write_files(&RegistryLimits::default(), true).unwrap();
             assert!(!off.case.prompts().join("tool_wishlist.md").exists());
             let run = off.run_file(&RegistryLimits::default(), true);
             assert!(run.contains("## Additional prompt files for the main agent"));
             assert!(run.contains("\nNone.\n"), "{run}");
         });
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn a_run_without_state_file_gets_no_rules_of_a_main_agent() {
-        let case = CaseDir::new().unwrap();
-        let toolchain = RustToolchainContext::for_version("1.99.0");
-        let env = HashMap::new();
-        let invocation = AgentInvocation {
-            phase: AgentPhase::Translate,
-            agent: AgentKind::Claude,
-            case: &case,
-            prompt: "",
-            timeout_secs: 1,
-            model: None,
-            subagent_model: None,
-            no_plan: true,
-            teamclaude: true,
-            extra_env: &env,
-            output_log_path: None,
-            prompt_record_dir: None,
-            rust_toolchain: &toolchain,
-            additional_prompts: &[],
-            stage_facts: &[],
-        };
-        invocation
-            .write_shared_prompts(&RegistryLimits::default(), true)
-            .unwrap();
-        let prompts = case.prompts();
-        assert!(!prompts.join("main_agent.md").exists());
-        assert!(prompts.join("subagent.md").exists() && prompts.join("common.md").exists());
-        assert_eq!(
-            crate::prompt_check::problems(&case.inputs()).unwrap(),
-            [""; 0]
-        );
-        case.finish();
     }
 
     #[test]
@@ -547,49 +542,6 @@ mod tests {
                  \x20 - output limit of one response: 32000 tokens (default: the agent runtime gives no value)\n";
                 assert!(run.contains(models), "{run}");
             },
-        );
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn prompt_record_holds_the_prompt_and_the_prompt_files() {
-        with_invocation(AgentKind::Claude, None, true, |invocation| {
-            invocation
-                .write_shared_prompts(&RegistryLimits::default(), true)
-                .unwrap();
-            let inputs = invocation.case.lock_inputs().unwrap();
-            let out = tempfile::tempdir().unwrap();
-            let record = out.path().join("prompts/verify");
-            // A record of an earlier run of the stage goes.
-            fs::create_dir_all(&record).unwrap();
-            fs::write(record.join("stale.md"), "old").unwrap();
-            record_prompts(invocation.case, "the prompt\n", &record).unwrap();
-            assert!(!record.join("stale.md").exists());
-            assert_eq!(
-                fs::read_to_string(record.join(RECORDED_PROMPT_FILE)).unwrap(),
-                "the prompt\n"
-            );
-            for file in ["run.md", "common.md", "verify/method.md"] {
-                assert_eq!(
-                    fs::read(record.join(file)).unwrap(),
-                    fs::read(invocation.case.prompts().join(file)).unwrap(),
-                    "{file}"
-                );
-            }
-            // The inputs are read-only; the record is an ordinary file.
-            let writable = |path: &Path| !fs::metadata(path).unwrap().permissions().readonly();
-            assert!(!writable(&invocation.case.prompts().join("run.md")));
-            assert!(writable(&record.join("run.md")));
-            drop(inputs);
-        });
-    }
-
-    #[test]
-    fn main_prompt_names_the_prompt_file_of_the_stage() {
-        assert_eq!(
-            main_prompt(AgentPhase::Verify),
-            "You are the main agent of the verification stage of a C-to-Rust translation run.\n\
-             Read inputs/prompts/verify/main.md now, and do the task in it.\n"
         );
     }
 }

@@ -39,6 +39,30 @@ impl fmt::Display for Stage {
     }
 }
 
+impl Stage {
+    /// Refuses the stages of a dry-run that cannot be rendered. A dry-run renders one agentic
+    /// stage: a later stage starts from the result of the stage before it, and a dry-run makes
+    /// no result.
+    pub fn check_dry_run(stages: &[Stage]) -> Result<(), String> {
+        match stages {
+            [_] => Ok(()),
+            [] => Err("a dry-run renders an agentic stage: give --agentic=<stage>".to_owned()),
+            _ => Err(format!(
+                "a dry-run renders one stage, and this run has {}: {}. A later stage starts \
+                 from the result of the stage before it, and a dry-run makes no result. Name \
+                 one stage: --agentic=<stage>. A stage after translate takes a snapshot of an \
+                 earlier run as its input",
+                stages.len(),
+                stages
+                    .iter()
+                    .map(Stage::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+}
+
 impl FromStr for Stage {
     type Err = String;
 
@@ -50,6 +74,111 @@ impl FromStr for Stage {
             "conform" | "c" => Ok(Stage::Conform),
             other => Err(format!(
                 "unknown stage: {other} (expected: translate/t, verify/v, quality/q, conform/c)"
+            )),
+        }
+    }
+}
+
+/// What selects everything that the agents of a run are given: the HARVEST pipeline, or one
+/// baseline arm of the ablation study. One value for the whole run. A baseline replaces the
+/// prompts, the files, the skills and the backend extras of HARVEST with its own, and has only
+/// the stages of [`Profile::stages`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// The HARVEST pipeline.
+    #[default]
+    Harvest,
+    /// The agent with its native ability: one task sentence.
+    Vanilla,
+    /// The prompts of the ACTOR system.
+    Actor,
+    /// The transpiler c2rust, driven by the agent.
+    C2rust,
+}
+
+impl Profile {
+    /// The baseline arms.
+    pub const BASELINES: [Profile; 3] = [Profile::Vanilla, Profile::Actor, Profile::C2rust];
+
+    pub fn is_baseline(self) -> bool {
+        self != Profile::Harvest
+    }
+
+    /// The stages that a run with this profile can have.
+    pub fn stages(self) -> &'static [Stage] {
+        match self {
+            Profile::Harvest => &[
+                Stage::Translate,
+                Stage::Verify,
+                Stage::Quality,
+                Stage::Conform,
+            ],
+            Profile::Actor => &[Stage::Translate, Stage::Verify],
+            Profile::Vanilla | Profile::C2rust => &[Stage::Translate],
+        }
+    }
+
+    /// Refuses the stages of a run that this profile does not have. A baseline runs only as
+    /// agentic stages.
+    pub fn check_stages(self, stages: &[Stage]) -> Result<(), String> {
+        if !self.is_baseline() {
+            return Ok(());
+        }
+        let own = self
+            .stages()
+            .iter()
+            .map(Stage::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if stages.is_empty() {
+            return Err(format!(
+                "the {self} baseline runs only as agentic stages ({own}): give --agentic=<stages>"
+            ));
+        }
+        match stages.iter().find(|stage| !self.stages().contains(stage)) {
+            // The most likely cause is `--agentic` without a value.
+            Some(stage) => Err(format!(
+                "the {self} baseline has no {stage} stage (its stages: {own}). Name the stages: \
+                 --agentic alone means translate,verify"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Parses the value of `--baseline`: the name of a baseline arm.
+    pub fn parse_baseline(name: &str) -> Result<Self, String> {
+        match name.parse::<Profile>() {
+            Ok(profile) if profile.is_baseline() => Ok(profile),
+            _ => Err(format!(
+                "unknown baseline: {name} (expected: vanilla, actor, c2rust)"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Profile::Harvest => "harvest",
+            Profile::Vanilla => "vanilla",
+            Profile::Actor => "actor",
+            Profile::C2rust => "c2rust",
+        })
+    }
+}
+
+impl FromStr for Profile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "harvest" => Ok(Profile::Harvest),
+            "vanilla" => Ok(Profile::Vanilla),
+            "actor" => Ok(Profile::Actor),
+            "c2rust" => Ok(Profile::C2rust),
+            other => Err(format!(
+                "unknown profile: {other} (expected: harvest, vanilla, actor, c2rust)"
             )),
         }
     }
@@ -126,6 +255,17 @@ pub struct Config {
     /// `teamclaude` command is on PATH. No effect on the other agents.
     pub teamclaude: bool,
 
+    /// What the agents of the agentic stages are given: the HARVEST pipeline, or a baseline arm.
+    #[serde(default)]
+    pub profile: Profile,
+
+    /// A dry-run: the agentic stage of the run does everything up to the moment when its agent
+    /// would start, keeps in `output` what the agent would receive, and starts no agent. The
+    /// run has one stage (see [`Stage::check_dry_run`]) and no result. Not a configuration key:
+    /// only the command line sets it, because the program that runs the pipeline must know it.
+    #[serde(skip)]
+    pub dry_run: bool,
+
     /// Filter describing which log messages should be output to stdout. This is in the
     /// `tracing_subscriber::filter::EnvFilter` format.
     pub log_filter: String,
@@ -163,6 +303,8 @@ impl Config {
             stage_input: None,
             agentic_agent: AgentKind::default(),
             teamclaude: true,
+            profile: Profile::default(),
+            dry_run: false,
             log_filter: "off".to_owned(),
             tools: Default::default(),
             unknown: Default::default(),
@@ -179,7 +321,14 @@ impl Config {
                 .map(Stage::to_string)
                 .collect::<Vec<_>>()
                 .join("+");
-            return Some(format!("agentic({}) stages={stages}", self.agentic_agent));
+            let baseline = match self.profile {
+                Profile::Harvest => String::new(),
+                baseline => format!(" baseline={baseline}"),
+            };
+            return Some(format!(
+                "agentic({}) stages={stages}{baseline}",
+                self.agentic_agent
+            ));
         }
         let tool_name = if self.modular {
             "modular_translation_llm"
@@ -244,6 +393,58 @@ mod tests {
                 .contains("opencode/oc")
         );
         assert_eq!(AgentKind::default(), AgentKind::OpenCode);
+    }
+
+    #[test]
+    fn profile_names_and_stage_rules() {
+        use Stage::{Conform, Quality, Translate, Verify};
+        assert_eq!(Profile::default(), Profile::Harvest);
+        for profile in Profile::BASELINES.into_iter().chain([Profile::Harvest]) {
+            assert_eq!(profile.to_string().parse::<Profile>(), Ok(profile));
+        }
+        // `--baseline` names an arm, not the HARVEST pipeline.
+        assert_eq!(Profile::parse_baseline("actor"), Ok(Profile::Actor));
+        for name in ["harvest", "Vanilla", "plain"] {
+            let err = Profile::parse_baseline(name).unwrap_err();
+            assert!(err.contains("vanilla, actor, c2rust"), "{err}");
+        }
+        // HARVEST has every stage, and also the non-agentic translators.
+        Profile::Harvest.check_stages(&[]).unwrap();
+        Profile::Harvest
+            .check_stages(&[Translate, Verify, Quality, Conform])
+            .unwrap();
+        Profile::Actor.check_stages(&[Translate, Verify]).unwrap();
+        Profile::Actor.check_stages(&[Verify]).unwrap();
+        for baseline in [Profile::Vanilla, Profile::C2rust] {
+            baseline.check_stages(&[Translate]).unwrap();
+            let err = baseline.check_stages(&[Translate, Verify]).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "the {baseline} baseline has no verify stage (its stages: translate). Name \
+                     the stages: --agentic alone means translate,verify"
+                )
+            );
+        }
+        for stage in [Quality, Conform] {
+            assert!(Profile::Actor.check_stages(&[stage]).is_err());
+        }
+        let err = Profile::Vanilla.check_stages(&[]).unwrap_err();
+        assert!(err.contains("--agentic"), "{err}");
+    }
+
+    #[test]
+    fn a_dry_run_has_one_stage() {
+        use Stage::{Translate, Verify};
+        Stage::check_dry_run(&[Translate]).unwrap();
+        Stage::check_dry_run(&[Verify]).unwrap();
+        let err = Stage::check_dry_run(&[]).unwrap_err();
+        assert!(err.contains("--agentic=<stage>"), "{err}");
+        let err = Stage::check_dry_run(&[Translate, Verify]).unwrap_err();
+        assert!(
+            err.starts_with("a dry-run renders one stage, and this run has 2: translate, verify."),
+            "{err}"
+        );
     }
 
     #[derive(Debug, Deserialize, Serialize, PartialEq)]

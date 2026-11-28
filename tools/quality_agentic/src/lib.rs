@@ -11,7 +11,7 @@
 //! The tests are the oracle of this stage, so the agent must not change them. The framework keeps
 //! a copy of them, and restores and reports any change before the freeze.
 
-use agent_runner::{AgentInvocation, AgentPhase, CaseDir, StageFact};
+use agent_runner::{AgentInvocation, AgentPhase, Arm, CaseDir, StageFact};
 use full_source::{CargoPackage, RawSource};
 use harvest_core::config::{ToolConfig, unknown_field_warning};
 use harvest_core::tools::{RunContext, Tool};
@@ -75,7 +75,7 @@ impl Tool for QualityAgentic {
             .get::<RawSource>(inputs[1])
             .ok_or("No RawSource representation found in IR")?;
 
-        let case = CaseDir::new()?;
+        let case = CaseDir::for_run(&context.config)?;
         let workspace = case.workspace();
         cargo_package.dir.materialize(&workspace)?;
         raw_source.dir.materialize(case.c_src())?;
@@ -83,7 +83,6 @@ impl Tool for QualityAgentic {
 
         let oracle = Oracle::capture(&workspace, &case.root().join("quality_oracle"))
             .map_err(|e| format!("saving the regression tests: {e}"))?;
-        let prompt = agent_runner::main_prompt(AgentPhase::Quality);
         let facts = [StageFact {
             heading: ORACLE_FACT,
             text: oracle.describe(),
@@ -97,24 +96,26 @@ impl Tool for QualityAgentic {
             phase: AgentPhase::Quality,
             agent,
             case: &case,
-            prompt: &prompt,
+            arm: Arm::Harvest {
+                additional_prompts: &[],
+                stage_facts: &facts,
+            },
             timeout_secs: config.timeout_secs,
             model: config.model.as_deref(),
             subagent_model: config.subagent_model.as_deref(),
-            no_plan: false,
             teamclaude: context.config.teamclaude,
             extra_env: &config.env,
             output_log_path: config.output_log_path.as_deref(),
             prompt_record_dir: config.prompt_record_dir.as_deref(),
             rust_toolchain: &rust_toolchain_context,
-            additional_prompts: &[],
-            stage_facts: &facts,
         })?;
         write_inputs(&case).map_err(|e| format!("writing the inputs: {e}"))?;
         fs::write(workspace.join("QUALITY.md"), QUALITY_MD)
             .map_err(|e| format!("writing QUALITY.md: {e}"))?;
         let reference_guard = case.lock_inputs()?;
-        prepared.run()?;
+        if let Some(dry_run) = prepared.run()? {
+            return Ok(Box::new(dry_run));
+        }
         info!("Quality stage complete");
         for report in ["QUALITY.md", "QUALITY_REPORT.md"] {
             if !workspace.join(report).exists() {
@@ -344,8 +345,9 @@ pub struct Config {
     /// (`.harvest/reference_modified/<stage>/`). Injected by the benchmark.
     pub reference_audit_dir: Option<PathBuf>,
 
-    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent
-    /// and a copy of the prompt files (`.harvest/prompts/<stage>/`). Injected by the benchmark.
+    /// Directory that keeps what the agents of this stage are given: the prompt of the main agent,
+    /// a copy of the prompt files, and the list of everything else
+    /// (`.harvest/prompts/<stage>/`). Injected by the benchmark.
     pub prompt_record_dir: Option<PathBuf>,
 
     /// The Test-Corpus / cando2 checkout defining the Rust toolchain contract. Injected from the
@@ -454,29 +456,29 @@ mod tests {
             heading: ORACLE_FACT,
             text: "- NONE.".to_owned(),
         }];
-        agent_runner::prepare_agent(AgentInvocation {
+        let prepared = agent_runner::prepare_agent(AgentInvocation {
             phase: AgentPhase::Quality,
             agent: harvest_core::config::AgentKind::Claude,
             case: &case,
-            prompt: "",
+            arm: Arm::Harvest {
+                additional_prompts: &[],
+                stage_facts: &facts,
+            },
             timeout_secs: 1,
             model: None,
             subagent_model: None,
-            no_plan: false,
             teamclaude: true,
             extra_env: &env,
             output_log_path: None,
             prompt_record_dir: None,
             rust_toolchain: &toolchain,
-            additional_prompts: &[],
-            stage_facts: &facts,
         })
         .unwrap();
         write_inputs(&case).unwrap();
         fs::write(case.workspace().join("QUALITY.md"), QUALITY_MD).unwrap();
-        let prompt = agent_runner::main_prompt(AgentPhase::Quality);
-        agent_runner::prompt_check::dump(&case, "quality", &prompt, &["QUALITY.md"]).unwrap();
+        let guard = case.lock_inputs().unwrap();
         check(&case);
+        drop((prepared, guard));
         case.finish();
     }
 
@@ -523,7 +525,9 @@ mod tests {
             assert_eq!(
                 must_read("quality/main.md"),
                 [
+                    "anti_cheating.md",
                     "common.md",
+                    "environment.md",
                     "git_main.md",
                     "main_agent.md",
                     "quality/rules.md",
@@ -540,7 +544,9 @@ mod tests {
                 assert_eq!(
                     must_read(&format!("quality/{name}")),
                     [
+                        "anti_cheating.md",
                         "common.md",
+                        "environment.md",
                         "git_subagent.md",
                         "quality/rules.md",
                         "run.md",

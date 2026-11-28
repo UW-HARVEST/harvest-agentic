@@ -1,12 +1,10 @@
 # Translation stage: the main agent
 
-Reader: the main agent of the translation stage. Read this file again after each context
-compaction.
-
 Read these files first:
 
 - `inputs/prompts/main_agent.md`
 - `inputs/prompts/translate/translation_rules.md`
+- `inputs/prompts/output_spec.md`
 - `inputs/prompts/translate/completion_gate.md`
 - `inputs/prompts/cargo_features.md`
 
@@ -172,9 +170,9 @@ each subtask. You do not read the C source in detail: the sub-agent of a subtask
 
 Decide these yourself, from the scout reports, and record them in `PLAN.md`:
 
-1. The project type:
-   - Has `main()` → needs `[[bin]]` with `name = "driver"`
-   - Exports library functions → needs `[lib]` with `crate-type = ["cdylib"]`
+1. The project type (`inputs/prompts/output_spec.md` gives the name and the type of each target):
+   - Has `main()` → needs the `[[bin]]` section
+   - Exports library functions → needs the `[lib]` section
    - Both → include both `[lib]` and `[[bin]]` sections
 2. ALL backends/variants, if the project has build-time configurability (source file selection,
    options, conditional compilation). Check a detail with a scoped grep

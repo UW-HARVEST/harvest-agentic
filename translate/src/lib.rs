@@ -10,6 +10,7 @@ use build_project_spec::BuildProjectSpec;
 use c_ast::ParseToAst;
 use conform_agentic::ConformAgentic;
 use harvest_core::config::{Config, Stage, ToolConfig};
+use harvest_core::stage_manifest::StageManifest;
 use harvest_core::utils::get_version;
 use harvest_core::{HarvestIR, diagnostics};
 use load_raw_source::LoadRawSource;
@@ -71,8 +72,14 @@ pub fn effective_config(config: &Config) -> Result<serde_json::Value, serde_json
     }))
 }
 
-/// Performs the complete transpilation process using the scheduler.
+/// Performs the complete transpilation process using the scheduler. A dry-run (`config.dry_run`)
+/// has one agentic stage: the IR then holds what the tool of the stage returns for a dry-run, and
+/// no package.
 pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::Error>> {
+    config.profile.check_stages(&config.stages)?;
+    if config.dry_run {
+        Stage::check_dry_run(&config.stages)?;
+    }
     // Basic tool setup
     let collector = diagnostics::Collector::initialize(&config)?;
     let mut ir = HarvestIR::default();
@@ -108,6 +115,20 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
             let snapshot = config.stage_input.as_deref().ok_or(
                 "stages without `translate` require stage_input (a previous run's output directory)",
             )?;
+            if config.profile.is_baseline() {
+                // The benchmark writes the manifest. The `translate` binary does not, so a
+                // baseline cannot resume from its output.
+                let manifest = StageManifest::read_from_dir(snapshot).map_err(|e| {
+                    format!(
+                        "a stage of the {} baseline resumes only from a snapshot whose stage \
+                         manifest shows that the same baseline made it, and {} has no readable \
+                         manifest ({e}). Only `benchmark` writes one",
+                        config.profile,
+                        snapshot.display()
+                    )
+                })?;
+                manifest.check_resume(config.profile)?;
+            }
             scheduler.queue(LoadTranslatedPackage::new(snapshot))
         };
         let package = if config.stages.contains(&Stage::Verify) {
@@ -137,9 +158,13 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
         let project_spec = scheduler.queue_after(BuildProjectSpec, &[load_src]);
         scheduler.queue_after(RawSourceToCargoLlm, &[load_src, project_spec])
     };
-    let _try_build = scheduler.queue_after(TryCargoBuild, &[translate]);
+    // The stage of a dry-run makes no package: its tool gives what its agent would receive.
+    if !config.dry_run {
+        scheduler.queue_after(TryCargoBuild, &[translate]);
+    }
 
     // Run until all tasks are complete, respecting the dependencies declared in `queue_after`
+    let dry_run = config.dry_run;
     let result = scheduler.run_all(&mut runner, &mut ir, config);
     drop(scheduler);
     drop(runner);
@@ -147,6 +172,13 @@ pub fn transpile(config: Arc<Config>) -> Result<HarvestIR, Box<dyn std::error::E
     if let Err(e) = result {
         error!("Error during transpilation: {e}");
         return Err(e);
+    }
+    if dry_run && !ir.contains_id(translate) {
+        return Err(
+            "the dry-run stopped before the moment when the agent would start: a tool of the \
+             run failed (see its error above)"
+                .into(),
+        );
     }
     Ok(ir)
 }
@@ -190,6 +222,56 @@ mod tests {
             serde_json::json!({"model": "m"})
         );
         assert_eq!(value["modular"], false);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_baseline_runs_only_its_stages_on_its_own_translation() {
+        use harvest_core::config::Profile;
+        let refused = |profile, stages: &[Stage], snapshot: Option<&std::path::Path>| {
+            let mut config = Config::mock();
+            config.profile = profile;
+            config.stages = stages.to_vec();
+            config.stage_input = snapshot.map(|dir| dir.to_path_buf());
+            transpile(config.into()).err().expect("refused").to_string()
+        };
+        let err = refused(Profile::Vanilla, &[Stage::Translate, Stage::Verify], None);
+        assert!(
+            err.contains("the vanilla baseline has no verify stage"),
+            "{err}"
+        );
+        let err = refused(Profile::C2rust, &[], None);
+        assert!(err.contains("runs only as agentic stages"), "{err}");
+        // A snapshot that the HARVEST pipeline translated.
+        let snapshot = harvest_core::test_util::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "schema_version": 2,
+            "bench_program": "toy",
+            "runs": [{
+                "stages": ["translate"], "argv": [], "cwd": "/", "harvest_version": "test",
+                "created_unix": 0, "config": null
+            }]
+        });
+        let meta = snapshot.path().join(".harvest");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("stage.json"), manifest.to_string()).unwrap();
+        let err = refused(Profile::Actor, &[Stage::Verify], Some(snapshot.path()));
+        assert!(err.ends_with("has the HARVEST pipeline"), "{err}");
+        // An output of the `translate` binary has no manifest.
+        let bare = harvest_core::test_util::tempdir().unwrap();
+        let err = refused(Profile::Actor, &[Stage::Verify], Some(bare.path()));
+        assert!(err.contains("has no readable manifest"), "{err}");
+        assert!(err.ends_with("Only `benchmark` writes one"), "{err}");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_dry_run_of_two_stages_is_refused() {
+        let mut config = Config::mock();
+        config.dry_run = true;
+        config.stages = vec![Stage::Translate, Stage::Verify];
+        let err = transpile(config.into()).err().expect("refused").to_string();
+        assert!(err.starts_with("a dry-run renders one stage"), "{err}");
     }
 
     #[cfg(not(miri))]
